@@ -1,6 +1,6 @@
 from __future__ import annotations
 from typing import Literal
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 
 
 # 调度器内部支持的任务类型：
@@ -10,30 +10,25 @@ from pydantic import BaseModel, Field
 TaskType=Literal["reason","explore","bootstrap"]
 
 # 可选的 LLM 服务提供方。
-ProviderType=Literal["deepseek","glm","kimi","PI","mock"]
+WorkerType=Literal["claudecode","codex","pi","mock"]
 
 # 任务完成后的处理方式：
 # - remove：完成后从待处理队列移除
 # - stop：完成后停止继续调度
 CompletedAction=Literal["remove","stop"]
 
-WORKER_ENV_KEYS:dict[ProviderType,tuple[str,...]]={
-    "deepseek":(
-        "DEEPSEEK_MODEL",
-        "DEEPSEEK_BASE_URL",
-        "DEEPSEEK_API_KEY",
+WORKER_ENV_KEYS:dict[WorkerType,tuple[str,...]]={
+    "claudecode":(
+        "ANTHROPIC_MODEL",
+        "ANTHROPIC_BASE_URL",
+        "ANTHROPIC_AUTH_TOKEN",
     ),
-    "glm":(
-        "GLM_MODEL",
-        "GLM_BASE_URL",
-        "GLM_API_KEY",
+    "codex":(
+        "CODEX_MODEL",
+        "CODEX_BASE_URL",
+        "CODEX_API_KEY",
     ),
-    "kimi":(
-        "KIMI_MODEL",
-        "KIMI_BASE_URL",
-        "KIMI_API_KEY",
-    ),
-    "PI":(
+    "pi":(
         "PI_MODEL",
         "PI_BASE_URL",
         "PI_API_KEY",
@@ -41,58 +36,65 @@ WORKER_ENV_KEYS:dict[ProviderType,tuple[str,...]]={
     ),
     "mock":(),
 }
+class ReasonTaskConfig(BaseModel):
+    # 每个推理任务的执行超时时间，单位秒，必须大于 0。
+    timeout:int=Field(gt=0)
+    max_intents:int=Field(gt=0,default=3)
 
-class LLMconfig(BaseModel):
-    """LLM 调用相关配置。"""
+class ExploreTaskConfig(BaseModel):
+    # 每个探索任务的执行超时时间，单位秒，必须大于 0。
+    timeout:int=Field(gt=0)
+    conclude_timeout:int=Field(gt=0)
 
-    # 使用哪个模型服务提供方。
-    provider: ProviderType="mock"
+class BootstrapTaskConfig(BaseModel):
+    # 每个引导任务的执行超时时间，单位秒，必须大于 0。
+    timeout:int=Field(gt=0)
+    conclude_timeout:int=Field(gt=0)
 
-    # 具体模型名称；mock 模式下保留默认值即可。
-    model: str="mock"
+class TasksConfig(BaseModel):
+    # 所有任务阶段的配置
+    bootstrap:BootstrapTaskConfig
+    reason:ReasonTaskConfig
+    explore:ExploreTaskConfig
 
-    # 保存 API Key 的环境变量名，例如 DEEPSEEK_API_KEY。
-    api_key_env:str|None=None
+class ContainerConfig(BaseModel):
+    # dispatcher 会为项目启动容器，并在容器内执行worker命令。
+    image:str
+    network_mode:str
+    completed_action:CompletedAction
+    cap_add:list[str]=Field(default_factory=list)
 
-    # 自定义服务地址；使用默认官方地址时可以为空。
-    base_url:str|None=None
+class RuntimeConfig(BaseModel):
+    # 运行时配置，包含容器配置和任务阶段配置。
+    max_workers:int=Field(gt=0)
+    max_running_projects:int=Field(gt=0)
+    max_project_workers:int=Field(gt=0)
+    interval:int=Field(gt=0)
+    healthcheck_timeout:int=Field(gt=0)
+    prompt_group:str=Field(min_length=1)
 
-    # LLM 请求超时时间，范围限制在 1-600 秒。
-    timeout:int=Field(default=120,ge=1,le=600)
+class WorkerConfig(BaseModel):
+    model_config=ConfigDict(extra="forbid")
+    #单个worker的调度画像
+    name:str
+    type:WorkerType
+    task_type:list[TaskType]
+    max_running:int=Field(gt=0)
+    priority:int=Field(ge=0)
+    env:dict[str,str]=Field(default_factory=dict)
 
-class TaskConfig(BaseModel):
-    """单类任务的调度配置。"""
+    @field_validator("task_types")
+    @classmethod
+    def validate_task_types(cls,value:list[TaskType])->list[TaskType]:
+        #每个worker至少要支持一种任务类型
+        if not value:
+            raise ValueError("task_types must not be empty")
+        if len(set(value))!=len(value):
+            raise ValueError("task_types must be unique")
+        return value
+    
+    @field_validator(mode="after")
+    def validate_env(self)->"WorkerConfig":
+        #
 
-    # 当前配置对应哪一种任务。
-    task_type: TaskType
-
-    # 是否启用这类任务。
-    enabled:bool=True
-
-    # 单个任务执行超时时间，范围限制在 1-600 秒。
-    timeout:int=Field(default=120,ge=1,le=600)
-
-class DispatcherConfig(BaseModel):
-    """dispatcher 的总配置。"""
-
-    # worker 名称，用于认领任务、续约 heartbeat 和记录执行者。
-    worker:str="dispatcher-worker"
-
-    # 任务完成后的默认处理方式。
-    completed_action: CompletedAction="remove"
-
-    # 最大并发任务数，至少为 1。
-    max_concurrent_tasks:int=Field(default=1,ge=1)
-
-    # LLM 配置；默认使用 mock，方便本地无密钥启动。
-    llm:LLMconfig=Field(default_factory=LLMconfig)
-
-    # 默认启用三类任务配置。
-    tasks:list[TaskConfig]=Field(
-        default_factory=lambda:[
-            TaskConfig(task_type="bootstrap"),
-            TaskConfig(task_type="reason"),
-            TaskConfig(task_type="explore"),
-        ]
-    )
 

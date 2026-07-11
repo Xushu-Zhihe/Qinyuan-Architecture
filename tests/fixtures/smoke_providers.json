@@ -1,0 +1,26 @@
+{
+  "providers": [
+    {
+      "name": "fake-a",
+      "enabled": true,
+      "priority": 10,
+      "command": [
+        "python",
+        "-c",
+        "import json,sys;sys.stdin.read();o=chr(123);c=chr(125);p=dict(nodes=[],edges=[],goal_achieved=True,final_answer='flag'+o+'smoke'+c);print('BLACKBOARD_UPDATE: '+json.dumps(p))"
+      ],
+      "timeout_seconds": 10
+    },
+    {
+      "name": "fake-b",
+      "enabled": true,
+      "priority": 20,
+      "command": [
+        "python",
+        "-c",
+        "import json,sys;sys.stdin.read();o=chr(123);c=chr(125);p=dict(nodes=[],edges=[],goal_achieved=True,final_answer='flag'+o+'smoke'+c);print('BLACKBOARD_UPDATE: '+json.dumps(p))"
+      ],
+      "timeout_seconds": 10
+    }
+  ]
+}

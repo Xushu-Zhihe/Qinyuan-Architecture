@@ -1,0 +1,44 @@
+{
+  "providers": [
+    {
+      "name": "codex",
+      "enabled": true,
+      "priority": 100,
+      "command": [
+        "codex",
+        "exec",
+        "--sandbox",
+        "workspace-write",
+        "--skip-git-repo-check",
+        "--ephemeral",
+        "-c",
+        "approval_policy=\"never\"",
+        "-C",
+        "{work_dir}",
+        "-"
+      ],
+      "timeout_seconds": 900
+    },
+    {
+      "name": "claude",
+      "enabled": true,
+      "priority": 90,
+      "command": [
+        "claude",
+        "-p",
+        "--output-format",
+        "text",
+        "--permission-mode",
+        "dontAsk"
+      ],
+      "timeout_seconds": 900
+    },
+    {
+      "name": "kimi",
+      "enabled": true,
+      "priority": 80,
+      "command": ["kimi", "--print"],
+      "timeout_seconds": 900
+    }
+  ]
+}

@@ -1,6 +1,7 @@
 import json
 import sqlite3
 import asyncio
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -9,7 +10,9 @@ from uuid import uuid4
 from orchestrator.events import ProjectEventHub
 from orchestrator.layout import LayoutStore
 from orchestrator.store import BlackboardStore
+from orchestrator.supervisor import ProjectSupervisor
 from worker.models import ProviderConfig
+from worker.models import WorkerResult
 
 
 REGISTRY_SCHEMA = """
@@ -194,20 +197,28 @@ class ProjectService:
         self,
         data_root: Path,
         provider_configs: tuple[ProviderConfig, ...] = (),
+        execute: Callable[..., Awaitable[WorkerResult]] | None = None,
     ) -> None:
         self.registry = ProjectRegistry(data_root)
         self.provider_configs = {
             provider.name: provider for provider in provider_configs
         }
         self.global_semaphore = asyncio.Semaphore(16)
+        self.execute = execute
         self._handles: dict[str, ProjectHandle] = {}
-        self._supervisors: dict[str, object] = {}
+        self._supervisors: dict[str, ProjectSupervisor] = {}
 
     def close(self) -> None:
         for handle in self._handles.values():
             handle.store.close()
         self._handles.clear()
         self.registry.close()
+
+    async def aclose(self) -> None:
+        for supervisor in tuple(self._supervisors.values()):
+            await supervisor.stop()
+        self._supervisors.clear()
+        self.close()
 
     def create_project(
         self,
@@ -278,6 +289,45 @@ class ProjectService:
                 }
             )
         return tuple(result)
+
+    async def start_project(self, project_id: str) -> ProjectSupervisor:
+        existing = self._supervisors.get(project_id)
+        if existing is not None and any(
+            not task.done() for task in existing.tasks.values()
+        ):
+            return existing
+        handle = self.get_handle(project_id)
+        configs = tuple(
+            self.provider_configs[name]
+            for name in handle.record.providers
+            if name in self.provider_configs
+        )[: handle.record.agent_limit]
+        if not configs:
+            raise ValueError("project has no configured providers")
+        kwargs = {}
+        if self.execute is not None:
+            kwargs["execute"] = self.execute
+        supervisor = ProjectSupervisor(
+            store=handle.store,
+            providers=configs,
+            challenge_dir=handle.record.challenge_path,
+            project_dir=handle.record.path,
+            hub=handle.hub,
+            global_semaphore=self.global_semaphore,
+            **kwargs,
+        )
+        self._supervisors[project_id] = supervisor
+        await supervisor.start()
+        handle.record = self.registry.update_status(project_id, "running")
+        return supervisor
+
+    async def stop_project(self, project_id: str) -> ProjectRecord:
+        handle = self.get_handle(project_id)
+        supervisor = self._supervisors.get(project_id)
+        if supervisor is not None:
+            await supervisor.stop()
+        handle.record = self.registry.update_status(project_id, "stopped")
+        return handle.record
 
 
 def project_record_dict(record: ProjectRecord) -> dict[str, object]:

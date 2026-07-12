@@ -1,7 +1,14 @@
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Response, status
+from fastapi import (
+    FastAPI,
+    HTTPException,
+    Response,
+    WebSocket,
+    WebSocketDisconnect,
+    status,
+)
 
 from orchestrator.layout import LayoutConflict
 from orchestrator.models import IntentProposal
@@ -16,16 +23,18 @@ DEFAULT_DATA_ROOT = Path(__file__).resolve().parents[1] / "web-data"
 def create_app(
     data_root: Path | None = None,
     provider_configs: tuple[ProviderConfig, ...] = (),
+    execute=None,
 ) -> FastAPI:
     service = ProjectService(
         (data_root or DEFAULT_DATA_ROOT).resolve(),
         provider_configs,
+        execute=execute,
     )
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         yield
-        service.close()
+        await service.aclose()
 
     app = FastAPI(title="Blackboard", lifespan=lifespan)
     app.state.projects = service
@@ -35,6 +44,10 @@ def create_app(
             return service.get_handle(project_id)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="project not found") from exc
+
+    async def publish_since(project, sequence: int) -> None:
+        for event in project.store.events_after(sequence):
+            await project.hub.publish(event)
 
     @app.get("/api/projects")
     def list_projects():
@@ -73,35 +86,42 @@ def create_app(
         "/api/projects/{project_id}/nodes",
         status_code=status.HTTP_201_CREATED,
     )
-    def create_node(project_id: str, payload: NodeCreate):
+    async def create_node(project_id: str, payload: NodeCreate):
         project = handle(project_id)
+        sequence = int(project.store.snapshot()["sequence"])
         try:
             node_id = project.store.add_human_node(payload.type, payload.content)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        return next(
+        result = next(
             node
             for node in project.store.snapshot()["nodes"]
             if node["id"] == node_id
         )
+        await publish_since(project, sequence)
+        return result
 
     @app.delete(
         "/api/projects/{project_id}/nodes/{node_id}",
         status_code=status.HTTP_204_NO_CONTENT,
     )
-    def archive_node(project_id: str, node_id: str):
+    async def archive_node(project_id: str, node_id: str):
+        project = handle(project_id)
+        sequence = int(project.store.snapshot()["sequence"])
         try:
-            handle(project_id).store.archive_node(node_id)
+            project.store.archive_node(node_id)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="node not found") from exc
+        await publish_since(project, sequence)
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
     @app.post(
         "/api/projects/{project_id}/edges",
         status_code=status.HTTP_201_CREATED,
     )
-    def create_edge(project_id: str, payload: EdgeCreate):
+    async def create_edge(project_id: str, payload: EdgeCreate):
         project = handle(project_id)
+        sequence = int(project.store.snapshot()["sequence"])
         try:
             if payload.type == "intent":
                 if payload.content is None or not payload.content.strip():
@@ -123,17 +143,19 @@ def create_app(
                 )
         except (KeyError, ValueError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        return next(
+        result = next(
             edge
             for edge in project.store.snapshot()["edges"]
             if edge["id"] == edge_id
         )
+        await publish_since(project, sequence)
+        return result
 
     @app.put("/api/projects/{project_id}/layout")
-    def update_layout(project_id: str, payload: LayoutUpdate):
+    async def update_layout(project_id: str, payload: LayoutUpdate):
         project = handle(project_id)
         try:
-            return project.layout.save(
+            result = project.layout.save(
                 payload.revision,
                 {
                     "nodes": payload.nodes,
@@ -141,6 +163,13 @@ def create_app(
                     "viewport": payload.viewport,
                 },
             )
+            event = project.store.append_event(
+                "graph.layout_updated",
+                "human",
+                {"revision": result["revision"]},
+            )
+            await project.hub.publish(event)
+            return result
         except LayoutConflict as exc:
             raise HTTPException(
                 status_code=409,
@@ -170,5 +199,55 @@ def create_app(
                 encoding="utf-8", errors="replace"
             ) if Path(str(execution["stderr_path"])).is_file() else "",
         }
+
+    @app.post(
+        "/api/projects/{project_id}/start",
+        status_code=status.HTTP_202_ACCEPTED,
+    )
+    async def start_project(project_id: str):
+        try:
+            supervisor = await service.start_project(project_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="project not found") from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {
+            "status": "running",
+            "agents": supervisor.agent_statuses(),
+        }
+
+    @app.post("/api/projects/{project_id}/stop")
+    async def stop_project(project_id: str):
+        try:
+            record = await service.stop_project(project_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="project not found") from exc
+        return project_record_dict(record)
+
+    @app.websocket("/ws/projects/{project_id}")
+    async def project_socket(
+        websocket: WebSocket,
+        project_id: str,
+        after: int = 0,
+    ):
+        try:
+            project = service.get_handle(project_id)
+        except KeyError:
+            await websocket.close(code=4404)
+            return
+        await websocket.accept()
+        try:
+            for event in project.store.events_after(after):
+                await websocket.send_json(
+                    {"project_id": project_id, **event}
+                )
+            async with project.hub.subscribe() as queue:
+                while True:
+                    event = await queue.get()
+                    await websocket.send_json(
+                        {"project_id": project_id, **event}
+                    )
+        except WebSocketDisconnect:
+            return
 
     return app

@@ -909,6 +909,16 @@ class BlackboardStore:
             ).fetchall()
         )
 
+    def append_event(
+        self,
+        event_type: str,
+        source: str,
+        payload: dict[str, object],
+    ) -> dict[str, object]:
+        with self.connection:
+            sequence = self._event(event_type, source, payload)
+        return self.events_after(sequence - 1)[0]
+
     def mark_interrupted(self) -> int:
         with self.connection:
             cursor = self.connection.execute(

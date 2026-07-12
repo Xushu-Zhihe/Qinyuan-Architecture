@@ -56,13 +56,12 @@ class ProjectSupervisor:
 
     async def _set_agent_status(self, provider: str, status: str) -> None:
         self._agent_status[provider] = status
-        await self.hub.publish(
-            {
-                "type": "agent.status_changed",
-                "source": provider,
-                "payload": {"provider": provider, "status": status},
-            }
+        event = self.store.append_event(
+            "agent.status_changed",
+            provider,
+            {"provider": provider, "status": status},
         )
+        await self.hub.publish(event)
 
     async def _run_provider(
         self,
@@ -123,10 +122,14 @@ class ProjectSupervisor:
         assert parsed_intent.decision.intent is not None
 
         async with self.write_lock:
+            sequence = int(self.store.snapshot()["sequence"])
             intent = self.store.create_or_merge_intent(
                 provider_name,
                 parsed_intent.decision.intent,
             )
+            events = self.store.events_after(sequence)
+        for event in events:
+            await self.hub.publish(event)
         result_status = await self._execute_intent(provider, intent)
         if result_status == "completed":
             self._failures[provider_name] = 0
@@ -146,6 +149,7 @@ class ProjectSupervisor:
             / f"run-{provider.name}-{uuid4().hex}"
         )
         async with self.write_lock:
+            sequence = int(self.store.snapshot()["sequence"])
             execution = self.store.start_execution(
                 intent.id,
                 provider.name,
@@ -153,24 +157,31 @@ class ProjectSupervisor:
                 str((execution_dir / "stderr.txt").resolve()),
                 str(execution_dir.resolve()),
             )
+            events = self.store.events_after(sequence)
+        for event in events:
+            await self.hub.publish(event)
 
         offsets = {"stdout": 0, "stderr": 0}
 
         async def on_chunk(chunk: LogChunk) -> None:
             offset = offsets[chunk.stream]
-            offsets[chunk.stream] += len(chunk.text.encode("utf-8"))
+            byte_length = len(chunk.text.encode("utf-8"))
+            offsets[chunk.stream] += byte_length
+            metadata = {
+                "intent_id": intent.id,
+                "execution_id": execution.id,
+                "stream": chunk.stream,
+                "byte_offset": offset,
+                "byte_length": byte_length,
+            }
+            async with self.write_lock:
+                event = self.store.append_event(
+                    "intent.log_chunk",
+                    provider.name,
+                    metadata,
+                )
             await self.hub.publish(
-                {
-                    "type": "intent.log_chunk",
-                    "source": provider.name,
-                    "payload": {
-                        "intent_id": intent.id,
-                        "execution_id": execution.id,
-                        "stream": chunk.stream,
-                        "offset": offset,
-                        "text": chunk.text,
-                    },
-                }
+                {**event, "payload": {**metadata, "text": chunk.text}}
             )
 
         await self._set_agent_status(provider.name, "running")
@@ -217,6 +228,7 @@ class ProjectSupervisor:
             return "failed"
 
         async with self.write_lock:
+            sequence = int(self.store.snapshot()["sequence"])
             self.store.finish_execution(
                 execution.id,
                 parsed_result.update,
@@ -227,6 +239,9 @@ class ProjectSupervisor:
             if answer is not None:
                 self.store.set_project_status("achieved", answer)
                 self.cancel_event.set()
+            events = self.store.events_after(sequence)
+        for event in events:
+            await self.hub.publish(event)
         self.wake_event.set()
         return "completed"
 

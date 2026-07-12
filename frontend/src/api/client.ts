@@ -29,6 +29,8 @@ export const api = {
     request<ProjectSnapshot>(`/api/projects/${projectId}/graph`),
   addNode: (projectId: string, payload: Record<string, unknown>) =>
     request(`/api/projects/${projectId}/nodes`, { method: 'POST', body: JSON.stringify(payload) }),
+  archiveNode: (projectId: string, nodeId: string) =>
+    request<void>(`/api/projects/${projectId}/nodes/${nodeId}`, { method: 'DELETE' }),
   addEdge: (projectId: string, payload: Record<string, unknown>) =>
     request(`/api/projects/${projectId}/edges`, { method: 'POST', body: JSON.stringify(payload) }),
   updateEdge: (projectId: string, edgeId: string, payload: Record<string, unknown>) =>

@@ -12,6 +12,13 @@ export interface ProjectState {
   logs: Record<string, { stdout: string; stderr: string }>
 }
 
+export const MAX_LOG_LINES = 2000
+
+export function capLogText(text: string, maxLines = MAX_LOG_LINES): string {
+  const lines = text.split('\n')
+  return lines.length <= maxLines ? text : lines.slice(-maxLines).join('\n')
+}
+
 export function createProjectState(
   initial: Partial<ProjectState> = {},
 ): ProjectState {
@@ -37,7 +44,7 @@ function appendLog(
       ...state.logs,
       [executionId]: {
         ...current,
-        [stream]: current[stream] + String(payload.text ?? ''),
+        [stream]: capLogText(current[stream] + String(payload.text ?? '')),
       },
     },
   }
@@ -56,6 +63,8 @@ export function reduceProjectEvent(
   }
   if (event.type === 'intent.log_chunk') {
     next = appendLog(next, event.payload)
+  } else {
+    next = { ...next, needsRefresh: true }
   }
   return next
 }

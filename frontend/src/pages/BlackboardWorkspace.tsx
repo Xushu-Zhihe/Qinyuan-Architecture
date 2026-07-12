@@ -4,20 +4,21 @@ import { useEffect, useReducer, useState } from 'react'
 import { api } from '../api/client'
 import { connectProjectSocket } from '../api/projectSocket'
 import { GraphToolbar } from '../components/GraphToolbar'
+import { InspectorPanel, type InspectorSelection } from '../components/InspectorPanel'
+import { LogConsole } from '../components/LogConsole'
 import {
   BlackboardGraph,
   type BlackboardFlowInstance,
   type ReconnectCommand,
 } from '../graph/BlackboardGraph'
 import { createProjectState, reduceProjectEvent, replaceSnapshot } from '../state/projectStore'
-import type { BlackboardEdge, BlackboardNode, WorkspaceMode } from '../types'
-
-type Selection = { kind: 'node'; value: BlackboardNode } | { kind: 'edge'; value: BlackboardEdge } | null
+import type { IntentExecution, WorkspaceMode } from '../types'
 
 export function BlackboardWorkspace({ projectId, onBack }: { projectId: string; onBack: () => void }) {
   const [state, dispatch] = useReducer((current: ReturnType<typeof createProjectState>, action: { type: 'snapshot'; value: any } | { type: 'event'; value: any }) => action.type === 'snapshot' ? replaceSnapshot(current, action.value) : reduceProjectEvent(current, action.value), createProjectState())
   const [mode, setMode] = useState<WorkspaceMode>('browse')
-  const [selection, setSelection] = useState<Selection>(null)
+  const [selection, setSelection] = useState<InspectorSelection>(null)
+  const [selectedExecution, setSelectedExecution] = useState<IntentExecution | null>(null)
   const [flow, setFlow] = useState<BlackboardFlowInstance | null>(null)
 
   async function refresh() {
@@ -62,6 +63,13 @@ export function BlackboardWorkspace({ projectId, onBack }: { projectId: string; 
     await refresh()
   }
 
+  async function archiveNode(nodeId: string) {
+    await api.archiveNode(projectId, nodeId)
+    setSelection(null)
+    setSelectedExecution(null)
+    await refresh()
+  }
+
   return (
     <main className="workspace-shell">
       <header className="workspace-header">
@@ -87,9 +95,17 @@ export function BlackboardWorkspace({ projectId, onBack }: { projectId: string; 
         onConnectNodes={(source, target) => void connectNodes(source, target)}
         onInstance={setFlow}
       />
-      <aside className="workspace-selection" aria-label="当前选择">
-        {selection ? `${selection.kind === 'node' ? selection.value.type : selection.value.type}: ${selection.value.content ?? ''}` : '选择节点或边查看详情'}
-      </aside>
+      <InspectorPanel
+        selection={selection}
+        snapshot={snapshot}
+        onSelectExecution={setSelectedExecution}
+        onArchiveNode={nodeId => void archiveNode(nodeId)}
+      />
+      <LogConsole
+        projectId={projectId}
+        execution={selectedExecution}
+        liveLogs={selectedExecution ? state.logs[selectedExecution.id] ?? { stdout: '', stderr: '' } : { stdout: '', stderr: '' }}
+      />
     </main>
   )
 }

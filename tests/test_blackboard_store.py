@@ -3,7 +3,12 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from orchestrator.models import IntentProposal
+from orchestrator.models import (
+    ExecutionUpdate,
+    FactProposal,
+    IntentProposal,
+    RelationProposal,
+)
 from orchestrator.store import BlackboardStore
 
 
@@ -31,6 +36,26 @@ class StoreTestCase(unittest.TestCase):
         store = self.make_store()
         fact_id = store.add_human_node("fact", "JWT uses HS256")
         return store, fact_id
+
+    def make_store_and_intent(self):
+        store, fact_id = self.make_store_with_fact()
+        intent = store.create_or_merge_intent(
+            "codex",
+            IntentProposal(
+                fact_id,
+                store.node_id("goal"),
+                "Verify the key source",
+            ),
+        )
+        return store, intent
+
+    @staticmethod
+    def execution_paths(provider: str = "codex") -> tuple[str, str, str]:
+        return (
+            f"logs/{provider}/stdout.txt",
+            f"logs/{provider}/stderr.txt",
+            f"logs/{provider}/work",
+        )
 
 
 class BlackboardStoreTests(StoreTestCase):
@@ -161,6 +186,131 @@ class BlackboardStoreTests(StoreTestCase):
             if node["id"] == first
         )
         self.assertEqual(fact["sources"], ["claude", "codex"])
+
+
+class BlackboardExecutionTests(StoreTestCase):
+    def test_execution_output_links_fact_to_intent(self) -> None:
+        store, intent = self.make_store_and_intent()
+        stdout, stderr, work = self.execution_paths()
+        execution = store.start_execution(
+            intent.id,
+            "codex",
+            stdout,
+            stderr,
+            work,
+        )
+        update = ExecutionUpdate(
+            intent_id=intent.id,
+            facts=(FactProposal("fact-new", "JWT secret is in config"),),
+            edges=(),
+            goal_achieved=False,
+            final_answer=None,
+        )
+
+        store.finish_execution(execution.id, update, 0, "completed")
+
+        snapshot = store.snapshot()
+        fact = next(
+            node
+            for node in snapshot["nodes"]
+            if node["content"] == "JWT secret is in config"
+        )
+        self.assertEqual(fact["generation"], intent.generation)
+        self.assertEqual(fact["produced_by"]["intent_id"], intent.id)
+        self.assertEqual(
+            fact["produced_by"]["execution_id"],
+            execution.id,
+        )
+
+    def test_invalid_relation_rolls_back_result_and_status(self) -> None:
+        store, intent = self.make_store_and_intent()
+        execution = store.start_execution(
+            intent.id,
+            "codex",
+            *self.execution_paths(),
+        )
+        update = ExecutionUpdate(
+            intent_id=intent.id,
+            facts=(FactProposal("fact-new", "A transient fact"),),
+            edges=(
+                RelationProposal("supports", "fact-new", "missing"),
+            ),
+            goal_achieved=False,
+            final_answer=None,
+        )
+
+        with self.assertRaisesRegex(ValueError, "unknown node reference"):
+            store.finish_execution(execution.id, update, 0, "completed")
+
+        snapshot = store.snapshot()
+        self.assertNotIn(
+            "A transient fact",
+            [node["content"] for node in snapshot["nodes"]],
+        )
+        self.assertEqual(store.execution(execution.id)["status"], "running")
+
+    def test_intent_status_aggregates_independent_executions(self) -> None:
+        store, intent = self.make_store_and_intent()
+        first = store.start_execution(
+            intent.id,
+            "codex",
+            *self.execution_paths("codex"),
+        )
+        second = store.start_execution(
+            intent.id,
+            "claude",
+            *self.execution_paths("claude"),
+        )
+
+        store.fail_execution(first.id, "failed", "process failed")
+        self.assertEqual(store.intent_status(intent.id), "running")
+        store.finish_execution(
+            second.id,
+            ExecutionUpdate(intent.id, (), (), False, None),
+            0,
+            "completed",
+        )
+
+        self.assertEqual(store.intent_status(intent.id), "completed")
+        edge = next(
+            edge
+            for edge in store.snapshot()["edges"]
+            if edge["id"] == intent.id
+        )
+        self.assertEqual(len(edge["executions"]), 2)
+
+    def test_consensus_spans_asynchronous_executions(self) -> None:
+        store = self.make_store()
+
+        store.record_answer("codex", "flag{same}")
+        self.assertIsNone(store.consensus(available_providers=2))
+        store.record_answer("claude", " flag{same} ")
+
+        self.assertEqual(
+            store.consensus(available_providers=2),
+            "flag{same}",
+        )
+        self.assertEqual(store.candidates(), ("flag{same}",))
+
+    def test_events_after_returns_monotonic_sequence(self) -> None:
+        store, intent = self.make_store_and_intent()
+        first_sequence = store.snapshot()["sequence"]
+        store.start_execution(
+            intent.id,
+            "codex",
+            *self.execution_paths(),
+        )
+
+        events = store.events_after(first_sequence)
+
+        self.assertGreater(len(events), 0)
+        self.assertTrue(
+            all(event["sequence"] > first_sequence for event in events)
+        )
+        self.assertEqual(
+            [event["sequence"] for event in events],
+            sorted(event["sequence"] for event in events),
+        )
 
 
 if __name__ == "__main__":

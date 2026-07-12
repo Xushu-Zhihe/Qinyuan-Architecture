@@ -90,6 +90,38 @@ CREATE TABLE intents (
     fingerprint TEXT NOT NULL UNIQUE
 );
 
+CREATE TABLE intent_executions (
+    id TEXT PRIMARY KEY,
+    intent_edge_id TEXT NOT NULL REFERENCES intents(edge_id),
+    provider TEXT NOT NULL,
+    status TEXT NOT NULL,
+    started_at TEXT,
+    finished_at TEXT,
+    exit_code INTEGER,
+    stdout_path TEXT NOT NULL,
+    stderr_path TEXT NOT NULL,
+    work_dir TEXT NOT NULL,
+    error_message TEXT
+);
+
+CREATE INDEX executions_by_intent
+ON intent_executions(intent_edge_id, status, started_at);
+
+CREATE TABLE intent_outputs (
+    intent_edge_id TEXT NOT NULL REFERENCES intents(edge_id),
+    execution_id TEXT NOT NULL REFERENCES intent_executions(id),
+    node_id TEXT NOT NULL REFERENCES nodes(id),
+    PRIMARY KEY(execution_id, node_id)
+);
+
+CREATE TABLE final_answers (
+    id TEXT PRIMARY KEY,
+    provider TEXT NOT NULL,
+    answer TEXT NOT NULL,
+    goal_version INTEGER NOT NULL,
+    created_at TEXT NOT NULL
+);
+
 CREATE TABLE events (
     sequence INTEGER PRIMARY KEY AUTOINCREMENT,
     type TEXT NOT NULL,
@@ -107,6 +139,14 @@ class IntentRecord:
     target_node_id: str
     content: str
     generation: int
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutionRecord:
+    id: str
+    intent_id: str
+    provider: str
+    status: str
 
 
 def _id(prefix: str) -> str:
@@ -362,44 +402,52 @@ class BlackboardStore:
         content: str,
         generation: int,
     ) -> str:
+        with self.connection:
+            return self._merge_fact(source, content, generation)
+
+    def _merge_fact(
+        self,
+        source: str,
+        content: str,
+        generation: int,
+    ) -> str:
         normalized = _normalize(content)
         if not normalized:
             raise ValueError("fact content must be non-empty")
         fingerprint = _fingerprint(normalized)
-        with self.connection:
-            existing = self.connection.execute(
-                """
-                SELECT id FROM nodes
-                WHERE project_id = ? AND type = 'fact' AND fingerprint = ?
-                """,
-                (self.project_id, fingerprint),
-            ).fetchone()
-            if existing is not None:
-                node_id = str(existing["id"])
-                self._add_node_provenance(node_id, source, content)
-                self._event(
-                    "graph.node_updated",
-                    source,
-                    {"node_id": node_id, "change": "provenance"},
-                )
-                return node_id
-
-            node_id = self._insert_node(
-                "fact",
-                normalized,
+        existing = self.connection.execute(
+            """
+            SELECT id FROM nodes
+            WHERE project_id = ? AND type = 'fact' AND fingerprint = ?
+            """,
+            (self.project_id, fingerprint),
+        ).fetchone()
+        if existing is not None:
+            node_id = str(existing["id"])
+            self._add_node_provenance(node_id, source, content)
+            self._event(
+                "graph.node_updated",
                 source,
-                generation,
-                fingerprint,
+                {"node_id": node_id, "change": "provenance"},
             )
-            for similar_id in self._similar_facts(normalized, node_id):
-                self._insert_relation(
-                    "similar_to",
-                    node_id,
-                    similar_id,
-                    "orchestrator",
-                    generation,
-                )
             return node_id
+
+        node_id = self._insert_node(
+            "fact",
+            normalized,
+            source,
+            generation,
+            fingerprint,
+        )
+        for similar_id in self._similar_facts(normalized, node_id):
+            self._insert_relation(
+                "similar_to",
+                node_id,
+                similar_id,
+                "orchestrator",
+                generation,
+            )
+        return node_id
 
     def _similar_facts(
         self,
@@ -556,6 +604,329 @@ class BlackboardStore:
             ).fetchall()
         )
 
+    def start_execution(
+        self,
+        intent_id: str,
+        provider: str,
+        stdout_path: str,
+        stderr_path: str,
+        work_dir: str,
+    ) -> ExecutionRecord:
+        execution_id = _id("execution")
+        with self.connection:
+            exists = self.connection.execute(
+                "SELECT 1 FROM intents WHERE edge_id = ?",
+                (intent_id,),
+            ).fetchone()
+            if exists is None:
+                raise KeyError(intent_id)
+            self.connection.execute(
+                """
+                INSERT INTO intent_executions(
+                    id, intent_edge_id, provider, status, started_at,
+                    stdout_path, stderr_path, work_dir
+                ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?)
+                """,
+                (
+                    execution_id,
+                    intent_id,
+                    provider,
+                    _now(),
+                    stdout_path,
+                    stderr_path,
+                    work_dir,
+                ),
+            )
+            self._event(
+                "intent.execution_started",
+                provider,
+                {
+                    "intent_id": intent_id,
+                    "execution_id": execution_id,
+                },
+            )
+        return ExecutionRecord(
+            execution_id,
+            intent_id,
+            provider,
+            "running",
+        )
+
+    def execution(self, execution_id: str) -> dict[str, object]:
+        row = self.connection.execute(
+            "SELECT * FROM intent_executions WHERE id = ?",
+            (execution_id,),
+        ).fetchone()
+        if row is None:
+            raise KeyError(execution_id)
+        return dict(row)
+
+    def finish_execution(
+        self,
+        execution_id: str,
+        update,
+        exit_code: int | None,
+        status: str,
+    ) -> tuple[str, ...]:
+        with self.connection:
+            execution = self.connection.execute(
+                "SELECT * FROM intent_executions WHERE id = ?",
+                (execution_id,),
+            ).fetchone()
+            if execution is None:
+                raise KeyError(execution_id)
+            intent_id = str(execution["intent_edge_id"])
+            if update.intent_id != intent_id:
+                raise ValueError("result references the wrong intent")
+            intent = self.connection.execute(
+                """
+                SELECT e.generation
+                FROM edges AS e
+                JOIN intents AS i ON i.edge_id = e.id
+                WHERE e.id = ?
+                """,
+                (intent_id,),
+            ).fetchone()
+            if intent is None:
+                raise KeyError(intent_id)
+
+            refs: dict[str, str] = {}
+            for fact in update.facts:
+                refs[fact.ref] = self._merge_fact(
+                    str(execution["provider"]),
+                    fact.content,
+                    int(intent["generation"]),
+                )
+
+            known = {
+                str(row["id"])
+                for row in self.connection.execute(
+                    "SELECT id FROM nodes WHERE project_id = ?",
+                    (self.project_id,),
+                ).fetchall()
+            }
+            for edge in update.edges:
+                from_node = refs.get(edge.from_ref, edge.from_ref)
+                to_node = refs.get(edge.to_ref, edge.to_ref)
+                if from_node not in known or to_node not in known:
+                    raise ValueError("unknown node reference")
+                self._insert_relation(
+                    edge.type,
+                    from_node,
+                    to_node,
+                    str(execution["provider"]),
+                    int(intent["generation"]),
+                )
+
+            for node_id in dict.fromkeys(refs.values()):
+                self.connection.execute(
+                    """
+                    INSERT OR IGNORE INTO intent_outputs(
+                        intent_edge_id, execution_id, node_id
+                    ) VALUES (?, ?, ?)
+                    """,
+                    (intent_id, execution_id, node_id),
+                )
+
+            if update.goal_achieved:
+                if update.final_answer is None:
+                    raise ValueError("goal completion requires final answer")
+                self._record_answer(
+                    str(execution["provider"]),
+                    update.final_answer,
+                )
+
+            self.connection.execute(
+                """
+                UPDATE intent_executions
+                SET status = ?, finished_at = ?, exit_code = ?
+                WHERE id = ?
+                """,
+                (status, _now(), exit_code, execution_id),
+            )
+            self._event(
+                "intent.execution_finished",
+                str(execution["provider"]),
+                {
+                    "intent_id": intent_id,
+                    "execution_id": execution_id,
+                    "status": status,
+                },
+            )
+            return tuple(dict.fromkeys(refs.values()))
+
+    def fail_execution(
+        self,
+        execution_id: str,
+        status: str,
+        error_message: str,
+        exit_code: int | None = None,
+    ) -> None:
+        with self.connection:
+            execution = self.execution(execution_id)
+            self.connection.execute(
+                """
+                UPDATE intent_executions
+                SET status = ?, finished_at = ?, exit_code = ?,
+                    error_message = ?
+                WHERE id = ?
+                """,
+                (status, _now(), exit_code, error_message, execution_id),
+            )
+            self._event(
+                "intent.execution_finished",
+                str(execution["provider"]),
+                {
+                    "intent_id": execution["intent_edge_id"],
+                    "execution_id": execution_id,
+                    "status": status,
+                },
+            )
+
+    def intent_status(self, intent_id: str) -> str:
+        statuses = [
+            str(row["status"])
+            for row in self.connection.execute(
+                """
+                SELECT status FROM intent_executions
+                WHERE intent_edge_id = ?
+                """,
+                (intent_id,),
+            ).fetchall()
+        ]
+        if not statuses:
+            return "planned"
+        if any(status in {"planned", "running"} for status in statuses):
+            return "running"
+        if "completed" in statuses:
+            return "completed"
+        if all(status == "cancelled" for status in statuses):
+            return "cancelled"
+        return "failed"
+
+    def record_answer(self, provider: str, answer: str) -> None:
+        with self.connection:
+            self._record_answer(provider, answer)
+
+    def _record_answer(self, provider: str, answer: str) -> None:
+        normalized = answer.strip()
+        if not normalized:
+            raise ValueError("answer must be non-empty")
+        goal_version = int(
+            self.connection.execute(
+                "SELECT goal_version FROM projects WHERE id = ?",
+                (self.project_id,),
+            ).fetchone()[0]
+        )
+        self.connection.execute(
+            """
+            INSERT INTO final_answers(
+                id, provider, answer, goal_version, created_at
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            (_id("answer"), provider, normalized, goal_version, _now()),
+        )
+        self._event(
+            "answer.proposed",
+            provider,
+            {"answer": normalized, "goal_version": goal_version},
+        )
+
+    def consensus(self, available_providers: int) -> str | None:
+        goal_version = int(
+            self.connection.execute(
+                "SELECT goal_version FROM projects WHERE id = ?",
+                (self.project_id,),
+            ).fetchone()[0]
+        )
+        rows = self.connection.execute(
+            """
+            SELECT trim(answer) AS answer, COUNT(DISTINCT provider) AS supporters
+            FROM final_answers
+            WHERE goal_version = ?
+            GROUP BY trim(answer)
+            ORDER BY supporters DESC, answer
+            """,
+            (goal_version,),
+        ).fetchall()
+        threshold = 1 if available_providers == 1 else 2
+        winners = [
+            str(row["answer"])
+            for row in rows
+            if int(row["supporters"]) >= threshold
+        ]
+        return winners[0] if len(winners) == 1 else None
+
+    def candidates(self) -> tuple[str, ...]:
+        goal_version = int(
+            self.connection.execute(
+                "SELECT goal_version FROM projects WHERE id = ?",
+                (self.project_id,),
+            ).fetchone()[0]
+        )
+        return tuple(
+            str(row["answer"])
+            for row in self.connection.execute(
+                """
+                SELECT DISTINCT trim(answer) AS answer
+                FROM final_answers
+                WHERE goal_version = ? ORDER BY answer
+                """,
+                (goal_version,),
+            ).fetchall()
+        )
+
+    def events_after(self, sequence: int) -> tuple[dict[str, object], ...]:
+        return tuple(
+            {
+                "sequence": int(row["sequence"]),
+                "type": str(row["type"]),
+                "source": str(row["source"]),
+                "payload": json.loads(str(row["payload_json"])),
+                "created_at": str(row["created_at"]),
+            }
+            for row in self.connection.execute(
+                """
+                SELECT sequence, type, source, payload_json, created_at
+                FROM events WHERE sequence > ? ORDER BY sequence
+                """,
+                (sequence,),
+            ).fetchall()
+        )
+
+    def mark_interrupted(self) -> int:
+        with self.connection:
+            cursor = self.connection.execute(
+                """
+                UPDATE intent_executions
+                SET status = 'interrupted', finished_at = ?,
+                    error_message = 'server restarted'
+                WHERE status IN ('planned', 'running')
+                """,
+                (_now(),),
+            )
+            return int(cursor.rowcount)
+
+    def set_project_status(
+        self,
+        status: str,
+        final_answer: str | None = None,
+    ) -> None:
+        with self.connection:
+            self.connection.execute(
+                """
+                UPDATE projects
+                SET status = ?, final_answer = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (status, final_answer, _now(), self.project_id),
+            )
+            self._event(
+                "project.status_changed",
+                "orchestrator",
+                {"status": status, "final_answer": final_answer},
+            )
+
     def archive_node(self, node_id: str, source: str = "human") -> None:
         with self.connection:
             cursor = self.connection.execute(
@@ -609,7 +980,30 @@ class BlackboardStore:
                     (row["id"],),
                 ).fetchall()
             ]
-            nodes.append({**dict(row), "sources": sources, "produced_by": None})
+            output = self.connection.execute(
+                """
+                SELECT intent_edge_id, execution_id
+                FROM intent_outputs
+                WHERE node_id = ?
+                ORDER BY rowid DESC LIMIT 1
+                """,
+                (row["id"],),
+            ).fetchone()
+            produced_by = (
+                {
+                    "intent_id": str(output["intent_edge_id"]),
+                    "execution_id": str(output["execution_id"]),
+                }
+                if output is not None
+                else None
+            )
+            nodes.append(
+                {
+                    **dict(row),
+                    "sources": sources,
+                    "produced_by": produced_by,
+                }
+            )
 
         edge_rows = self.connection.execute(
             """
@@ -637,7 +1031,18 @@ class BlackboardStore:
             ]
             edge = {**dict(row), "sources": sources}
             if edge["type"] == "intent":
-                edge["status"] = "planned"
+                edge["status"] = self.intent_status(str(edge["id"]))
+                edge["executions"] = [
+                    dict(item)
+                    for item in self.connection.execute(
+                        """
+                        SELECT * FROM intent_executions
+                        WHERE intent_edge_id = ?
+                        ORDER BY started_at, id
+                        """,
+                        (edge["id"],),
+                    ).fetchall()
+                ]
             edges.append(edge)
 
         highest_generation = max(
@@ -652,7 +1057,7 @@ class BlackboardStore:
             "project": dict(project_row),
             "nodes": nodes,
             "edges": edges,
-            "candidates": [],
+            "candidates": list(self.candidates()),
             "highest_generation": highest_generation,
             "sequence": int(sequence_row["sequence"]),
         }

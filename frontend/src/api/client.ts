@@ -23,7 +23,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 
 export const api = {
   listProjects: () => request<ProjectSummary[]>('/api/projects'),
-  createProject: (payload: Record<string, unknown>) =>
+  createProject: (payload: object) =>
     request<ProjectSummary>('/api/projects', { method: 'POST', body: JSON.stringify(payload) }),
   getGraph: (projectId: string) =>
     request<ProjectSnapshot>(`/api/projects/${projectId}/graph`),

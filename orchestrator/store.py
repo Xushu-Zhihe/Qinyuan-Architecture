@@ -2,103 +2,139 @@ import hashlib
 import json
 import sqlite3
 import unicodedata
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from difflib import SequenceMatcher
 from pathlib import Path
 from uuid import uuid4
 
-from orchestrator.models import AGENT_NODE_TYPES, EDGE_TYPES, AgentUpdate
+from orchestrator.models import IntentProposal, RELATION_EDGE_TYPES
 
 
 SCHEMA = """
 PRAGMA foreign_keys = ON;
+PRAGMA journal_mode = WAL;
+PRAGMA busy_timeout = 5000;
 
-CREATE TABLE runs (
-    run_id TEXT PRIMARY KEY,
+CREATE TABLE projects (
+    id TEXT PRIMARY KEY,
     status TEXT NOT NULL,
-    max_rounds INTEGER NOT NULL CHECK(max_rounds > 0),
-    final_answer TEXT
-);
-
-CREATE TABLE rounds (
-    run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
-    round_number INTEGER NOT NULL CHECK(round_number >= 0),
-    status TEXT NOT NULL,
-    snapshot_path TEXT,
-    PRIMARY KEY(run_id, round_number)
+    goal_version INTEGER NOT NULL DEFAULT 1,
+    final_answer TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
 );
 
 CREATE TABLE nodes (
     id TEXT PRIMARY KEY,
-    run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
-    type TEXT NOT NULL CHECK(type IN ('goal', 'origin', 'fact', 'intent', 'hint')),
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    type TEXT NOT NULL CHECK(type IN ('goal', 'origin', 'fact', 'hint')),
     content TEXT NOT NULL CHECK(length(trim(content)) > 0),
     fingerprint TEXT,
     state TEXT NOT NULL DEFAULT 'active',
-    created_round INTEGER NOT NULL CHECK(created_round >= 0)
+    generation INTEGER NOT NULL CHECK(generation >= 0),
+    created_at TEXT NOT NULL
 );
 
-CREATE UNIQUE INDEX one_goal_per_run ON nodes(run_id) WHERE type = 'goal';
-CREATE UNIQUE INDEX one_origin_per_run ON nodes(run_id) WHERE type = 'origin';
-CREATE INDEX nodes_by_run_type ON nodes(run_id, type, state);
-CREATE INDEX fact_fingerprint ON nodes(run_id, fingerprint) WHERE type = 'fact';
+CREATE UNIQUE INDEX one_goal_per_project
+ON nodes(project_id) WHERE type = 'goal' AND state = 'active';
+CREATE UNIQUE INDEX one_origin_per_project
+ON nodes(project_id) WHERE type = 'origin' AND state = 'active';
+CREATE UNIQUE INDEX fact_fingerprint
+ON nodes(project_id, fingerprint) WHERE type = 'fact';
+CREATE INDEX nodes_by_project_type
+ON nodes(project_id, type, state, generation);
 
 CREATE TABLE node_provenance (
     id TEXT PRIMARY KEY,
     node_id TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
     source TEXT NOT NULL,
-    round_number INTEGER NOT NULL CHECK(round_number >= 0),
     original_content TEXT NOT NULL,
-    UNIQUE(node_id, source, round_number, original_content)
+    created_at TEXT NOT NULL,
+    UNIQUE(node_id, source, original_content)
+);
+
+CREATE TABLE node_versions (
+    id TEXT PRIMARY KEY,
+    node_id TEXT NOT NULL REFERENCES nodes(id),
+    old_content TEXT NOT NULL,
+    new_content TEXT NOT NULL,
+    source TEXT NOT NULL,
+    created_at TEXT NOT NULL
 );
 
 CREATE TABLE edges (
     id TEXT PRIMARY KEY,
-    run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
     type TEXT NOT NULL,
-    from_node TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
-    to_node TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
-    source TEXT NOT NULL,
-    round_number INTEGER NOT NULL CHECK(round_number >= 0),
-    UNIQUE(run_id, type, from_node, to_node, source, round_number)
+    from_node TEXT NOT NULL REFERENCES nodes(id),
+    to_node TEXT NOT NULL REFERENCES nodes(id),
+    generation INTEGER NOT NULL CHECK(generation >= 0),
+    created_at TEXT NOT NULL
 );
 
-CREATE TABLE agent_results (
-    run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
-    round_number INTEGER NOT NULL,
-    provider TEXT NOT NULL,
-    process_status TEXT NOT NULL,
-    protocol_status TEXT NOT NULL,
-    exit_code INTEGER,
-    duration_seconds REAL NOT NULL,
-    stdout_path TEXT NOT NULL,
-    stderr_path TEXT NOT NULL,
-    work_dir TEXT NOT NULL,
-    final_answer TEXT,
-    PRIMARY KEY(run_id, round_number, provider)
+CREATE INDEX edges_by_project_generation
+ON edges(project_id, generation, type);
+
+CREATE TABLE edge_provenance (
+    id TEXT PRIMARY KEY,
+    edge_id TEXT NOT NULL REFERENCES edges(id) ON DELETE CASCADE,
+    source TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(edge_id, source)
+);
+
+CREATE TABLE intents (
+    edge_id TEXT PRIMARY KEY REFERENCES edges(id) ON DELETE CASCADE,
+    content TEXT NOT NULL,
+    fingerprint TEXT NOT NULL UNIQUE
 );
 
 CREATE TABLE events (
     sequence INTEGER PRIMARY KEY AUTOINCREMENT,
-    run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
-    round_number INTEGER NOT NULL,
     type TEXT NOT NULL,
     source TEXT NOT NULL,
-    payload_json TEXT NOT NULL
+    payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
 );
 """
+
+
+@dataclass(frozen=True, slots=True)
+class IntentRecord:
+    id: str
+    source_node_id: str
+    target_node_id: str
+    content: str
+    generation: int
 
 
 def _id(prefix: str) -> str:
     return f"{prefix}-{uuid4().hex}"
 
 
-def _normalize_fact(content: str) -> str:
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _normalize(content: str) -> str:
     normalized = unicodedata.normalize("NFKC", content)
     return " ".join(normalized.strip().split())
 
 
-def _fact_fingerprint(content: str) -> str:
-    return hashlib.sha256(_normalize_fact(content).encode("utf-8")).hexdigest()
+def _fingerprint(content: str) -> str:
+    return hashlib.sha256(_normalize(content).encode("utf-8")).hexdigest()
+
+
+def _intent_fingerprint(proposal: IntentProposal) -> str:
+    material = "\0".join(
+        (
+            proposal.source_node_id,
+            proposal.target_node_id,
+            _normalize(proposal.content),
+        )
+    )
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
 
 
 class BlackboardStore:
@@ -106,556 +142,527 @@ class BlackboardStore:
         self,
         path: Path,
         connection: sqlite3.Connection,
-        run_id: str,
+        project_id: str,
     ) -> None:
         self.path = path
         self.connection = connection
-        self.run_id = run_id
+        self.project_id = project_id
 
     @classmethod
     def create(
         cls,
         path: Path,
-        run_id: str,
-        max_rounds: int,
+        project_id: str,
         goal: str,
         origin: str,
         hints: tuple[str, ...],
     ) -> "BlackboardStore":
+        if not goal.strip() or not origin.strip():
+            raise ValueError("goal and origin must be non-empty")
         path.parent.mkdir(parents=True, exist_ok=True)
-        connection = sqlite3.connect(path)
+        connection = sqlite3.connect(path, check_same_thread=False)
         connection.row_factory = sqlite3.Row
         connection.executescript(SCHEMA)
-        store = cls(path, connection, run_id)
+        store = cls(path, connection, project_id)
+        now = _now()
         with connection:
             connection.execute(
                 """
-                INSERT INTO runs(run_id, status, max_rounds)
-                VALUES (?, 'running', ?)
+                INSERT INTO projects(
+                    id, status, goal_version, created_at, updated_at
+                ) VALUES (?, 'idle', 1, ?, ?)
                 """,
-                (run_id, max_rounds),
+                (project_id, now, now),
             )
-            connection.execute(
-                """
-                INSERT INTO rounds(run_id, round_number, status)
-                VALUES (?, 0, 'initialized')
-                """,
-                (run_id,),
+            goal_id = store._insert_node(
+                "goal", goal, "human", generation=0
             )
-            goal_id = store._insert_node("goal", goal, "human", 0)
-            store._insert_node("origin", origin, "human", 0)
+            store._insert_node(
+                "origin", origin, "human", generation=0
+            )
             for hint in hints:
-                hint_id = store._insert_node("hint", hint, "human", 0)
-                store._insert_edge("addresses", hint_id, goal_id, "human", 0)
+                if not hint.strip():
+                    continue
+                hint_id = store._insert_node(
+                    "hint", hint, "human", generation=0
+                )
+                store._insert_relation(
+                    "addresses",
+                    hint_id,
+                    goal_id,
+                    "human",
+                    generation=0,
+                )
         return store
 
     def close(self) -> None:
         self.connection.close()
+
+    def _event(
+        self,
+        event_type: str,
+        source: str,
+        payload: dict[str, object],
+    ) -> int:
+        cursor = self.connection.execute(
+            """
+            INSERT INTO events(type, source, payload_json, created_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (
+                event_type,
+                source,
+                json.dumps(payload, ensure_ascii=False),
+                _now(),
+            ),
+        )
+        return int(cursor.lastrowid)
 
     def _insert_node(
         self,
         node_type: str,
         content: str,
         source: str,
-        round_number: int,
+        generation: int,
         fingerprint: str | None = None,
     ) -> str:
         node_id = _id(node_type)
+        normalized = _normalize(content)
+        created_at = _now()
         self.connection.execute(
             """
             INSERT INTO nodes(
-                id, run_id, type, content, fingerprint, created_round
-            ) VALUES (?, ?, ?, ?, ?, ?)
+                id, project_id, type, content, fingerprint,
+                state, generation, created_at
+            ) VALUES (?, ?, ?, ?, ?, 'active', ?, ?)
             """,
             (
                 node_id,
-                self.run_id,
+                self.project_id,
                 node_type,
-                content.strip(),
+                normalized,
                 fingerprint,
-                round_number,
+                generation,
+                created_at,
             ),
         )
-        self.connection.execute(
-            """
-            INSERT INTO node_provenance(
-                id, node_id, source, round_number, original_content
-            ) VALUES (?, ?, ?, ?, ?)
-            """,
-            (_id("provenance"), node_id, source, round_number, content),
-        )
+        self._add_node_provenance(node_id, source, content)
         self._event(
-            round_number,
-            "node_created",
+            "graph.node_added",
             source,
             {"node_id": node_id, "type": node_type},
         )
         return node_id
 
-    def _insert_edge(
-        self,
-        edge_type: str,
-        from_node: str,
-        to_node: str,
-        source: str,
-        round_number: int,
-    ) -> str:
-        edge_id = _id("edge")
-        self.connection.execute(
-            """
-            INSERT INTO edges(
-                id, run_id, type, from_node, to_node, source, round_number
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                edge_id,
-                self.run_id,
-                edge_type,
-                from_node,
-                to_node,
-                source,
-                round_number,
-            ),
-        )
-        self._event(
-            round_number,
-            "edge_created",
-            source,
-            {"edge_id": edge_id, "type": edge_type},
-        )
-        return edge_id
-
-    def _event(
-        self,
-        round_number: int,
-        event_type: str,
-        source: str,
-        payload: dict[str, object],
-    ) -> None:
-        self.connection.execute(
-            """
-            INSERT INTO events(
-                run_id, round_number, type, source, payload_json
-            ) VALUES (?, ?, ?, ?, ?)
-            """,
-            (
-                self.run_id,
-                round_number,
-                event_type,
-                source,
-                json.dumps(payload, ensure_ascii=False),
-            ),
-        )
-
-    def _add_provenance(
+    def _add_node_provenance(
         self,
         node_id: str,
         source: str,
-        round_number: int,
         original_content: str,
     ) -> None:
         self.connection.execute(
             """
             INSERT OR IGNORE INTO node_provenance(
-                id, node_id, source, round_number, original_content
+                id, node_id, source, original_content, created_at
             ) VALUES (?, ?, ?, ?, ?)
             """,
             (
                 _id("provenance"),
                 node_id,
                 source,
-                round_number,
                 original_content,
+                _now(),
             ),
         )
-        self._event(
-            round_number,
-            "provenance_added",
-            source,
-            {"node_id": node_id},
+
+    def _add_edge_provenance(self, edge_id: str, source: str) -> None:
+        self.connection.execute(
+            """
+            INSERT OR IGNORE INTO edge_provenance(
+                id, edge_id, source, created_at
+            ) VALUES (?, ?, ?, ?)
+            """,
+            (_id("provenance"), edge_id, source, _now()),
         )
 
-    def _current_intent(self, source: str) -> str | None:
+    def _insert_relation(
+        self,
+        edge_type: str,
+        from_node: str,
+        to_node: str,
+        source: str,
+        generation: int,
+    ) -> str:
+        if edge_type not in RELATION_EDGE_TYPES:
+            raise ValueError(f"unsupported relation edge type: {edge_type}")
+        edge_id = _id("edge")
+        self.connection.execute(
+            """
+            INSERT INTO edges(
+                id, project_id, type, from_node, to_node,
+                generation, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                edge_id,
+                self.project_id,
+                edge_type,
+                from_node,
+                to_node,
+                generation,
+                _now(),
+            ),
+        )
+        self._add_edge_provenance(edge_id, source)
+        self._event(
+            "graph.edge_added",
+            source,
+            {"edge_id": edge_id, "type": edge_type},
+        )
+        return edge_id
+
+    def node_id(self, node_type: str) -> str:
         row = self.connection.execute(
             """
-            SELECT n.id
-            FROM nodes AS n
-            JOIN node_provenance AS p ON p.node_id = n.id
-            WHERE n.run_id = ?
-              AND n.type = 'intent'
-              AND n.state = 'active'
-              AND p.source = ?
-            ORDER BY n.created_round DESC
-            LIMIT 1
+            SELECT id FROM nodes
+            WHERE project_id = ? AND type = ? AND state = 'active'
+            ORDER BY created_at LIMIT 1
             """,
-            (self.run_id, source),
+            (self.project_id, node_type),
         ).fetchone()
-        return row[0] if row else None
+        if row is None:
+            raise KeyError(node_type)
+        return str(row["id"])
+
+    def node_types(self) -> dict[str, str]:
+        return {
+            str(row["id"]): str(row["type"])
+            for row in self.connection.execute(
+                """
+                SELECT id, type FROM nodes
+                WHERE project_id = ? AND state = 'active'
+                """,
+                (self.project_id,),
+            ).fetchall()
+        }
+
+    def add_human_node(self, node_type: str, content: str) -> str:
+        if node_type == "fact":
+            return self.add_fact("human", content, generation=0)
+        if node_type != "hint":
+            raise ValueError("human graph nodes must be fact or hint")
+        with self.connection:
+            return self._insert_node(
+                "hint", content, "human", generation=0
+            )
+
+    def add_fact(
+        self,
+        source: str,
+        content: str,
+        generation: int,
+    ) -> str:
+        normalized = _normalize(content)
+        if not normalized:
+            raise ValueError("fact content must be non-empty")
+        fingerprint = _fingerprint(normalized)
+        with self.connection:
+            existing = self.connection.execute(
+                """
+                SELECT id FROM nodes
+                WHERE project_id = ? AND type = 'fact' AND fingerprint = ?
+                """,
+                (self.project_id, fingerprint),
+            ).fetchone()
+            if existing is not None:
+                node_id = str(existing["id"])
+                self._add_node_provenance(node_id, source, content)
+                self._event(
+                    "graph.node_updated",
+                    source,
+                    {"node_id": node_id, "change": "provenance"},
+                )
+                return node_id
+
+            node_id = self._insert_node(
+                "fact",
+                normalized,
+                source,
+                generation,
+                fingerprint,
+            )
+            for similar_id in self._similar_facts(normalized, node_id):
+                self._insert_relation(
+                    "similar_to",
+                    node_id,
+                    similar_id,
+                    "orchestrator",
+                    generation,
+                )
+            return node_id
 
     def _similar_facts(
         self,
         content: str,
         exclude_id: str,
     ) -> tuple[str, ...]:
-        normalized = _normalize_fact(content)
         rows = self.connection.execute(
             """
-            SELECT id, content
-            FROM nodes
-            WHERE run_id = ? AND type = 'fact' AND id != ?
+            SELECT id, content FROM nodes
+            WHERE project_id = ? AND type = 'fact' AND id != ?
             """,
-            (self.run_id, exclude_id),
+            (self.project_id, exclude_id),
         ).fetchall()
         return tuple(
-            row["id"]
+            str(row["id"])
             for row in rows
             if SequenceMatcher(
                 None,
-                normalized,
-                _normalize_fact(row["content"]),
+                content,
+                _normalize(str(row["content"])),
             ).ratio()
             >= 0.92
         )
 
-    def _merge_node(
+    def add_relation(
         self,
-        proposal_type: str,
-        content: str,
-        source: str,
-        round_number: int,
+        edge_type: str,
+        from_node: str,
+        to_node: str,
+        source: str = "human",
     ) -> str:
-        if proposal_type == "fact":
-            fingerprint = _fact_fingerprint(content)
-            row = self.connection.execute(
-                """
-                SELECT id
-                FROM nodes
-                WHERE run_id = ? AND type = 'fact' AND fingerprint = ?
-                """,
-                (self.run_id, fingerprint),
-            ).fetchone()
-            if row:
-                self._add_provenance(
-                    row["id"],
-                    source,
-                    round_number,
-                    content,
-                )
-                return row["id"]
-
-            node_id = self._insert_node(
-                "fact",
-                _normalize_fact(content),
-                source,
-                round_number,
-                fingerprint,
-            )
-            for similar_id in self._similar_facts(content, node_id):
-                self._insert_edge(
-                    "similar_to",
-                    node_id,
-                    similar_id,
-                    "orchestrator",
-                    round_number,
-                )
-            return node_id
-
-        previous = self._current_intent(source)
-        node_id = self._insert_node(
-            "intent",
-            content,
-            source,
-            round_number,
+        generation = max(
+            self._node_generation(from_node),
+            self._node_generation(to_node),
         )
-        if previous:
-            self.connection.execute(
-                "UPDATE nodes SET state = 'superseded' WHERE id = ?",
-                (previous,),
-            )
-            self._insert_edge(
-                "supersedes",
-                node_id,
-                previous,
-                "orchestrator",
-                round_number,
-            )
-            self._event(
-                round_number,
-                "intent_superseded",
+        with self.connection:
+            return self._insert_relation(
+                edge_type,
+                from_node,
+                to_node,
                 source,
-                {"old": previous, "new": node_id},
+                generation,
             )
-        return node_id
 
-    def _existing_node_ids(self) -> set[str]:
-        return {
-            row[0]
-            for row in self.connection.execute(
-                "SELECT id FROM nodes WHERE run_id = ?",
-                (self.run_id,),
-            ).fetchall()
-        }
+    def _node_generation(self, node_id: str) -> int:
+        row = self.connection.execute(
+            "SELECT generation FROM nodes WHERE id = ? AND project_id = ?",
+            (node_id, self.project_id),
+        ).fetchone()
+        if row is None:
+            raise ValueError("unknown node reference")
+        return int(row["generation"])
 
-    def apply_round(
+    def create_or_merge_intent(
         self,
-        round_number: int,
-        updates: tuple[tuple[str, AgentUpdate], ...],
-    ) -> None:
+        source: str,
+        proposal: IntentProposal,
+    ) -> IntentRecord:
+        node_types = self.node_types()
+        source_type = node_types.get(proposal.source_node_id)
+        target_type = node_types.get(proposal.target_node_id)
+        facts_exist = "fact" in node_types.values()
+        if source_type != "fact" and not (
+            source_type == "origin" and not facts_exist
+        ):
+            raise ValueError("origin is only allowed as bootstrap source")
+        if target_type not in {"goal", "fact", "hint"}:
+            raise ValueError("unsupported intent target")
+        normalized = _normalize(proposal.content)
+        if not normalized:
+            raise ValueError("intent content must be non-empty")
+        fingerprint = _intent_fingerprint(
+            IntentProposal(
+                proposal.source_node_id,
+                proposal.target_node_id,
+                normalized,
+            )
+        )
+        generation = self._node_generation(proposal.source_node_id) + 1
+
         with self.connection:
-            known = self._existing_node_ids()
-            for source, update in sorted(updates, key=lambda item: item[0]):
-                refs: dict[str, str] = {}
-                for proposal in update.nodes:
-                    if proposal.type not in AGENT_NODE_TYPES:
-                        raise ValueError(
-                            f"unsupported agent node type: {proposal.type}"
-                        )
-                    refs[proposal.ref] = self._merge_node(
-                        proposal.type,
-                        proposal.content,
-                        source,
-                        round_number,
-                    )
-
-                resolved = known | set(refs.values())
-                for edge in update.edges:
-                    if edge.type not in EDGE_TYPES or edge.type == "supersedes":
-                        raise ValueError(f"unsupported edge type: {edge.type}")
-                    from_node = refs.get(edge.from_ref, edge.from_ref)
-                    to_node = refs.get(edge.to_ref, edge.to_ref)
-                    if from_node not in resolved or to_node not in resolved:
-                        raise ValueError("unknown node reference")
-                    self._insert_edge(
-                        edge.type,
-                        from_node,
-                        to_node,
-                        source,
-                        round_number,
-                    )
-                known.update(refs.values())
-
-            self.connection.execute(
+            existing = self.connection.execute(
                 """
-                INSERT INTO rounds(run_id, round_number, status)
-                VALUES (?, ?, 'merged')
-                ON CONFLICT(run_id, round_number) DO UPDATE SET
-                    status = 'merged'
+                SELECT e.id, e.from_node, e.to_node, i.content, e.generation
+                FROM intents AS i
+                JOIN edges AS e ON e.id = i.edge_id
+                WHERE i.fingerprint = ?
                 """,
-                (self.run_id, round_number),
-            )
+                (fingerprint,),
+            ).fetchone()
+            if existing is not None:
+                edge_id = str(existing["id"])
+                self._add_edge_provenance(edge_id, source)
+                self._event(
+                    "graph.edge_updated",
+                    source,
+                    {"edge_id": edge_id, "change": "provenance"},
+                )
+                return IntentRecord(
+                    edge_id,
+                    str(existing["from_node"]),
+                    str(existing["to_node"]),
+                    str(existing["content"]),
+                    int(existing["generation"]),
+                )
 
-    def record_agent_result(
-        self,
-        round_number: int,
-        provider: str,
-        process_status: str,
-        protocol_status: str,
-        exit_code: int | None,
-        duration_seconds: float,
-        stdout_path: str,
-        stderr_path: str,
-        work_dir: str,
-        final_answer: str | None,
-    ) -> None:
-        with self.connection:
+            edge_id = _id("intent")
             self.connection.execute(
                 """
-                INSERT INTO agent_results(
-                    run_id,
-                    round_number,
-                    provider,
-                    process_status,
-                    protocol_status,
-                    exit_code,
-                    duration_seconds,
-                    stdout_path,
-                    stderr_path,
-                    work_dir,
-                    final_answer
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO edges(
+                    id, project_id, type, from_node, to_node,
+                    generation, created_at
+                ) VALUES (?, ?, 'intent', ?, ?, ?, ?)
                 """,
                 (
-                    self.run_id,
-                    round_number,
-                    provider,
-                    process_status,
-                    protocol_status,
-                    exit_code,
-                    duration_seconds,
-                    stdout_path,
-                    stderr_path,
-                    work_dir,
-                    final_answer.strip() if final_answer else None,
+                    edge_id,
+                    self.project_id,
+                    proposal.source_node_id,
+                    proposal.target_node_id,
+                    generation,
+                    _now(),
                 ),
             )
+            self.connection.execute(
+                """
+                INSERT INTO intents(edge_id, content, fingerprint)
+                VALUES (?, ?, ?)
+                """,
+                (edge_id, normalized, fingerprint),
+            )
+            self._add_edge_provenance(edge_id, source)
+            self._event(
+                "graph.edge_added",
+                source,
+                {"edge_id": edge_id, "type": "intent"},
+            )
+            return IntentRecord(
+                edge_id,
+                proposal.source_node_id,
+                proposal.target_node_id,
+                normalized,
+                generation,
+            )
 
-    def consensus(
-        self,
-        round_number: int,
-        available_agents: int,
-    ) -> str | None:
-        rows = self.connection.execute(
-            """
-            SELECT
-                trim(final_answer) AS answer,
-                COUNT(DISTINCT provider) AS supporters
-            FROM agent_results
-            WHERE run_id = ?
-              AND round_number = ?
-              AND protocol_status = 'valid'
-              AND final_answer IS NOT NULL
-            GROUP BY trim(final_answer)
-            ORDER BY supporters DESC, answer
-            """,
-            (self.run_id, round_number),
-        ).fetchall()
-        threshold = 1 if available_agents == 1 else 2
-        winners = [
-            row["answer"]
-            for row in rows
-            if row["supporters"] >= threshold
-        ]
-        return winners[0] if len(winners) == 1 else None
-
-    def candidates(self) -> tuple[str, ...]:
+    def intent_sources(self, intent_id: str) -> tuple[str, ...]:
         return tuple(
-            row[0]
+            str(row["source"])
             for row in self.connection.execute(
                 """
-                SELECT DISTINCT trim(final_answer)
-                FROM agent_results
-                WHERE run_id = ? AND final_answer IS NOT NULL
-                ORDER BY trim(final_answer)
+                SELECT source FROM edge_provenance
+                WHERE edge_id = ? ORDER BY source
                 """,
-                (self.run_id,),
+                (intent_id,),
             ).fetchall()
         )
 
-    def add_hint(self, content: str, round_number: int) -> str:
-        goal_id = self.connection.execute(
-            """
-            SELECT id
-            FROM nodes
-            WHERE run_id = ? AND type = 'goal'
-            """,
-            (self.run_id,),
-        ).fetchone()[0]
+    def archive_node(self, node_id: str, source: str = "human") -> None:
         with self.connection:
-            hint_id = self._insert_node(
-                "hint",
-                content,
-                "human",
-                round_number,
-            )
-            self._insert_edge(
-                "addresses",
-                hint_id,
-                goal_id,
-                "human",
-                round_number,
-            )
-        return hint_id
-
-    def finish(
-        self,
-        status: str,
-        final_answer: str | None,
-        round_number: int,
-    ) -> None:
-        with self.connection:
-            self.connection.execute(
+            cursor = self.connection.execute(
                 """
-                UPDATE runs
-                SET status = ?, final_answer = ?
-                WHERE run_id = ?
+                UPDATE nodes SET state = 'archived'
+                WHERE id = ? AND project_id = ?
                 """,
-                (status, final_answer, self.run_id),
+                (node_id, self.project_id),
             )
+            if cursor.rowcount != 1:
+                raise KeyError(node_id)
             self._event(
-                round_number,
-                "run_finished",
-                "orchestrator",
-                {"status": status, "final_answer": final_answer},
+                "graph.node_updated",
+                source,
+                {"node_id": node_id, "state": "archived"},
             )
 
     def snapshot(self) -> dict[str, object]:
-        run = dict(
-            self.connection.execute(
-                """
-                SELECT run_id, status, max_rounds, final_answer
-                FROM runs WHERE run_id = ?
-                """,
-                (self.run_id,),
-            ).fetchone()
-        )
+        project_row = self.connection.execute(
+            "SELECT * FROM projects WHERE id = ?",
+            (self.project_id,),
+        ).fetchone()
+        if project_row is None:
+            raise KeyError(self.project_id)
+
         node_rows = self.connection.execute(
             """
-            SELECT id, type, content, state, created_round
-            FROM nodes
-            WHERE run_id = ?
-            ORDER BY created_round,
+            SELECT id, type, content, state, generation, created_at
+            FROM nodes WHERE project_id = ?
+            ORDER BY generation,
                 CASE type
                     WHEN 'goal' THEN 0
                     WHEN 'origin' THEN 1
                     WHEN 'hint' THEN 2
-                    WHEN 'fact' THEN 3
-                    ELSE 4
+                    ELSE 3
                 END,
+                created_at,
                 id
             """,
-            (self.run_id,),
+            (self.project_id,),
         ).fetchall()
-        nodes: list[dict[str, object]] = []
+        nodes = []
         for row in node_rows:
             sources = [
-                item[0]
+                str(item["source"])
                 for item in self.connection.execute(
                     """
-                    SELECT DISTINCT source
-                    FROM node_provenance
-                    WHERE node_id = ?
-                    ORDER BY source
+                    SELECT DISTINCT source FROM node_provenance
+                    WHERE node_id = ? ORDER BY source
                     """,
                     (row["id"],),
                 ).fetchall()
             ]
-            nodes.append({**dict(row), "sources": sources})
-        edges = [
-            dict(row)
-            for row in self.connection.execute(
-                """
-                SELECT id, type, from_node, to_node, source, round_number
-                FROM edges
-                WHERE run_id = ?
-                ORDER BY round_number, id
-                """,
-                (self.run_id,),
-            ).fetchall()
-        ]
+            nodes.append({**dict(row), "sources": sources, "produced_by": None})
+
+        edge_rows = self.connection.execute(
+            """
+            SELECT
+                e.id, e.type, e.from_node, e.to_node,
+                e.generation, e.created_at, i.content
+            FROM edges AS e
+            LEFT JOIN intents AS i ON i.edge_id = e.id
+            WHERE e.project_id = ?
+            ORDER BY e.generation, e.created_at, e.id
+            """,
+            (self.project_id,),
+        ).fetchall()
+        edges = []
+        for row in edge_rows:
+            sources = [
+                str(item["source"])
+                for item in self.connection.execute(
+                    """
+                    SELECT DISTINCT source FROM edge_provenance
+                    WHERE edge_id = ? ORDER BY source
+                    """,
+                    (row["id"],),
+                ).fetchall()
+            ]
+            edge = {**dict(row), "sources": sources}
+            if edge["type"] == "intent":
+                edge["status"] = "planned"
+            edges.append(edge)
+
+        highest_generation = max(
+            [0]
+            + [int(node["generation"]) for node in nodes]
+            + [int(edge["generation"]) for edge in edges]
+        )
+        sequence_row = self.connection.execute(
+            "SELECT COALESCE(MAX(sequence), 0) AS sequence FROM events"
+        ).fetchone()
         return {
-            "run": run,
+            "project": dict(project_row),
             "nodes": nodes,
             "edges": edges,
-            "candidates": list(self.candidates()),
+            "candidates": [],
+            "highest_generation": highest_generation,
+            "sequence": int(sequence_row["sequence"]),
         }
 
-    def export_snapshot(self, round_number: int, directory: Path) -> Path:
+    def export_snapshot(self, directory: Path) -> Path:
         directory.mkdir(parents=True, exist_ok=True)
-        path = directory / f"round-{round_number:03d}.json"
+        generation = int(self.snapshot()["highest_generation"])
+        path = directory / f"generation-{generation:03d}.json"
         path.write_text(
             json.dumps(self.snapshot(), ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
         )
-        with self.connection:
-            self.connection.execute(
-                """
-                INSERT INTO rounds(
-                    run_id, round_number, status, snapshot_path
-                ) VALUES (?, ?, 'snapshot_ready', ?)
-                ON CONFLICT(run_id, round_number) DO UPDATE SET
-                    status = excluded.status,
-                    snapshot_path = excluded.snapshot_path
-                """,
-                (self.run_id, round_number, str(path.resolve())),
-            )
         return path

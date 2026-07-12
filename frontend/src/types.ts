@@ -1,5 +1,6 @@
 export type BlackboardNodeType = 'goal' | 'origin' | 'fact' | 'hint'
 export type WorkspaceMode = 'browse' | 'edit'
+export type GraphTool = 'select' | 'connect'
 export type IntentStatus = 'planned' | 'running' | 'completed' | 'failed' | 'cancelled'
 
 export interface ProvenanceOutput {

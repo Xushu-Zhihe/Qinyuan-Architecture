@@ -29,6 +29,7 @@ export function LogConsole({
 }) {
   const [stream, setStream] = useState<LogStream>('stdout')
   const [storedLogs, setStoredLogs] = useState<ExecutionLogs>({ stdout: '', stderr: '' })
+  const [liveBaseline, setLiveBaseline] = useState({ stdout: 0, stderr: 0 })
   const [cleared, setCleared] = useState(false)
   const [follow, setFollow] = useState(true)
   const [collapsed, setCollapsed] = useState(false)
@@ -37,19 +38,30 @@ export function LogConsole({
 
   useEffect(() => {
     setStoredLogs({ stdout: '', stderr: '' })
+    setLiveBaseline({
+      stdout: liveLogs.stdout.length,
+      stderr: liveLogs.stderr.length,
+    })
     setCleared(false)
     setError(null)
     if (!execution) return
     let active = true
     void loadLogs(projectId, execution.id)
-      .then(logs => { if (active) setStoredLogs(logs) })
+      .then(logs => {
+        if (!active) return
+        setStoredLogs(logs)
+        setLiveBaseline(current => ({
+          stdout: logs.stdout ? current.stdout : 0,
+          stderr: logs.stderr ? current.stderr : 0,
+        }))
+      })
       .catch(reason => { if (active) setError(reason instanceof Error ? reason.message : String(reason)) })
     return () => { active = false }
   }, [execution?.id, loadLogs, projectId])
 
   const visibleText = cleared
     ? ''
-    : capLogText(storedLogs[stream] + liveLogs[stream])
+    : capLogText(storedLogs[stream] + liveLogs[stream].slice(liveBaseline[stream]))
 
   useEffect(() => {
     if (follow && viewportRef.current) {

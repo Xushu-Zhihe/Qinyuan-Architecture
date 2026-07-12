@@ -49,4 +49,23 @@ describe('NewProjectDialog', () => {
       expect.objectContaining({ mode: 'run', providers: ['codex'] }),
     )
   })
+
+  it('keeps selected providers for a manual project that can start later', async () => {
+    const onSubmit = vi.fn()
+    render(
+      <NewProjectDialog
+        open
+        providers={['codex', 'claude']}
+        onSubmit={onSubmit}
+        onClose={() => {}}
+      />,
+    )
+    await fillRequiredFields()
+    await userEvent.click(screen.getByLabelText('codex'))
+    await userEvent.click(screen.getByRole('button', { name: '创建项目' }))
+
+    expect(onSubmit).toHaveBeenCalledWith(
+      expect.objectContaining({ mode: 'manual', providers: ['codex'] }),
+    )
+  })
 })

@@ -10,6 +10,8 @@ from fastapi import (
     WebSocketDisconnect,
     status,
 )
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 
 from orchestrator.layout import LayoutConflict
 from orchestrator.models import IntentProposal
@@ -25,12 +27,14 @@ from worker.models import ProviderConfig
 
 
 DEFAULT_DATA_ROOT = Path(__file__).resolve().parents[1] / "web-data"
+DEFAULT_FRONTEND_DIST = Path(__file__).resolve().parents[1] / "frontend" / "dist"
 
 
 def create_app(
     data_root: Path | None = None,
     provider_configs: tuple[ProviderConfig, ...] = (),
     execute=None,
+    frontend_dist: Path | None = None,
 ) -> FastAPI:
     service = ProjectService(
         (data_root or DEFAULT_DATA_ROOT).resolve(),
@@ -45,6 +49,11 @@ def create_app(
 
     app = FastAPI(title="Blackboard", lifespan=lifespan)
     app.state.projects = service
+    dist_root = (frontend_dist or DEFAULT_FRONTEND_DIST).resolve()
+    index_file = dist_root / "index.html"
+    assets_root = dist_root / "assets"
+    if index_file.is_file() and assets_root.is_dir():
+        app.mount("/assets", StaticFiles(directory=assets_root), name="assets")
 
     def handle(project_id: str):
         try:
@@ -87,7 +96,14 @@ def create_app(
     @app.get("/api/projects/{project_id}/graph")
     def get_graph(project_id: str):
         project = handle(project_id)
-        return {**project.store.snapshot(), "layout": project.layout.load()}
+        snapshot = project.store.snapshot()
+        graph_project = dict(snapshot["project"])
+        snapshot["project"] = {
+            **project_record_dict(project.record),
+            "status": graph_project["status"],
+            "final_answer": graph_project.get("final_answer"),
+        }
+        return {**snapshot, "layout": project.layout.load()}
 
     @app.post(
         "/api/projects/{project_id}/nodes",
@@ -298,5 +314,12 @@ def create_app(
                     )
         except WebSocketDisconnect:
             return
+
+    if index_file.is_file():
+        @app.get("/{path:path}", include_in_schema=False)
+        def frontend_route(path: str):
+            if path == "api" or path.startswith("api/"):
+                raise HTTPException(status_code=404, detail="not found")
+            return FileResponse(index_file)
 
     return app

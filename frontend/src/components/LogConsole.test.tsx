@@ -74,4 +74,20 @@ describe('LogConsole', () => {
 
     await waitFor(() => expect(screen.getByText('persistent output', { exact: false })).toBeInTheDocument())
   })
+
+  it('does not duplicate live text already present in saved logs', async () => {
+    const loadLogs = vi.fn().mockResolvedValue({ stdout: 'single copy\n', stderr: '' })
+    const { container } = render(
+      <LogConsole
+        projectId="project-1"
+        execution={execution}
+        liveLogs={{ stdout: 'single copy\n', stderr: '' }}
+        loadLogs={loadLogs}
+      />,
+    )
+
+    await screen.findByText('single copy', { exact: false })
+    const text = container.querySelector('.log-output')?.textContent ?? ''
+    expect(text.match(/single copy/g)).toHaveLength(1)
+  })
 })

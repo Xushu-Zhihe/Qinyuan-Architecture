@@ -3,13 +3,15 @@ import { describe, expect, it } from 'vitest'
 
 import { GraphToolbar } from '../components/GraphToolbar'
 import {
+  advanceClickConnection,
   buildFlowEdges,
   buildReconnectCommand,
+  shouldFitAfterNodeChange,
 } from './BlackboardGraph'
 
 describe('blackboard graph editing rules', () => {
   it('locks semantic editing in browse mode', () => {
-    render(<GraphToolbar mode="browse" onAddFact={() => {}} onConnect={() => {}} onFit={() => {}} />)
+    render(<GraphToolbar mode="browse" activeTool="select" onSelect={() => {}} onAddFact={() => {}} onConnect={() => {}} onFit={() => {}} />)
     expect(screen.getByRole('button', { name: '添加 Fact' })).toBeDisabled()
     expect(screen.getByRole('button', { name: '连接节点' })).toBeDisabled()
   })
@@ -41,5 +43,26 @@ describe('blackboard graph editing rules', () => {
     expect(edges[0].type).toBe('intent')
     expect(edges[0].source).toBe('fact-1')
     expect(edges[0].target).toBe('goal-1')
+  })
+
+  it('builds an intent connection from two node clicks in connect mode', () => {
+    expect(advanceClickConnection('select', null, 'fact-1')).toEqual({
+      source: null,
+      command: null,
+    })
+    expect(advanceClickConnection('connect', null, 'fact-1')).toEqual({
+      source: 'fact-1',
+      command: null,
+    })
+    expect(advanceClickConnection('connect', 'fact-1', 'goal-1')).toEqual({
+      source: null,
+      command: { source: 'fact-1', target: 'goal-1' },
+    })
+  })
+
+  it('fits the graph when newly produced nodes arrive', () => {
+    expect(shouldFitAfterNodeChange(2, 3)).toBe(true)
+    expect(shouldFitAfterNodeChange(3, 3)).toBe(false)
+    expect(shouldFitAfterNodeChange(0, 3)).toBe(false)
   })
 })

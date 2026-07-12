@@ -46,6 +46,7 @@ class WebApiTests(unittest.TestCase):
         )
 
         self.assertEqual(graph.status_code, 200)
+        self.assertEqual(graph.json()["project"]["name"], "Demo")
         self.assertEqual(
             [node["type"] for node in graph.json()["nodes"]],
             ["goal", "origin", "hint"],
@@ -184,6 +185,32 @@ class WebApiTests(unittest.TestCase):
         )
 
         self.assertEqual(response.status_code, 404)
+
+    def test_serves_built_frontend_and_spa_routes_without_masking_api_404(self) -> None:
+        frontend_dist = self.data_root / "frontend-dist"
+        assets = frontend_dist / "assets"
+        assets.mkdir(parents=True)
+        (frontend_dist / "index.html").write_text(
+            "<html><body>built blackboard</body></html>",
+            encoding="utf-8",
+        )
+        (assets / "app.js").write_text("console.log('built')", encoding="utf-8")
+        context = TestClient(
+            create_app(self.data_root / "static-data", frontend_dist=frontend_dist)
+        )
+        client = context.__enter__()
+        self.addCleanup(context.__exit__, None, None, None)
+
+        asset = client.get("/assets/app.js")
+        workspace = client.get("/projects/project-example")
+        missing_api = client.get("/api/does-not-exist")
+
+        self.assertEqual(asset.status_code, 200)
+        self.assertIn("console.log", asset.text)
+        self.assertEqual(workspace.status_code, 200)
+        self.assertIn("built blackboard", workspace.text)
+        self.assertEqual(missing_api.status_code, 404)
+        self.assertNotIn("built blackboard", missing_api.text)
 
 
 if __name__ == "__main__":

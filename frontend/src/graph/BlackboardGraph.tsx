@@ -17,6 +17,7 @@ import { useEffect, useMemo, useState } from 'react'
 import type {
   BlackboardEdge,
   BlackboardNode as BlackboardNodeModel,
+  GraphTool,
   LayoutSnapshot,
   WorkspaceMode,
 } from '../types'
@@ -30,6 +31,28 @@ export interface ReconnectCommand {
 }
 
 export type BlackboardFlowInstance = ReactFlowInstance<BlackboardFlowNode, Edge>
+
+export function shouldFitAfterNodeChange(previousCount: number, nextCount: number) {
+  return previousCount > 0 && nextCount > previousCount
+}
+
+export function advanceClickConnection(
+  tool: GraphTool,
+  source: string | null,
+  clickedNodeId: string,
+): {
+  source: string | null
+  command: { source: string; target: string } | null
+} {
+  if (tool !== 'connect') return { source: null, command: null }
+  if (!source || source === clickedNodeId) {
+    return { source: clickedNodeId, command: null }
+  }
+  return {
+    source: null,
+    command: { source, target: clickedNodeId },
+  }
+}
 
 export function buildReconnectCommand(
   mode: WorkspaceMode,
@@ -62,12 +85,17 @@ export function buildFlowNodes(
   nodes: BlackboardNodeModel[],
   layout: LayoutSnapshot,
   highestGeneration: number,
+  connectingNodeId: string | null = null,
 ): BlackboardFlowNode[] {
   return nodes.filter(node => node.state !== 'archived').map((node, index) => ({
     id: node.id,
     type: 'blackboard',
     position: layout.nodes[node.id] ?? autoPosition(node, index),
-    data: { node, isLatest: node.generation === highestGeneration },
+    data: {
+      node,
+      isLatest: node.generation === highestGeneration,
+      isConnecting: node.id === connectingNodeId,
+    },
   }))
 }
 
@@ -80,6 +108,7 @@ export function BlackboardGraph({
   layout,
   highestGeneration,
   mode,
+  connectingNodeId,
   onSelect,
   onLayoutChange,
   onReconnectIntent,
@@ -91,13 +120,17 @@ export function BlackboardGraph({
   layout: LayoutSnapshot
   highestGeneration: number
   mode: WorkspaceMode
+  connectingNodeId?: string | null
   onSelect: (selection: { kind: 'node'; value: BlackboardNodeModel } | { kind: 'edge'; value: BlackboardEdge } | null) => void
   onLayoutChange: (nodeId: string, position: { x: number; y: number }) => void
   onReconnectIntent: (command: ReconnectCommand) => void
   onConnectNodes: (source: string, target: string) => void
   onInstance?: (instance: BlackboardFlowInstance) => void
 }) {
-  const initialNodes = useMemo(() => buildFlowNodes(sourceNodes, layout, highestGeneration), [sourceNodes, layout, highestGeneration])
+  const initialNodes = useMemo(
+    () => buildFlowNodes(sourceNodes, layout, highestGeneration, connectingNodeId),
+    [sourceNodes, layout, highestGeneration, connectingNodeId],
+  )
   const initialEdges = useMemo(() => buildFlowEdges(sourceEdges), [sourceEdges])
   const [nodes, setNodes, onNodesChange] = useNodesState(initialNodes)
   const [edges, setEdges, onEdgesChange] = useEdgesState(initialEdges)

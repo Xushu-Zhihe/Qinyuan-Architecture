@@ -46,7 +46,7 @@ export function NewProjectDialog({
       origin: String(data.get('origin')).trim(),
       hints: hints.map(item => item.trim()).filter(Boolean),
       mode,
-      providers: mode === 'run' ? selected : [],
+      providers: selected,
       agent_limit: Number(data.get('agent_limit')),
       challenge_path: String(data.get('challenge_path')).trim() || null,
     })
@@ -70,7 +70,7 @@ export function NewProjectDialog({
             <label className="choice-row"><input type="radio" name="mode" checked={mode === 'manual'} onChange={() => setMode('manual')} />仅黑板</label>
             <label className="choice-row"><input type="radio" name="mode" checked={mode === 'run'} onChange={() => setMode('run')} />立即启动 Agent</label>
           </fieldset>
-          <fieldset disabled={mode === 'manual'}>
+          <fieldset>
             <legend>Agent</legend>
             {providers.map(provider => (
               <label className="choice-row" key={provider}>

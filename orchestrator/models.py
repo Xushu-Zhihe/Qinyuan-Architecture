@@ -123,10 +123,10 @@ class AgentRoundResult:
 
 @dataclass(frozen=True, slots=True)
 class OrchestrationResult:
-    run_id: str
+    project_id: str
     run_dir: str
     status: str
-    rounds_completed: int
+    highest_generation: int
     final_answer: str | None
     candidates: tuple[str, ...]
 

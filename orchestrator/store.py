@@ -189,6 +189,21 @@ class BlackboardStore:
         self.project_id = project_id
 
     @classmethod
+    def open(cls, path: Path, project_id: str) -> "BlackboardStore":
+        connection = sqlite3.connect(path, check_same_thread=False)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys = ON")
+        connection.execute("PRAGMA busy_timeout = 5000")
+        exists = connection.execute(
+            "SELECT 1 FROM projects WHERE id = ?",
+            (project_id,),
+        ).fetchone()
+        if exists is None:
+            connection.close()
+            raise KeyError(project_id)
+        return cls(path, connection, project_id)
+
+    @classmethod
     def create(
         cls,
         path: Path,

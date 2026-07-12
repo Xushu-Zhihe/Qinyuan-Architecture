@@ -1,9 +1,15 @@
 import json
 import sqlite3
+import asyncio
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
+
+from orchestrator.events import ProjectEventHub
+from orchestrator.layout import LayoutStore
+from orchestrator.store import BlackboardStore
+from worker.models import ProviderConfig
 
 
 REGISTRY_SCHEMA = """
@@ -43,6 +49,18 @@ class ProjectRecord:
     created_at: str
     updated_at: str
     last_opened_at: str
+
+
+@dataclass(slots=True)
+class ProjectHandle:
+    record: ProjectRecord
+    store: BlackboardStore
+    layout: LayoutStore
+    hub: ProjectEventHub
+
+    @property
+    def id(self) -> str:
+        return self.record.id
 
 
 def _now() -> str:
@@ -169,3 +187,111 @@ class ProjectRegistry:
         if target != root and root not in target.parents:
             raise ProjectPathError("path escapes project directory")
         return target
+
+
+class ProjectService:
+    def __init__(
+        self,
+        data_root: Path,
+        provider_configs: tuple[ProviderConfig, ...] = (),
+    ) -> None:
+        self.registry = ProjectRegistry(data_root)
+        self.provider_configs = {
+            provider.name: provider for provider in provider_configs
+        }
+        self.global_semaphore = asyncio.Semaphore(16)
+        self._handles: dict[str, ProjectHandle] = {}
+        self._supervisors: dict[str, object] = {}
+
+    def close(self) -> None:
+        for handle in self._handles.values():
+            handle.store.close()
+        self._handles.clear()
+        self.registry.close()
+
+    def create_project(
+        self,
+        *,
+        name: str,
+        goal: str,
+        origin: str,
+        hints: tuple[str, ...],
+        mode: str,
+        provider_names: tuple[str, ...],
+        agent_limit: int,
+        challenge_path: Path | None,
+    ) -> ProjectHandle:
+        unknown = set(provider_names) - set(self.provider_configs)
+        if self.provider_configs and unknown:
+            raise ValueError(f"unknown providers: {sorted(unknown)}")
+        record = self.registry.create(
+            name,
+            mode,
+            challenge_path,
+            provider_names,
+            agent_limit,
+        )
+        store = BlackboardStore.create(
+            record.path / "blackboard.db",
+            record.id,
+            goal,
+            origin,
+            hints,
+        )
+        handle = ProjectHandle(
+            record,
+            store,
+            LayoutStore(record.path),
+            ProjectEventHub(),
+        )
+        self._handles[record.id] = handle
+        return handle
+
+    def get_handle(self, project_id: str) -> ProjectHandle:
+        handle = self._handles.get(project_id)
+        if handle is not None:
+            return handle
+        record = self.registry.get(project_id)
+        handle = ProjectHandle(
+            record,
+            BlackboardStore.open(record.path / "blackboard.db", record.id),
+            LayoutStore(record.path),
+            ProjectEventHub(),
+        )
+        self._handles[record.id] = handle
+        return handle
+
+    def list_projects(self) -> tuple[dict[str, object], ...]:
+        result = []
+        for record in self.registry.list():
+            snapshot = self.get_handle(record.id).store.snapshot()
+            result.append(
+                {
+                    **project_record_dict(record),
+                    "fact_count": sum(
+                        node["type"] == "fact" for node in snapshot["nodes"]
+                    ),
+                    "intent_count": sum(
+                        edge["type"] == "intent" for edge in snapshot["edges"]
+                    ),
+                    "highest_generation": snapshot["highest_generation"],
+                }
+            )
+        return tuple(result)
+
+
+def project_record_dict(record: ProjectRecord) -> dict[str, object]:
+    return {
+        "id": record.id,
+        "name": record.name,
+        "mode": record.mode,
+        "status": record.status,
+        "challenge_path": (
+            str(record.challenge_path) if record.challenge_path else None
+        ),
+        "providers": list(record.providers),
+        "agent_limit": record.agent_limit,
+        "created_at": record.created_at,
+        "updated_at": record.updated_at,
+        "last_opened_at": record.last_opened_at,
+    }

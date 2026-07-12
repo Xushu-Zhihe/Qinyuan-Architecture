@@ -40,7 +40,7 @@ def _build_parser() -> argparse.ArgumentParser:
         default=[],
         help="initial human hint; repeatable",
     )
-    parser.add_argument("--max-rounds", type=_positive_int, default=5)
+    parser.add_argument("--max-iterations", type=_positive_int, default=5)
     return parser
 
 
@@ -80,8 +80,7 @@ def run_cli(
                 ),
                 challenge_dir=challenge_dir,
                 runs_root=DEFAULT_RUNS_ROOT,
-                max_rounds=args.max_rounds,
-                hint_reader=input_func,
+                max_iterations=args.max_iterations,
             )
         )
     except ConfigError as exc:
@@ -92,7 +91,7 @@ def run_cli(
         return 1
 
     print(f"Status: {result.status}")
-    print(f"Rounds: {result.rounds_completed}")
+    print(f"Generation: {result.highest_generation}")
     if result.final_answer:
         print(f"Final answer: {result.final_answer}")
     elif result.candidates:

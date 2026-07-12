@@ -11,6 +11,12 @@ class ProviderConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class LogChunk:
+    stream: str
+    text: str
+
+
+@dataclass(frozen=True, slots=True)
 class WorkerResult:
     provider: str
     priority: int

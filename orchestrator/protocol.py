@@ -6,15 +6,40 @@ from orchestrator.models import (
     EDGE_TYPES,
     AgentUpdate,
     EdgeProposal,
+    ExecutionUpdate,
+    FactProposal,
+    IntentDecision,
+    IntentParseResult,
+    IntentProposal,
     NodeProposal,
     ProtocolResult,
+    RELATION_EDGE_TYPES,
+    RelationProposal,
+    ResultParseResult,
 )
 
 
 PREFIX = "BLACKBOARD_UPDATE:"
+INTENT_PREFIX = "BLACKBOARD_INTENT:"
+RESULT_PREFIX = "BLACKBOARD_RESULT:"
 UPDATE_FIELDS = {"nodes", "edges", "goal_achieved", "final_answer"}
 NODE_FIELDS = {"ref", "type", "content"}
 EDGE_FIELDS = {"type", "from", "to"}
+INTENT_PLAN_FIELDS = {
+    "action",
+    "source_node_id",
+    "target_node_id",
+    "content",
+}
+INTENT_IDLE_FIELDS = {"action", "reason"}
+RESULT_FIELDS = {
+    "intent_id",
+    "facts",
+    "edges",
+    "goal_achieved",
+    "final_answer",
+}
+FACT_FIELDS = {"ref", "content"}
 
 
 def render_request(
@@ -41,6 +66,48 @@ def render_request(
     )
 
 
+def _challenge_text(challenge_dir: str | Path | None) -> str:
+    return str(challenge_dir) if challenge_dir else "not provided"
+
+
+def render_intent_request(
+    snapshot: dict[str, object],
+    challenge_dir: str | Path | None,
+) -> str:
+    return (
+        "Choose the next useful action from the blackboard.\n"
+        f"Challenge directory (read-only): {_challenge_text(challenge_dir)}\n"
+        "Normally choose an existing fact as source. Only when no fact exists "
+        "may origin be the bootstrap source. Target goal, fact, or hint.\n"
+        "Finish with exactly one BLACKBOARD_INTENT: line. Use either "
+        '{"action":"plan","source_node_id":"...","target_node_id":"...",'
+        '"content":"..."} or {"action":"idle","reason":"..."}.\n\n'
+        "Graph snapshot:\n"
+        + json.dumps(snapshot, ensure_ascii=False, indent=2)
+        + "\n"
+    )
+
+
+def render_execution_request(
+    snapshot: dict[str, object],
+    intent: dict[str, object],
+    challenge_dir: str | Path | None,
+) -> str:
+    return (
+        "Execute the assigned blackboard intent.\n"
+        f"Challenge directory (read-only): {_challenge_text(challenge_dir)}\n"
+        "You may propose facts and ordinary relation edges only. Do not create "
+        "goal, origin, hint, or another intent.\n"
+        "Finish with one BLACKBOARD_RESULT: line containing exactly intent_id, "
+        "facts, edges, goal_achieved, and final_answer.\n\n"
+        "Assigned intent:\n"
+        + json.dumps(intent, ensure_ascii=False, indent=2)
+        + "\n\nGraph snapshot:\n"
+        + json.dumps(snapshot, ensure_ascii=False, indent=2)
+        + "\n"
+    )
+
+
 def _error(message: str) -> ProtocolResult:
     return ProtocolResult(
         status="protocol_error",
@@ -60,6 +127,146 @@ def _require_fields(
         raise ValueError(f"unexpected {label} fields: {sorted(extra)}")
     if missing:
         raise ValueError(f"missing {label} fields: {sorted(missing)}")
+
+
+def _non_empty_string(value: object, label: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{label} must be a non-empty string")
+    return value.strip()
+
+
+def _last_payload(stdout: str, prefix: str) -> dict[str, object]:
+    candidates = [
+        line[len(prefix) :].strip()
+        for line in stdout.splitlines()
+        if line.startswith(prefix)
+    ]
+    if not candidates:
+        raise ValueError(f"missing {prefix.rstrip(':')}")
+    last_error: Exception | None = None
+    for candidate in reversed(candidates):
+        try:
+            payload = json.loads(candidate)
+            if not isinstance(payload, dict):
+                raise ValueError("protocol payload must be an object")
+            return payload
+        except (json.JSONDecodeError, ValueError) as exc:
+            last_error = exc
+    raise ValueError(str(last_error) if last_error else "invalid protocol payload")
+
+
+def parse_intent(
+    stdout: str,
+    node_types: dict[str, str],
+) -> IntentParseResult:
+    try:
+        payload = _last_payload(stdout, INTENT_PREFIX)
+        action = payload.get("action")
+        if action == "idle":
+            _require_fields(payload, INTENT_IDLE_FIELDS, "intent")
+            reason = _non_empty_string(payload["reason"], "reason")
+            return IntentParseResult(
+                status="valid",
+                decision=IntentDecision("idle", None, reason),
+                error=None,
+            )
+
+        _require_fields(payload, INTENT_PLAN_FIELDS, "intent")
+        if action != "plan":
+            raise ValueError("intent action must be plan or idle")
+        source = _non_empty_string(payload["source_node_id"], "source_node_id")
+        target = _non_empty_string(payload["target_node_id"], "target_node_id")
+        content = _non_empty_string(payload["content"], "content")
+        facts_exist = "fact" in node_types.values()
+        source_type = node_types.get(source)
+        if source_type != "fact" and not (
+            source_type == "origin" and not facts_exist
+        ):
+            raise ValueError("source must be a fact or bootstrap origin")
+        if node_types.get(target) not in {"goal", "fact", "hint"}:
+            raise ValueError("unsupported intent target")
+        return IntentParseResult(
+            status="valid",
+            decision=IntentDecision(
+                "plan",
+                IntentProposal(source, target, content),
+                None,
+            ),
+            error=None,
+        )
+    except (json.JSONDecodeError, ValueError) as exc:
+        return IntentParseResult("protocol_error", None, str(exc))
+
+
+def parse_result(
+    stdout: str,
+    assigned_intent_id: str,
+    existing_node_ids: set[str],
+) -> ResultParseResult:
+    try:
+        payload = _last_payload(stdout, RESULT_PREFIX)
+        _require_fields(payload, RESULT_FIELDS, "result")
+        intent_id = _non_empty_string(payload["intent_id"], "intent_id")
+        if intent_id != assigned_intent_id:
+            raise ValueError("result must reference the assigned intent")
+
+        raw_facts = payload["facts"]
+        raw_edges = payload["edges"]
+        achieved = payload["goal_achieved"]
+        answer = payload["final_answer"]
+        if not isinstance(raw_facts, list) or not isinstance(raw_edges, list):
+            raise ValueError("facts and edges must be lists")
+        if not isinstance(achieved, bool):
+            raise ValueError("goal_achieved must be a boolean")
+        if answer is not None and (
+            not isinstance(answer, str) or not answer.strip()
+        ):
+            raise ValueError("final_answer must be null or a non-empty string")
+        if achieved and answer is None:
+            raise ValueError("goal_achieved requires final_answer")
+
+        facts: list[FactProposal] = []
+        refs: set[str] = set()
+        for raw in raw_facts:
+            if not isinstance(raw, dict):
+                raise ValueError("fact proposal must be an object")
+            _require_fields(raw, FACT_FIELDS, "fact")
+            ref = _non_empty_string(raw["ref"], "fact ref")
+            if ref in refs:
+                raise ValueError("fact ref must be unique")
+            refs.add(ref)
+            facts.append(
+                FactProposal(ref, _non_empty_string(raw["content"], "fact content"))
+            )
+
+        allowed_refs = existing_node_ids | refs
+        edges: list[RelationProposal] = []
+        for raw in raw_edges:
+            if not isinstance(raw, dict):
+                raise ValueError("edge proposal must be an object")
+            _require_fields(raw, EDGE_FIELDS, "edge")
+            edge_type = raw["type"]
+            from_ref = raw["from"]
+            to_ref = raw["to"]
+            if edge_type not in RELATION_EDGE_TYPES:
+                raise ValueError("unsupported relation edge type")
+            if from_ref not in allowed_refs or to_ref not in allowed_refs:
+                raise ValueError("unknown node reference")
+            edges.append(RelationProposal(edge_type, from_ref, to_ref))
+
+        return ResultParseResult(
+            status="valid",
+            update=ExecutionUpdate(
+                intent_id=intent_id,
+                facts=tuple(facts),
+                edges=tuple(edges),
+                goal_achieved=achieved,
+                final_answer=answer.strip() if answer else None,
+            ),
+            error=None,
+        )
+    except (json.JSONDecodeError, ValueError) as exc:
+        return ResultParseResult("protocol_error", None, str(exc))
 
 
 def _parse_candidate(

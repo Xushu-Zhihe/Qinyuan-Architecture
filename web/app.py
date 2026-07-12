@@ -1,0 +1,325 @@
+from contextlib import asynccontextmanager
+import sqlite3
+from pathlib import Path
+
+from fastapi import (
+    FastAPI,
+    HTTPException,
+    Response,
+    WebSocket,
+    WebSocketDisconnect,
+    status,
+)
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
+
+from orchestrator.layout import LayoutConflict
+from orchestrator.models import IntentProposal
+from orchestrator.projects import ProjectService, project_record_dict
+from web.schemas import (
+    EdgeCreate,
+    EdgeUpdate,
+    LayoutUpdate,
+    NodeCreate,
+    ProjectCreate,
+)
+from worker.models import ProviderConfig
+
+
+DEFAULT_DATA_ROOT = Path(__file__).resolve().parents[1] / "web-data"
+DEFAULT_FRONTEND_DIST = Path(__file__).resolve().parents[1] / "frontend" / "dist"
+
+
+def create_app(
+    data_root: Path | None = None,
+    provider_configs: tuple[ProviderConfig, ...] = (),
+    execute=None,
+    frontend_dist: Path | None = None,
+) -> FastAPI:
+    service = ProjectService(
+        (data_root or DEFAULT_DATA_ROOT).resolve(),
+        provider_configs,
+        execute=execute,
+    )
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        yield
+        await service.aclose()
+
+    app = FastAPI(title="Blackboard", lifespan=lifespan)
+    app.state.projects = service
+    dist_root = (frontend_dist or DEFAULT_FRONTEND_DIST).resolve()
+    index_file = dist_root / "index.html"
+    assets_root = dist_root / "assets"
+    if index_file.is_file() and assets_root.is_dir():
+        app.mount("/assets", StaticFiles(directory=assets_root), name="assets")
+
+    def handle(project_id: str):
+        try:
+            return service.get_handle(project_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="project not found") from exc
+
+    async def publish_since(project, sequence: int) -> None:
+        for event in project.store.events_after(sequence):
+            await project.hub.publish(event)
+
+    @app.get("/api/projects")
+    def list_projects():
+        return service.list_projects()
+
+    @app.post("/api/projects", status_code=status.HTTP_201_CREATED)
+    def create_project(payload: ProjectCreate):
+        challenge = Path(payload.challenge_path).resolve() if payload.challenge_path else None
+        if challenge is not None and not challenge.is_dir():
+            raise HTTPException(status_code=400, detail="challenge path is not a directory")
+        try:
+            project = service.create_project(
+                name=payload.name,
+                goal=payload.goal,
+                origin=payload.origin,
+                hints=tuple(hint for hint in payload.hints if hint.strip()),
+                mode=payload.mode,
+                provider_names=tuple(payload.providers),
+                agent_limit=payload.agent_limit,
+                challenge_path=challenge,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return project_record_dict(project.record)
+
+    @app.get("/api/projects/{project_id}")
+    def get_project(project_id: str):
+        return project_record_dict(handle(project_id).record)
+
+    @app.get("/api/projects/{project_id}/graph")
+    def get_graph(project_id: str):
+        project = handle(project_id)
+        snapshot = project.store.snapshot()
+        graph_project = dict(snapshot["project"])
+        snapshot["project"] = {
+            **project_record_dict(project.record),
+            "status": graph_project["status"],
+            "final_answer": graph_project.get("final_answer"),
+        }
+        return {**snapshot, "layout": project.layout.load()}
+
+    @app.post(
+        "/api/projects/{project_id}/nodes",
+        status_code=status.HTTP_201_CREATED,
+    )
+    async def create_node(project_id: str, payload: NodeCreate):
+        project = handle(project_id)
+        sequence = int(project.store.snapshot()["sequence"])
+        try:
+            node_id = project.store.add_human_node(payload.type, payload.content)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        result = next(
+            node
+            for node in project.store.snapshot()["nodes"]
+            if node["id"] == node_id
+        )
+        await publish_since(project, sequence)
+        return result
+
+    @app.delete(
+        "/api/projects/{project_id}/nodes/{node_id}",
+        status_code=status.HTTP_204_NO_CONTENT,
+    )
+    async def archive_node(project_id: str, node_id: str):
+        project = handle(project_id)
+        sequence = int(project.store.snapshot()["sequence"])
+        try:
+            project.store.archive_node(node_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="node not found") from exc
+        await publish_since(project, sequence)
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+    @app.post(
+        "/api/projects/{project_id}/edges",
+        status_code=status.HTTP_201_CREATED,
+    )
+    async def create_edge(project_id: str, payload: EdgeCreate):
+        project = handle(project_id)
+        sequence = int(project.store.snapshot()["sequence"])
+        try:
+            if payload.type == "intent":
+                if payload.content is None or not payload.content.strip():
+                    raise ValueError("intent content must be non-empty")
+                record = project.store.create_or_merge_intent(
+                    "human",
+                    IntentProposal(
+                        payload.from_node_id,
+                        payload.to_node_id,
+                        payload.content,
+                    ),
+                )
+                edge_id = record.id
+            else:
+                edge_id = project.store.add_relation(
+                    payload.type,
+                    payload.from_node_id,
+                    payload.to_node_id,
+                )
+        except (KeyError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        result = next(
+            edge
+            for edge in project.store.snapshot()["edges"]
+            if edge["id"] == edge_id
+        )
+        await publish_since(project, sequence)
+        return result
+
+    @app.patch("/api/projects/{project_id}/edges/{edge_id}")
+    async def reconnect_edge(
+        project_id: str,
+        edge_id: str,
+        payload: EdgeUpdate,
+    ):
+        project = handle(project_id)
+        sequence = int(project.store.snapshot()["sequence"])
+        try:
+            project.store.reconnect_edge(
+                edge_id,
+                payload.from_node_id,
+                payload.to_node_id,
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="edge not found") from exc
+        except (ValueError, sqlite3.IntegrityError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        result = next(
+            edge
+            for edge in project.store.snapshot()["edges"]
+            if edge["id"] == edge_id
+        )
+        await publish_since(project, sequence)
+        return result
+
+    @app.delete(
+        "/api/projects/{project_id}/edges/{edge_id}",
+        status_code=status.HTTP_204_NO_CONTENT,
+    )
+    async def delete_edge(project_id: str, edge_id: str):
+        project = handle(project_id)
+        sequence = int(project.store.snapshot()["sequence"])
+        try:
+            project.store.delete_edge(edge_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="edge not found") from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        await publish_since(project, sequence)
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+    @app.put("/api/projects/{project_id}/layout")
+    async def update_layout(project_id: str, payload: LayoutUpdate):
+        project = handle(project_id)
+        try:
+            result = project.layout.save(
+                payload.revision,
+                {
+                    "nodes": payload.nodes,
+                    "edges": payload.edges,
+                    "viewport": payload.viewport,
+                },
+            )
+            event = project.store.append_event(
+                "graph.layout_updated",
+                "human",
+                {"revision": result["revision"]},
+            )
+            await project.hub.publish(event)
+            return result
+        except LayoutConflict as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={"current_revision": exc.current_revision},
+            ) from exc
+
+    @app.get("/api/projects/{project_id}/executions/{execution_id}")
+    def get_execution(project_id: str, execution_id: str):
+        project = handle(project_id)
+        try:
+            return project.store.execution(execution_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="execution not found") from exc
+
+    @app.get("/api/projects/{project_id}/executions/{execution_id}/logs")
+    def get_execution_logs(project_id: str, execution_id: str):
+        project = handle(project_id)
+        try:
+            execution = project.store.execution(execution_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="execution not found") from exc
+        return {
+            "stdout": Path(str(execution["stdout_path"])).read_text(
+                encoding="utf-8", errors="replace"
+            ) if Path(str(execution["stdout_path"])).is_file() else "",
+            "stderr": Path(str(execution["stderr_path"])).read_text(
+                encoding="utf-8", errors="replace"
+            ) if Path(str(execution["stderr_path"])).is_file() else "",
+        }
+
+    @app.post(
+        "/api/projects/{project_id}/start",
+        status_code=status.HTTP_202_ACCEPTED,
+    )
+    async def start_project(project_id: str):
+        try:
+            supervisor = await service.start_project(project_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="project not found") from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {
+            "status": "running",
+            "agents": supervisor.agent_statuses(),
+        }
+
+    @app.post("/api/projects/{project_id}/stop")
+    async def stop_project(project_id: str):
+        try:
+            record = await service.stop_project(project_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="project not found") from exc
+        return project_record_dict(record)
+
+    @app.websocket("/ws/projects/{project_id}")
+    async def project_socket(
+        websocket: WebSocket,
+        project_id: str,
+        after: int = 0,
+    ):
+        try:
+            project = service.get_handle(project_id)
+        except KeyError:
+            await websocket.close(code=4404)
+            return
+        await websocket.accept()
+        try:
+            for event in project.store.events_after(after):
+                await websocket.send_json(
+                    {"project_id": project_id, **event}
+                )
+            async with project.hub.subscribe() as queue:
+                while True:
+                    event = await queue.get()
+                    await websocket.send_json(
+                        {"project_id": project_id, **event}
+                    )
+        except WebSocketDisconnect:
+            return
+
+    if index_file.is_file():
+        @app.get("/{path:path}", include_in_schema=False)
+        def frontend_route(path: str):
+            if path == "api" or path.startswith("api/"):
+                raise HTTPException(status_code=404, detail="not found")
+            return FileResponse(index_file)
+
+    return app

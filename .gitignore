@@ -5,3 +5,5 @@ __pycache__/
 worker/runs/
 .superpowers/
 .worktrees/
+frontend/node_modules/
+frontend/dist/

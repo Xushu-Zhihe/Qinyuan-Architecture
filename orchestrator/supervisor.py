@@ -1,0 +1,277 @@
+import asyncio
+from collections.abc import Awaitable, Callable
+from pathlib import Path
+from uuid import uuid4
+
+from orchestrator.events import ProjectEventHub
+from orchestrator.protocol import (
+    parse_intent,
+    parse_result,
+    render_execution_request,
+    render_intent_request,
+)
+from orchestrator.store import BlackboardStore, IntentRecord
+from worker.executor import execute_provider
+from worker.models import LogChunk, ProviderConfig, WorkerResult
+
+
+Executor = Callable[..., Awaitable[WorkerResult]]
+
+
+class ProjectSupervisor:
+    def __init__(
+        self,
+        store: BlackboardStore,
+        providers: tuple[ProviderConfig, ...],
+        challenge_dir: Path | None,
+        project_dir: Path,
+        hub: ProjectEventHub | None = None,
+        execute: Executor = execute_provider,
+        global_semaphore: asyncio.Semaphore | None = None,
+        max_iterations: int | None = None,
+        failure_threshold: int = 3,
+    ) -> None:
+        self.store = store
+        self.providers = {
+            provider.name: provider
+            for provider in providers
+            if provider.enabled
+        }
+        self.challenge_dir = challenge_dir
+        self.project_dir = project_dir
+        self.hub = hub or ProjectEventHub()
+        self.execute = execute
+        self.global_semaphore = global_semaphore or asyncio.Semaphore(1024)
+        self.max_iterations = max_iterations
+        self.failure_threshold = failure_threshold
+        self.cancel_event = asyncio.Event()
+        self.wake_event = asyncio.Event()
+        self.write_lock = asyncio.Lock()
+        self.tasks: dict[str, asyncio.Task[None]] = {}
+        self._agent_status = {name: "idle" for name in self.providers}
+        self._failures = {name: 0 for name in self.providers}
+
+    def agent_statuses(self) -> dict[str, str]:
+        return dict(self._agent_status)
+
+    async def _set_agent_status(self, provider: str, status: str) -> None:
+        self._agent_status[provider] = status
+        await self.hub.publish(
+            {
+                "type": "agent.status_changed",
+                "source": provider,
+                "payload": {"provider": provider, "status": status},
+            }
+        )
+
+    async def _run_provider(
+        self,
+        provider: ProviderConfig,
+        request: str,
+        work_dir: Path,
+        on_chunk=None,
+    ) -> WorkerResult:
+        async with self.global_semaphore:
+            return await self.execute(
+                provider,
+                request,
+                self.challenge_dir,
+                work_dir,
+                on_chunk=on_chunk,
+                cancel_event=self.cancel_event,
+            )
+
+    async def _mark_failure(self, provider: str) -> None:
+        self._failures[provider] += 1
+        await self._set_agent_status(provider, "failed")
+        if self._failures[provider] >= self.failure_threshold:
+            self.store.set_project_status("degraded")
+
+    async def run_agent_once(self, provider_name: str) -> str:
+        provider = self.providers[provider_name]
+        if self.cancel_event.is_set():
+            await self._set_agent_status(provider_name, "cancelled")
+            return "cancelled"
+
+        await self._set_agent_status(provider_name, "planning")
+        snapshot = self.store.snapshot()
+        planning_dir = (
+            self.project_dir
+            / "executions"
+            / f"plan-{provider_name}-{uuid4().hex}"
+        )
+        planning = await self._run_provider(
+            provider,
+            render_intent_request(snapshot, self.challenge_dir),
+            planning_dir,
+        )
+        if planning.status != "success":
+            await self._mark_failure(provider_name)
+            return "failed"
+
+        parsed_intent = parse_intent(
+            planning.output,
+            self.store.node_types(),
+        )
+        if parsed_intent.status != "valid" or parsed_intent.decision is None:
+            await self._mark_failure(provider_name)
+            return "failed"
+        if parsed_intent.decision.action == "idle":
+            self._failures[provider_name] = 0
+            await self._set_agent_status(provider_name, "idle")
+            return "idle"
+        assert parsed_intent.decision.intent is not None
+
+        async with self.write_lock:
+            intent = self.store.create_or_merge_intent(
+                provider_name,
+                parsed_intent.decision.intent,
+            )
+        result_status = await self._execute_intent(provider, intent)
+        if result_status == "completed":
+            self._failures[provider_name] = 0
+            await self._set_agent_status(provider_name, "completed")
+        else:
+            await self._mark_failure(provider_name)
+        return result_status
+
+    async def _execute_intent(
+        self,
+        provider: ProviderConfig,
+        intent: IntentRecord,
+    ) -> str:
+        execution_dir = (
+            self.project_dir
+            / "executions"
+            / f"run-{provider.name}-{uuid4().hex}"
+        )
+        async with self.write_lock:
+            execution = self.store.start_execution(
+                intent.id,
+                provider.name,
+                str((execution_dir / "stdout.txt").resolve()),
+                str((execution_dir / "stderr.txt").resolve()),
+                str(execution_dir.resolve()),
+            )
+
+        offsets = {"stdout": 0, "stderr": 0}
+
+        async def on_chunk(chunk: LogChunk) -> None:
+            offset = offsets[chunk.stream]
+            offsets[chunk.stream] += len(chunk.text.encode("utf-8"))
+            await self.hub.publish(
+                {
+                    "type": "intent.log_chunk",
+                    "source": provider.name,
+                    "payload": {
+                        "intent_id": intent.id,
+                        "execution_id": execution.id,
+                        "stream": chunk.stream,
+                        "offset": offset,
+                        "text": chunk.text,
+                    },
+                }
+            )
+
+        await self._set_agent_status(provider.name, "running")
+        snapshot = self.store.snapshot()
+        result = await self._run_provider(
+            provider,
+            render_execution_request(
+                snapshot,
+                {
+                    "id": intent.id,
+                    "source_node_id": intent.source_node_id,
+                    "target_node_id": intent.target_node_id,
+                    "content": intent.content,
+                    "generation": intent.generation,
+                },
+                self.challenge_dir,
+            ),
+            execution_dir,
+            on_chunk=on_chunk,
+        )
+        if result.status != "success":
+            async with self.write_lock:
+                self.store.fail_execution(
+                    execution.id,
+                    result.status,
+                    f"provider process status was {result.status}",
+                    result.exit_code,
+                )
+            return "failed"
+
+        parsed_result = parse_result(
+            result.output,
+            assigned_intent_id=intent.id,
+            existing_node_ids=set(self.store.node_types()),
+        )
+        if parsed_result.status != "valid" or parsed_result.update is None:
+            async with self.write_lock:
+                self.store.fail_execution(
+                    execution.id,
+                    "protocol_error",
+                    parsed_result.error or "invalid result protocol",
+                    result.exit_code,
+                )
+            return "failed"
+
+        async with self.write_lock:
+            self.store.finish_execution(
+                execution.id,
+                parsed_result.update,
+                result.exit_code,
+                "completed",
+            )
+            answer = self.store.consensus(len(self.providers))
+            if answer is not None:
+                self.store.set_project_status("achieved", answer)
+                self.cancel_event.set()
+        self.wake_event.set()
+        return "completed"
+
+    async def _agent_loop(self, provider_name: str) -> None:
+        iterations = 0
+        while not self.cancel_event.is_set():
+            if self.max_iterations is not None and iterations >= self.max_iterations:
+                break
+            iterations += 1
+            status = await self.run_agent_once(provider_name)
+            if status in {"failed", "cancelled"}:
+                if self._failures[provider_name] >= self.failure_threshold:
+                    break
+            if status == "idle":
+                if self.max_iterations is not None:
+                    break
+                self.wake_event.clear()
+                try:
+                    await asyncio.wait_for(self.wake_event.wait(), timeout=1)
+                except asyncio.TimeoutError:
+                    pass
+
+    async def start(self) -> None:
+        if any(not task.done() for task in self.tasks.values()):
+            return
+        self.cancel_event.clear()
+        self.store.set_project_status("running")
+        self.tasks = {
+            name: asyncio.create_task(self._agent_loop(name))
+            for name in self.providers
+        }
+
+    async def wait_until_idle(self, timeout: float | None = None) -> None:
+        if self.tasks:
+            await asyncio.wait_for(
+                asyncio.gather(*self.tasks.values()),
+                timeout=timeout,
+            )
+        project = self.store.snapshot()["project"]
+        if project["status"] == "running":
+            self.store.set_project_status("idle")
+
+    async def stop(self) -> None:
+        self.cancel_event.set()
+        if self.tasks:
+            await asyncio.gather(*self.tasks.values(), return_exceptions=True)
+        if self.store.snapshot()["project"]["status"] != "achieved":
+            self.store.set_project_status("stopped")

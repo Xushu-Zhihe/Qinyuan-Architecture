@@ -26,6 +26,11 @@ class EdgeCreate(BaseModel):
     content: str | None = None
 
 
+class EdgeUpdate(BaseModel):
+    from_node_id: str = Field(min_length=1)
+    to_node_id: str = Field(min_length=1)
+
+
 class LayoutUpdate(BaseModel):
     revision: int = Field(ge=0)
     nodes: dict[str, object] = Field(default_factory=dict)

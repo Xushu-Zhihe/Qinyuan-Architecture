@@ -31,6 +31,10 @@ export const api = {
     request(`/api/projects/${projectId}/nodes`, { method: 'POST', body: JSON.stringify(payload) }),
   addEdge: (projectId: string, payload: Record<string, unknown>) =>
     request(`/api/projects/${projectId}/edges`, { method: 'POST', body: JSON.stringify(payload) }),
+  updateEdge: (projectId: string, edgeId: string, payload: Record<string, unknown>) =>
+    request(`/api/projects/${projectId}/edges/${edgeId}`, { method: 'PATCH', body: JSON.stringify(payload) }),
+  deleteEdge: (projectId: string, edgeId: string) =>
+    request<void>(`/api/projects/${projectId}/edges/${edgeId}`, { method: 'DELETE' }),
   saveLayout: (projectId: string, payload: LayoutSnapshot) =>
     request<LayoutSnapshot>(`/api/projects/${projectId}/layout`, { method: 'PUT', body: JSON.stringify(payload) }),
   startProject: (projectId: string) =>

@@ -1,4 +1,5 @@
 from contextlib import asynccontextmanager
+import sqlite3
 from pathlib import Path
 
 from fastapi import (
@@ -13,7 +14,13 @@ from fastapi import (
 from orchestrator.layout import LayoutConflict
 from orchestrator.models import IntentProposal
 from orchestrator.projects import ProjectService, project_record_dict
-from web.schemas import EdgeCreate, LayoutUpdate, NodeCreate, ProjectCreate
+from web.schemas import (
+    EdgeCreate,
+    EdgeUpdate,
+    LayoutUpdate,
+    NodeCreate,
+    ProjectCreate,
+)
 from worker.models import ProviderConfig
 
 
@@ -150,6 +157,48 @@ def create_app(
         )
         await publish_since(project, sequence)
         return result
+
+    @app.patch("/api/projects/{project_id}/edges/{edge_id}")
+    async def reconnect_edge(
+        project_id: str,
+        edge_id: str,
+        payload: EdgeUpdate,
+    ):
+        project = handle(project_id)
+        sequence = int(project.store.snapshot()["sequence"])
+        try:
+            project.store.reconnect_edge(
+                edge_id,
+                payload.from_node_id,
+                payload.to_node_id,
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="edge not found") from exc
+        except (ValueError, sqlite3.IntegrityError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        result = next(
+            edge
+            for edge in project.store.snapshot()["edges"]
+            if edge["id"] == edge_id
+        )
+        await publish_since(project, sequence)
+        return result
+
+    @app.delete(
+        "/api/projects/{project_id}/edges/{edge_id}",
+        status_code=status.HTTP_204_NO_CONTENT,
+    )
+    async def delete_edge(project_id: str, edge_id: str):
+        project = handle(project_id)
+        sequence = int(project.store.snapshot()["sequence"])
+        try:
+            project.store.delete_edge(edge_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="edge not found") from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        await publish_since(project, sequence)
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
 
     @app.put("/api/projects/{project_id}/layout")
     async def update_layout(project_id: str, payload: LayoutUpdate):

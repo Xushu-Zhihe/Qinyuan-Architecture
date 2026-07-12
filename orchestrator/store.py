@@ -619,6 +619,95 @@ class BlackboardStore:
             ).fetchall()
         )
 
+    def reconnect_edge(
+        self,
+        edge_id: str,
+        from_node: str,
+        to_node: str,
+        source: str = "human",
+    ) -> None:
+        row = self.connection.execute(
+            """
+            SELECT e.type, i.content
+            FROM edges AS e
+            LEFT JOIN intents AS i ON i.edge_id = e.id
+            WHERE e.id = ? AND e.project_id = ?
+            """,
+            (edge_id, self.project_id),
+        ).fetchone()
+        if row is None:
+            raise KeyError(edge_id)
+        node_types = self.node_types()
+        if from_node not in node_types or to_node not in node_types:
+            raise ValueError("unknown node reference")
+        generation = max(
+            self._node_generation(from_node),
+            self._node_generation(to_node),
+        )
+        with self.connection:
+            if row["type"] == "intent":
+                facts_exist = "fact" in node_types.values()
+                if node_types[from_node] != "fact" and not (
+                    node_types[from_node] == "origin" and not facts_exist
+                ):
+                    raise ValueError("origin is only allowed as bootstrap source")
+                if node_types[to_node] not in {"goal", "fact", "hint"}:
+                    raise ValueError("unsupported intent target")
+                generation = self._node_generation(from_node) + 1
+                proposal = IntentProposal(
+                    from_node,
+                    to_node,
+                    str(row["content"]),
+                )
+                self.connection.execute(
+                    "UPDATE intents SET fingerprint = ? WHERE edge_id = ?",
+                    (_intent_fingerprint(proposal), edge_id),
+                )
+            self.connection.execute(
+                """
+                UPDATE edges
+                SET from_node = ?, to_node = ?, generation = ?
+                WHERE id = ?
+                """,
+                (from_node, to_node, generation, edge_id),
+            )
+            self._add_edge_provenance(edge_id, source)
+            self._event(
+                "graph.edge_updated",
+                source,
+                {
+                    "edge_id": edge_id,
+                    "from_node": from_node,
+                    "to_node": to_node,
+                },
+            )
+
+    def delete_edge(self, edge_id: str) -> None:
+        with self.connection:
+            row = self.connection.execute(
+                "SELECT type FROM edges WHERE id = ? AND project_id = ?",
+                (edge_id, self.project_id),
+            ).fetchone()
+            if row is None:
+                raise KeyError(edge_id)
+            executions = int(
+                self.connection.execute(
+                    """
+                    SELECT COUNT(*) FROM intent_executions
+                    WHERE intent_edge_id = ?
+                    """,
+                    (edge_id,),
+                ).fetchone()[0]
+            )
+            if executions:
+                raise ValueError("edge with execution history cannot be deleted")
+            self.connection.execute("DELETE FROM edges WHERE id = ?", (edge_id,))
+            self._event(
+                "graph.edge_updated",
+                "human",
+                {"edge_id": edge_id, "state": "deleted"},
+            )
+
     def start_execution(
         self,
         intent_id: str,

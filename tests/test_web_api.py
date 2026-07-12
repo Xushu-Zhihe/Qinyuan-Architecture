@@ -119,6 +119,48 @@ class WebApiTests(unittest.TestCase):
         self.assertEqual(conflict.status_code, 409)
         self.assertEqual(conflict.json()["detail"]["current_revision"], 1)
 
+    def test_reconnects_and_deletes_unexecuted_intent_edge(self) -> None:
+        project = self.create_project()
+        project_id = project["id"]
+        graph = self.client.get(f"/api/projects/{project_id}/graph").json()
+        goal = next(node for node in graph["nodes"] if node["type"] == "goal")
+        hint = self.client.post(
+            f"/api/projects/{project_id}/nodes",
+            json={"type": "hint", "content": "Check another path"},
+        ).json()
+        fact = self.client.post(
+            f"/api/projects/{project_id}/nodes",
+            json={"type": "fact", "content": "Known fact"},
+        ).json()
+        edge = self.client.post(
+            f"/api/projects/{project_id}/edges",
+            json={
+                "type": "intent",
+                "from_node_id": fact["id"],
+                "to_node_id": goal["id"],
+                "content": "Investigate",
+            },
+        ).json()
+
+        reconnected = self.client.patch(
+            f"/api/projects/{project_id}/edges/{edge['id']}",
+            json={
+                "from_node_id": fact["id"],
+                "to_node_id": hint["id"],
+            },
+        )
+        deleted = self.client.delete(
+            f"/api/projects/{project_id}/edges/{edge['id']}"
+        )
+
+        self.assertEqual(reconnected.status_code, 200)
+        self.assertEqual(reconnected.json()["to_node"], hint["id"])
+        self.assertEqual(deleted.status_code, 204)
+        refreshed = self.client.get(
+            f"/api/projects/{project_id}/graph"
+        ).json()
+        self.assertNotIn(edge["id"], [item["id"] for item in refreshed["edges"]])
+
     def test_execution_from_another_project_is_not_visible(self) -> None:
         first = self.create_project("First")
         second = self.create_project("Second")

@@ -1,8 +1,18 @@
 from dataclasses import dataclass
 
 
-NODE_TYPES = frozenset({"goal", "origin", "fact", "intent", "hint"})
-AGENT_NODE_TYPES = frozenset({"fact", "intent"})
+NODE_TYPES = frozenset({"goal", "origin", "fact", "hint"})
+AGENT_NODE_TYPES = frozenset({"fact"})
+RELATION_EDGE_TYPES = frozenset(
+    {
+        "supports",
+        "contradicts",
+        "derived_from",
+        "addresses",
+        "similar_to",
+        "equivalent_to",
+    }
+)
 EDGE_TYPES = frozenset(
     {
         "supports",
@@ -15,6 +25,56 @@ EDGE_TYPES = frozenset(
         "equivalent_to",
     }
 )
+
+
+@dataclass(frozen=True, slots=True)
+class IntentProposal:
+    source_node_id: str
+    target_node_id: str
+    content: str
+
+
+@dataclass(frozen=True, slots=True)
+class IntentDecision:
+    action: str
+    intent: IntentProposal | None
+    reason: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class FactProposal:
+    ref: str
+    content: str
+
+
+@dataclass(frozen=True, slots=True)
+class RelationProposal:
+    type: str
+    from_ref: str
+    to_ref: str
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutionUpdate:
+    intent_id: str
+    facts: tuple[FactProposal, ...]
+    edges: tuple[RelationProposal, ...]
+    goal_achieved: bool
+    final_answer: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class IntentParseResult:
+    status: str
+    decision: IntentDecision | None
+    error: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class ResultParseResult:
+    status: str
+    update: ExecutionUpdate | None
+    error: str | None
 
 
 @dataclass(frozen=True, slots=True)

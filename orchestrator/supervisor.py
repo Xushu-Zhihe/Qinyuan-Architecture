@@ -255,12 +255,16 @@ class ProjectSupervisor:
         if parsed_result.status != "valid" or parsed_result.update is None:
             error = parsed_result.error or "invalid result protocol"
             async with self.write_lock:
+                sequence = int(self.store.snapshot()["sequence"])
                 self.store.fail_execution(
                     execution.id,
                     "protocol_error",
                     error,
                     result.exit_code,
                 )
+                events = self.store.events_after(sequence)
+            for event in events:
+                await self.hub.publish(event)
             return IntentAttemptResult(
                 status="protocol_error",
                 protocol_error=error,

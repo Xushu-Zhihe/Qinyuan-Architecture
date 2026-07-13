@@ -218,6 +218,8 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         store, root = self.make_store()
         planning_calls = 0
         execution_requests: list[str] = []
+        hub = ProjectEventHub()
+        published_events: list[dict[str, object]] = []
 
         async def execute(config, request, challenge_dir, work_dir, **kwargs):
             nonlocal planning_calls
@@ -276,16 +278,19 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
                 "BLACKBOARD_RESULT: " + json.dumps(payload),
             )
 
-        supervisor = ProjectSupervisor(
-            store=store,
-            providers=(provider("codex"),),
-            challenge_dir=None,
-            project_dir=root,
-            execute=execute,
-            max_iterations=1,
-        )
-
-        status = await supervisor.run_agent_once("codex")
+        async with hub.subscribe() as queue:
+            supervisor = ProjectSupervisor(
+                store=store,
+                providers=(provider("codex"),),
+                challenge_dir=None,
+                project_dir=root,
+                hub=hub,
+                execute=execute,
+                max_iterations=1,
+            )
+            status = await supervisor.run_agent_once("codex")
+            while not queue.empty():
+                published_events.append(queue.get_nowait())
         snapshot = store.snapshot()
         intent = next(
             edge for edge in snapshot["edges"] if edge["type"] == "intent"
@@ -311,6 +316,14 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             snapshot["project"]["final_answer"],
             "flag{same}",
+        )
+        self.assertEqual(
+            [
+                event["payload"]["status"]
+                for event in published_events
+                if event["type"] == "intent.execution_finished"
+            ],
+            ["protocol_error", "completed"],
         )
 
     async def test_protocol_correction_stops_after_second_error(self) -> None:

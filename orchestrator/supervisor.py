@@ -1,10 +1,12 @@
 import asyncio
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from pathlib import Path
 from uuid import uuid4
 
 from orchestrator.events import ProjectEventHub
 from orchestrator.protocol import (
+    last_result_line,
     parse_intent,
     parse_result,
     render_execution_request,
@@ -16,6 +18,13 @@ from worker.models import LogChunk, ProviderConfig, WorkerResult
 
 
 Executor = Callable[..., Awaitable[WorkerResult]]
+
+
+@dataclass(frozen=True, slots=True)
+class IntentAttemptResult:
+    status: str
+    protocol_error: str | None = None
+    rejected_result_line: str | None = None
 
 
 class ProjectSupervisor:
@@ -143,6 +152,30 @@ class ProjectSupervisor:
         provider: ProviderConfig,
         intent: IntentRecord,
     ) -> str:
+        protocol_error: str | None = None
+        rejected_result_line: str | None = None
+        for attempt_number in range(2):
+            attempt = await self._execute_intent_attempt(
+                provider,
+                intent,
+                protocol_error=protocol_error,
+                rejected_result_line=rejected_result_line,
+            )
+            if attempt.status == "completed":
+                return "completed"
+            if attempt.status != "protocol_error" or attempt_number == 1:
+                return "failed"
+            protocol_error = attempt.protocol_error
+            rejected_result_line = attempt.rejected_result_line
+        raise AssertionError("unreachable intent attempt loop")
+
+    async def _execute_intent_attempt(
+        self,
+        provider: ProviderConfig,
+        intent: IntentRecord,
+        protocol_error: str | None,
+        rejected_result_line: str | None,
+    ) -> IntentAttemptResult:
         execution_dir = (
             self.project_dir
             / "executions"
@@ -198,6 +231,8 @@ class ProjectSupervisor:
                     "generation": intent.generation,
                 },
                 self.challenge_dir,
+                protocol_error=protocol_error,
+                rejected_result_line=rejected_result_line,
             ),
             execution_dir,
             on_chunk=on_chunk,
@@ -210,7 +245,7 @@ class ProjectSupervisor:
                     f"provider process status was {result.status}",
                     result.exit_code,
                 )
-            return "failed"
+            return IntentAttemptResult("failed")
 
         parsed_result = parse_result(
             result.output,
@@ -218,14 +253,19 @@ class ProjectSupervisor:
             existing_node_ids=set(self.store.node_types()),
         )
         if parsed_result.status != "valid" or parsed_result.update is None:
+            error = parsed_result.error or "invalid result protocol"
             async with self.write_lock:
                 self.store.fail_execution(
                     execution.id,
                     "protocol_error",
-                    parsed_result.error or "invalid result protocol",
+                    error,
                     result.exit_code,
                 )
-            return "failed"
+            return IntentAttemptResult(
+                status="protocol_error",
+                protocol_error=error,
+                rejected_result_line=last_result_line(result.output),
+            )
 
         async with self.write_lock:
             sequence = int(self.store.snapshot()["sequence"])
@@ -243,7 +283,7 @@ class ProjectSupervisor:
         for event in events:
             await self.hub.publish(event)
         self.wake_event.set()
-        return "completed"
+        return IntentAttemptResult("completed")
 
     async def _agent_loop(self, provider_name: str) -> None:
         iterations = 0

@@ -212,6 +212,171 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             "flag{same}",
         )
 
+    async def test_protocol_error_retries_same_intent_and_reaches_goal(
+        self,
+    ) -> None:
+        store, root = self.make_store()
+        planning_calls = 0
+        execution_requests: list[str] = []
+
+        async def execute(config, request, challenge_dir, work_dir, **kwargs):
+            nonlocal planning_calls
+            if "BLACKBOARD_INTENT:" in request:
+                planning_calls += 1
+                return self.result(
+                    config.name,
+                    work_dir,
+                    "BLACKBOARD_INTENT: "
+                    + json.dumps(
+                        {
+                            "action": "plan",
+                            "source_node_id": store.node_id("origin"),
+                            "target_node_id": store.node_id("goal"),
+                            "content": "Recover the flag",
+                        }
+                    ),
+                )
+
+            execution_requests.append(request)
+            intent_id = next(
+                edge["id"]
+                for edge in store.snapshot()["edges"]
+                if edge["type"] == "intent"
+            )
+            if len(execution_requests) == 1:
+                payload = {
+                    "intent_id": intent_id,
+                    "facts": ["flag = flag{same}"],
+                    "edges": [],
+                    "goal_achieved": True,
+                    "final_answer": "flag{same}",
+                }
+            else:
+                payload = {
+                    "intent_id": intent_id,
+                    "facts": [
+                        {
+                            "ref": "flag-fact",
+                            "content": "flag = flag{same}",
+                        }
+                    ],
+                    "edges": [
+                        {
+                            "type": "supports",
+                            "from": "flag-fact",
+                            "to": store.node_id("goal"),
+                        }
+                    ],
+                    "goal_achieved": True,
+                    "final_answer": "flag{same}",
+                }
+            return self.result(
+                config.name,
+                work_dir,
+                "BLACKBOARD_RESULT: " + json.dumps(payload),
+            )
+
+        supervisor = ProjectSupervisor(
+            store=store,
+            providers=(provider("codex"),),
+            challenge_dir=None,
+            project_dir=root,
+            execute=execute,
+            max_iterations=1,
+        )
+
+        status = await supervisor.run_agent_once("codex")
+        snapshot = store.snapshot()
+        intent = next(
+            edge for edge in snapshot["edges"] if edge["type"] == "intent"
+        )
+
+        self.assertEqual(status, "completed")
+        self.assertEqual(planning_calls, 1)
+        self.assertEqual(len(execution_requests), 2)
+        self.assertIn(
+            "fact proposal must be an object",
+            execution_requests[1],
+        )
+        self.assertIn("same assigned Intent", execution_requests[1])
+        self.assertEqual(
+            [item["status"] for item in intent["executions"]],
+            ["protocol_error", "completed"],
+        )
+        self.assertEqual(
+            len({item["work_dir"] for item in intent["executions"]}),
+            2,
+        )
+        self.assertEqual(snapshot["project"]["status"], "achieved")
+        self.assertEqual(
+            snapshot["project"]["final_answer"],
+            "flag{same}",
+        )
+
+    async def test_protocol_correction_stops_after_second_error(self) -> None:
+        store, root = self.make_store()
+        execution_calls = 0
+
+        async def execute(config, request, challenge_dir, work_dir, **kwargs):
+            nonlocal execution_calls
+            if "BLACKBOARD_INTENT:" in request:
+                return self.result(
+                    config.name,
+                    work_dir,
+                    "BLACKBOARD_INTENT: "
+                    + json.dumps(
+                        {
+                            "action": "plan",
+                            "source_node_id": store.node_id("origin"),
+                            "target_node_id": store.node_id("goal"),
+                            "content": "Recover the flag",
+                        }
+                    ),
+                )
+            execution_calls += 1
+            intent_id = next(
+                edge["id"]
+                for edge in store.snapshot()["edges"]
+                if edge["type"] == "intent"
+            )
+            return self.result(
+                config.name,
+                work_dir,
+                "BLACKBOARD_RESULT: "
+                + json.dumps(
+                    {
+                        "intent_id": intent_id,
+                        "facts": ["invalid fact"],
+                        "edges": [],
+                        "goal_achieved": True,
+                        "final_answer": "flag{same}",
+                    }
+                ),
+            )
+
+        supervisor = ProjectSupervisor(
+            store=store,
+            providers=(provider("codex"),),
+            challenge_dir=None,
+            project_dir=root,
+            execute=execute,
+            max_iterations=1,
+        )
+
+        status = await supervisor.run_agent_once("codex")
+        intent = next(
+            edge
+            for edge in store.snapshot()["edges"]
+            if edge["type"] == "intent"
+        )
+
+        self.assertEqual(status, "failed")
+        self.assertEqual(execution_calls, 2)
+        self.assertEqual(
+            [item["status"] for item in intent["executions"]],
+            ["protocol_error", "protocol_error"],
+        )
+
     async def test_stop_cancels_active_execution_and_marks_project_stopped(self) -> None:
         store, root = self.make_store()
         execution_started = asyncio.Event()

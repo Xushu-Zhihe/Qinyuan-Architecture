@@ -1,6 +1,9 @@
+import inspect
 import json
 import unittest
 
+import orchestrator.protocol as protocol
+from orchestrator.models import RELATION_EDGE_TYPES
 from orchestrator.protocol import (
     parse_intent,
     parse_result,
@@ -178,6 +181,88 @@ class ResultProtocolTests(unittest.TestCase):
         self.assertIn("BLACKBOARD_RESULT:", request)
         self.assertIn("intent-1", request)
         self.assertIn("Verify key", request)
+
+    def test_render_execution_request_contains_exact_result_contract(self) -> None:
+        request = render_execution_request(
+            snapshot={
+                "nodes": [
+                    {"id": "goal-1", "type": "goal", "state": "active"}
+                ]
+            },
+            intent={
+                "id": "intent-1",
+                "source_node_id": "origin-1",
+                "target_node_id": "goal-1",
+                "content": "Recover the flag",
+                "generation": 1,
+            },
+            challenge_dir=None,
+        )
+
+        self.assertIn("use $blackboard-result-protocol", request)
+        self.assertIn("If the Skill is unavailable", request)
+        self.assertIn(
+            '{"ref":"fact-ref","content":"verified fact"}',
+            request,
+        )
+        self.assertIn(
+            '{"type":"supports","from":"fact-ref","to":"goal-1"}',
+            request,
+        )
+        self.assertIn('"goal_achieved":true', request)
+        self.assertIn('"final_answer":"verified answer"', request)
+        for edge_type in RELATION_EDGE_TYPES:
+            self.assertIn(edge_type, request)
+
+    def test_render_execution_request_contains_correction_context(self) -> None:
+        parameters = inspect.signature(render_execution_request).parameters
+        self.assertIn("protocol_error", parameters)
+        self.assertIn("rejected_result_line", parameters)
+        if "protocol_error" not in parameters:
+            return
+
+        rejected = (
+            'BLACKBOARD_RESULT: {"intent_id":"intent-1",'
+            '"facts":["flag found"],"edges":[],"goal_achieved":true,'
+            '"final_answer":"flag{same}"}'
+        )
+        request = render_execution_request(
+            snapshot={"nodes": []},
+            intent={
+                "id": "intent-1",
+                "source_node_id": "origin-1",
+                "target_node_id": "goal-1",
+                "content": "Recover the flag",
+                "generation": 1,
+            },
+            challenge_dir=None,
+            protocol_error="fact proposal must be an object",
+            rejected_result_line=rejected,
+        )
+
+        self.assertIn("correct the previous result", request)
+        self.assertIn("fact proposal must be an object", request)
+        self.assertIn(json.dumps(rejected), request)
+        self.assertIn("Do not create or plan another Intent", request)
+
+    def test_last_result_line_returns_last_prefixed_line(self) -> None:
+        self.assertTrue(hasattr(protocol, "last_result_line"))
+        if not hasattr(protocol, "last_result_line"):
+            return
+
+        output = "\n".join(
+            (
+                'BLACKBOARD_RESULT: {"first":true}',
+                "analysis",
+                'BLACKBOARD_RESULT: {"second":true}',
+            )
+        )
+
+        self.assertEqual(
+            protocol.last_result_line(output),
+            'BLACKBOARD_RESULT: {"second":true}',
+        )
+        self.assertIsNone(protocol.last_result_line("analysis only"))
 
 
 if __name__ == "__main__":

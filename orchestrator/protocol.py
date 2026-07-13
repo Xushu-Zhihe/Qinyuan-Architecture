@@ -70,6 +70,54 @@ def _challenge_text(challenge_dir: str | Path | None) -> str:
     return str(challenge_dir) if challenge_dir else "not provided"
 
 
+def last_result_line(stdout: str) -> str | None:
+    candidates = [
+        line
+        for line in stdout.splitlines()
+        if line.startswith(RESULT_PREFIX)
+    ]
+    return candidates[-1] if candidates else None
+
+
+def _result_contract(intent: dict[str, object]) -> str:
+    intent_id = str(intent["id"])
+    target_node_id = str(intent.get("target_node_id", "target-node-id"))
+    example = {
+        "intent_id": intent_id,
+        "facts": [{"ref": "fact-ref", "content": "verified fact"}],
+        "edges": [
+            {
+                "type": "supports",
+                "from": "fact-ref",
+                "to": target_node_id,
+            }
+        ],
+        "goal_achieved": True,
+        "final_answer": "verified answer",
+    }
+    edge_types = ", ".join(sorted(RELATION_EDGE_TYPES))
+    return (
+        "Codex: use $blackboard-result-protocol before producing the result. "
+        "If the Skill is unavailable, continue with this inline contract.\n"
+        "The final line must start with BLACKBOARD_RESULT: followed by one "
+        "strict JSON object on the same line. The object must contain exactly "
+        "intent_id, facts, edges, goal_achieved, and final_answer.\n"
+        'Each fact must be {"ref":"temporary-ref","content":"non-empty fact"}. '
+        'Each edge must be {"type":"relation","from":"node-or-ref",'
+        '"to":"node-or-ref"}. Temporary fact refs must be unique. Edges may '
+        "reference existing node IDs or fact refs from this result.\n"
+        f"Allowed edge types: {edge_types}. goal_achieved must be a JSON "
+        "boolean. When true, final_answer must be a non-empty string; "
+        "otherwise final_answer may be null. Use empty arrays when there are "
+        "no facts or edges. Do not use Python dict syntax, key=value syntax, "
+        "tuples, or a Markdown fence for the protocol line.\n"
+        "Valid shape using the assigned IDs:\n"
+        f"{RESULT_PREFIX} "
+        + json.dumps(example, ensure_ascii=False, separators=(",", ":"))
+        + "\n"
+    )
+
+
 def render_intent_request(
     snapshot: dict[str, object],
     challenge_dir: str | Path | None,
@@ -92,15 +140,34 @@ def render_execution_request(
     snapshot: dict[str, object],
     intent: dict[str, object],
     challenge_dir: str | Path | None,
+    protocol_error: str | None = None,
+    rejected_result_line: str | None = None,
 ) -> str:
+    correction = ""
+    if protocol_error is not None:
+        correction_payload = {
+            "parser_error": protocol_error,
+            "rejected_result_line": rejected_result_line,
+        }
+        correction = (
+            "This is a protocol correction attempt. You must correct the "
+            "previous result while executing the same assigned Intent. Do not "
+            "create or plan another Intent. The rejected output was:\n"
+            + json.dumps(
+                correction_payload,
+                ensure_ascii=False,
+                indent=2,
+            )
+            + "\n"
+        )
     return (
         "Execute the assigned blackboard intent.\n"
         f"Challenge directory (read-only): {_challenge_text(challenge_dir)}\n"
         "You may propose facts and ordinary relation edges only. Do not create "
         "goal, origin, hint, or another intent.\n"
-        "Finish with one BLACKBOARD_RESULT: line containing exactly intent_id, "
-        "facts, edges, goal_achieved, and final_answer.\n\n"
-        "Assigned intent:\n"
+        + _result_contract(intent)
+        + correction
+        + "\nAssigned intent:\n"
         + json.dumps(intent, ensure_ascii=False, indent=2)
         + "\n\nGraph snapshot:\n"
         + json.dumps(snapshot, ensure_ascii=False, indent=2)

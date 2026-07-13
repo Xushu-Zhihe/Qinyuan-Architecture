@@ -186,13 +186,15 @@ BLACKBOARD_INTENT: {"action":"plan","source_node_id":"fact-...","target_node_id"
 BLACKBOARD_INTENT: {"action":"idle","reason":"No unresolved work"}
 ```
 
-执行阶段最后输出：
+执行阶段必须输出单行严格 JSON。`facts` 和 `edges` 的成员都是对象，不是字符串或二维数组：
 
 ```text
-BLACKBOARD_RESULT: {"intent_id":"intent-...","facts":[],"edges":[],"goal_achieved":false,"final_answer":null}
+BLACKBOARD_RESULT: {"intent_id":"intent-...","facts":[{"ref":"flag-fact","content":"flag = flag{example}"}],"edges":[{"type":"supports","from":"flag-fact","to":"goal-..."}],"goal_achieved":true,"final_answer":"flag{example}"}
 ```
 
-结构化结果整份校验并在单个事务中合并。协议错误不会留下部分 Fact 或关系，原始 stdout/stderr 仍会保留。
+`facts` 项只能包含 `ref`、`content`；`edges` 项只能包含 `type`、`from`、`to`。结构化结果整份校验并在单个事务中合并。协议错误不会留下部分 Fact 或关系，原始 stdout/stderr 仍会保留。
+
+执行进程成功但协议解析失败时，Supervisor 会保留失败 execution，并针对同一 Intent 创建一次带解析错误反馈的纠错 execution。第二次仍失败才把本轮计为失败。
 
 ## CLI 入口
 

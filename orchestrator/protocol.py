@@ -125,6 +125,9 @@ def render_intent_request(
     return (
         "Choose the next useful action from the blackboard.\n"
         f"Challenge directory (read-only): {_challenge_text(challenge_dir)}\n"
+        "This is planning only. Do not call tools, inspect files, or access "
+        "the network. Do not execute the action. Decide from the snapshot "
+        "and return the Intent promptly.\n"
         "Normally choose an existing fact as source. Only when no fact exists "
         "may origin be the bootstrap source. Target goal, fact, or hint.\n"
         "Finish with exactly one BLACKBOARD_INTENT: line. Use either "
@@ -165,6 +168,10 @@ def render_execution_request(
         f"Challenge directory (read-only): {_challenge_text(challenge_dir)}\n"
         "You may propose facts and ordinary relation edges only. Do not create "
         "goal, origin, hint, or another intent.\n"
+        "Treat environment or provider limitations (permissions, sandbox, "
+        "network, filesystem, unavailable tools) as execution diagnostics, "
+        "not challenge facts. Describe them in normal output, but do not add "
+        "them to facts.\n"
         + _result_contract(intent)
         + correction
         + "\nAssigned intent:\n"

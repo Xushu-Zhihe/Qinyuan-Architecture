@@ -114,6 +114,234 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             ["intent"],
         )
 
+    async def test_planning_uses_dedicated_timeout(self) -> None:
+        store, root = self.make_store()
+        observed_timeouts: list[float] = []
+
+        async def execute(config, request, challenge_dir, work_dir, **kwargs):
+            observed_timeouts.append(config.timeout_seconds)
+            if "BLACKBOARD_INTENT:" in request:
+                return self.result(
+                    config.name,
+                    work_dir,
+                    "BLACKBOARD_INTENT: "
+                    + json.dumps(
+                        {
+                            "action": "plan",
+                            "source_node_id": store.node_id("origin"),
+                            "target_node_id": store.node_id("goal"),
+                            "content": "Inspect the challenge",
+                        }
+                    ),
+                )
+            intent_id = next(
+                edge["id"]
+                for edge in store.snapshot()["edges"]
+                if edge["type"] == "intent"
+            )
+            return self.result(
+                config.name,
+                work_dir,
+                "BLACKBOARD_RESULT: "
+                + json.dumps(
+                    {
+                        "intent_id": intent_id,
+                        "facts": [],
+                        "edges": [],
+                        "goal_achieved": False,
+                        "final_answer": None,
+                    }
+                ),
+            )
+
+        configured = ProviderConfig(
+            "codex",
+            True,
+            10,
+            ("unused",),
+            timeout_seconds=900,
+            planning_timeout_seconds=30,
+        )
+        supervisor = ProjectSupervisor(
+            store=store,
+            providers=(configured,),
+            challenge_dir=None,
+            project_dir=root,
+            execute=execute,
+            max_iterations=1,
+        )
+
+        status = await supervisor.run_agent_once("codex")
+
+        self.assertEqual(status, "completed")
+        self.assertEqual(observed_timeouts, [30, 900])
+
+    async def test_stale_bootstrap_plan_replans_without_failure(self) -> None:
+        store, root = self.make_store()
+        planning_calls = 0
+        execution_calls = 0
+
+        async def execute(config, request, challenge_dir, work_dir, **kwargs):
+            nonlocal planning_calls, execution_calls
+            if "BLACKBOARD_INTENT:" in request:
+                planning_calls += 1
+                snapshot = json.loads(request.split("Graph snapshot:\n", 1)[1])
+                goal = next(
+                    node["id"]
+                    for node in snapshot["nodes"]
+                    if node["type"] == "goal"
+                )
+                if planning_calls == 1:
+                    source = next(
+                        node["id"]
+                        for node in snapshot["nodes"]
+                        if node["type"] == "origin"
+                    )
+                    store.add_human_node("fact", "Concurrent evidence")
+                else:
+                    source = next(
+                        node["id"]
+                        for node in snapshot["nodes"]
+                        if node["type"] == "fact"
+                    )
+                return self.result(
+                    config.name,
+                    work_dir,
+                    "BLACKBOARD_INTENT: "
+                    + json.dumps(
+                        {
+                            "action": "plan",
+                            "source_node_id": source,
+                            "target_node_id": goal,
+                            "content": "Follow current evidence",
+                        }
+                    ),
+                )
+
+            execution_calls += 1
+            intent_id = next(
+                edge["id"]
+                for edge in store.snapshot()["edges"]
+                if edge["type"] == "intent"
+            )
+            return self.result(
+                config.name,
+                work_dir,
+                "BLACKBOARD_RESULT: "
+                + json.dumps(
+                    {
+                        "intent_id": intent_id,
+                        "facts": [],
+                        "edges": [],
+                        "goal_achieved": False,
+                        "final_answer": None,
+                    }
+                ),
+            )
+
+        supervisor = ProjectSupervisor(
+            store=store,
+            providers=(provider("codex"),),
+            challenge_dir=None,
+            project_dir=root,
+            execute=execute,
+            max_iterations=1,
+        )
+
+        await supervisor.start()
+        await supervisor.wait_until_idle(timeout=1)
+
+        failed_events = [
+            event
+            for event in store.events_after(0)
+            if event["type"] == "agent.status_changed"
+            and event["payload"]["status"] == "failed"
+        ]
+        self.assertEqual(planning_calls, 2)
+        self.assertEqual(execution_calls, 1)
+        self.assertEqual(failed_events, [])
+        self.assertEqual(supervisor.agent_statuses()["codex"], "completed")
+
+    async def test_idle_agent_replans_only_after_graph_change(self) -> None:
+        store, root = self.make_store()
+        planning_calls = 0
+        first_call = asyncio.Event()
+        second_call = asyncio.Event()
+
+        async def execute(config, request, challenge_dir, work_dir, **kwargs):
+            nonlocal planning_calls
+            if "BLACKBOARD_INTENT:" not in request:
+                raise AssertionError("idle planner must not execute an Intent")
+            planning_calls += 1
+            if planning_calls == 1:
+                first_call.set()
+            elif planning_calls == 2:
+                second_call.set()
+            return self.result(
+                config.name,
+                work_dir,
+                "BLACKBOARD_INTENT: "
+                + json.dumps(
+                    {
+                        "action": "idle",
+                        "reason": "Wait for new graph evidence",
+                    }
+                ),
+            )
+
+        supervisor = ProjectSupervisor(
+            store=store,
+            providers=(provider("codex"),),
+            challenge_dir=None,
+            project_dir=root,
+            execute=execute,
+            idle_poll_interval=0.01,
+        )
+        await supervisor.start()
+        await asyncio.wait_for(first_call.wait(), timeout=1)
+        await asyncio.sleep(0.05)
+
+        self.assertEqual(planning_calls, 1)
+        store.add_human_node("fact", "Human supplied evidence")
+        await asyncio.wait_for(second_call.wait(), timeout=1)
+        await supervisor.stop()
+
+        self.assertEqual(planning_calls, 2)
+
+    async def test_stop_wakes_idle_agent_immediately(self) -> None:
+        store, root = self.make_store()
+        idle_returned = asyncio.Event()
+
+        async def execute(config, request, challenge_dir, work_dir, **kwargs):
+            idle_returned.set()
+            return self.result(
+                config.name,
+                work_dir,
+                "BLACKBOARD_INTENT: "
+                + json.dumps(
+                    {
+                        "action": "idle",
+                        "reason": "No unresolved work",
+                    }
+                ),
+            )
+
+        supervisor = ProjectSupervisor(
+            store=store,
+            providers=(provider("codex"),),
+            challenge_dir=None,
+            project_dir=root,
+            execute=execute,
+            idle_poll_interval=10,
+        )
+        await supervisor.start()
+        await asyncio.wait_for(idle_returned.wait(), timeout=1)
+        await asyncio.sleep(0)
+
+        await asyncio.wait_for(supervisor.stop(), timeout=0.2)
+
+        self.assertEqual(store.snapshot()["project"]["status"], "stopped")
+
     async def test_one_agent_failure_does_not_stop_another(self) -> None:
         store, root = self.make_store()
 

@@ -89,6 +89,8 @@ class IntentProtocolTests(unittest.TestCase):
         self.assertIn("BLACKBOARD_INTENT:", request)
         self.assertIn('"id": "goal-1"', request)
         self.assertIn("E:/ctf/task", request)
+        self.assertIn("Do not call tools", request)
+        self.assertIn("Do not execute the action", request)
 
 
 class ResultProtocolTests(unittest.TestCase):
@@ -213,6 +215,8 @@ class ResultProtocolTests(unittest.TestCase):
         self.assertIn('"final_answer":"verified answer"', request)
         for edge_type in RELATION_EDGE_TYPES:
             self.assertIn(edge_type, request)
+        self.assertIn("environment or provider limitations", request)
+        self.assertIn("diagnostics, not challenge facts", request)
 
     def test_render_execution_request_contains_correction_context(self) -> None:
         parameters = inspect.signature(render_execution_request).parameters

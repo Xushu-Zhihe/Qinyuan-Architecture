@@ -312,6 +312,25 @@ class BlackboardExecutionTests(StoreTestCase):
             sorted(event["sequence"] for event in events),
         )
 
+    def test_graph_sequence_ignores_runtime_and_layout_events(self) -> None:
+        store = self.make_store()
+        initial = store.graph_sequence()
+
+        store.append_event(
+            "agent.status_changed",
+            "codex",
+            {"provider": "codex", "status": "planning"},
+        )
+        store.append_event(
+            "graph.layout_updated",
+            "human",
+            {"revision": 1},
+        )
+
+        self.assertEqual(store.graph_sequence(), initial)
+        store.add_human_node("fact", "New evidence")
+        self.assertGreater(store.graph_sequence(), initial)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -998,6 +998,17 @@ class BlackboardStore:
             ).fetchall()
         )
 
+    def graph_sequence(self) -> int:
+        row = self.connection.execute(
+            """
+            SELECT COALESCE(MAX(sequence), 0) AS sequence
+            FROM events
+            WHERE type LIKE 'graph.node_%'
+               OR type LIKE 'graph.edge_%'
+            """
+        ).fetchone()
+        return int(row["sequence"])
+
     def append_event(
         self,
         event_type: str,

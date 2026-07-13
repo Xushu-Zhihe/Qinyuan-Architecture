@@ -153,7 +153,15 @@ Vite 默认地址为 `http://127.0.0.1:5173`，并将 `/api` 和 `/ws` 代理到
       "name": "codex",
       "enabled": true,
       "priority": 100,
-      "command": ["codex", "exec", "-C", "{work_dir}", "-"],
+      "command": [
+        "codex",
+        "exec",
+        "--dangerously-bypass-approvals-and-sandbox",
+        "-C",
+        "{work_dir}",
+        "-"
+      ],
+      "planning_timeout_seconds": 120,
       "timeout_seconds": 900
     }
   ]
@@ -168,7 +176,8 @@ Vite 默认地址为 `http://127.0.0.1:5173`，并将 `/api` 和 `/ws` 代理到
 | `enabled` | 是否可被项目选择 |
 | `priority` | 保留的配置元数据，不参与事实可信度判断 |
 | `command` | 参数数组；不经过 shell 解释 |
-| `timeout_seconds` | 单次规划或执行调用超时 |
+| `planning_timeout_seconds` | 规划调用超时；省略时取 `timeout_seconds` 与 120 秒中的较小值 |
+| `timeout_seconds` | Intent 执行调用超时 |
 
 支持 `{work_dir}` 和 `{challenge_dir}` 占位符。prompt 通过 stdin 发送，CLI 认证由各 provider 自己管理，平台不读取或保存 API Key。
 
@@ -234,7 +243,7 @@ E2E 使用本地 fake providers，不调用真实模型，不消耗模型额度�
 
 本项目可用于 CTF、安全评估、漏洞研究和渗透测试相关任务，但只能在明确获得授权的环境中使用。不要对未经所有者许可的系统、网络、应用或数据运行自动化安全测试。
 
-工作目录隔离不等同于容器级安全隔离。CLI 的实际文件、网络和进程权限仍取决于操作系统、provider 参数及其自身沙箱配置。
+工作目录隔离不等同于容器级安全隔离。默认 Codex 和 Claude 配置会关闭 CLI 自身的审批与沙箱，只适合在外部隔离的虚拟机或容器中运行。CLI 的实际文件、网络和进程权限取决于操作系统账户以及虚拟机或容器的边界；不要在含有宿主机共享目录、生产凭据或未隔离局域网访问的环境中使用默认配置。
 
 ## 当前限制
 

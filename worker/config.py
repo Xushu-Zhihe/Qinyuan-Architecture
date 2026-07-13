@@ -65,6 +65,18 @@ def _parse_provider(raw: object, index: int) -> ProviderConfig:
         or timeout <= 0
     ):
         raise ConfigError(f"provider {name!r}.timeout_seconds must be positive")
+    planning_timeout = raw.get(
+        "planning_timeout_seconds",
+        min(float(timeout), 120.0),
+    )
+    if (
+        not isinstance(planning_timeout, (int, float))
+        or isinstance(planning_timeout, bool)
+        or planning_timeout <= 0
+    ):
+        raise ConfigError(
+            f"provider {name!r}.planning_timeout_seconds must be positive"
+        )
 
     _validate_placeholders(name, command)
     return ProviderConfig(
@@ -73,6 +85,7 @@ def _parse_provider(raw: object, index: int) -> ProviderConfig:
         priority=priority,
         command=tuple(command),
         timeout_seconds=float(timeout),
+        planning_timeout_seconds=float(planning_timeout),
     )
 
 

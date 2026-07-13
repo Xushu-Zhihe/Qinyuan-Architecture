@@ -1,6 +1,6 @@
 import asyncio
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from uuid import uuid4
 
@@ -39,6 +39,7 @@ class ProjectSupervisor:
         global_semaphore: asyncio.Semaphore | None = None,
         max_iterations: int | None = None,
         failure_threshold: int = 3,
+        idle_poll_interval: float = 1.0,
     ) -> None:
         self.store = store
         self.providers = {
@@ -53,6 +54,7 @@ class ProjectSupervisor:
         self.global_semaphore = global_semaphore or asyncio.Semaphore(1024)
         self.max_iterations = max_iterations
         self.failure_threshold = failure_threshold
+        self.idle_poll_interval = idle_poll_interval
         self.cancel_event = asyncio.Event()
         self.wake_event = asyncio.Event()
         self.write_lock = asyncio.Lock()
@@ -103,13 +105,21 @@ class ProjectSupervisor:
 
         await self._set_agent_status(provider_name, "planning")
         snapshot = self.store.snapshot()
+        planning_node_types = {
+            str(node["id"]): str(node["type"])
+            for node in snapshot["nodes"]
+            if node["state"] == "active"
+        }
         planning_dir = (
             self.project_dir
             / "executions"
             / f"plan-{provider_name}-{uuid4().hex}"
         )
         planning = await self._run_provider(
-            provider,
+            replace(
+                provider,
+                timeout_seconds=provider.planning_timeout_seconds,
+            ),
             render_intent_request(snapshot, self.challenge_dir),
             planning_dir,
         )
@@ -119,11 +129,13 @@ class ProjectSupervisor:
 
         parsed_intent = parse_intent(
             planning.output,
-            self.store.node_types(),
+            planning_node_types,
         )
         if parsed_intent.status != "valid" or parsed_intent.decision is None:
             await self._mark_failure(provider_name)
             return "failed"
+        if self.store.node_types() != planning_node_types:
+            return "stale"
         if parsed_intent.decision.action == "idle":
             self._failures[provider_name] = 0
             await self._set_agent_status(provider_name, "idle")
@@ -131,6 +143,8 @@ class ProjectSupervisor:
         assert parsed_intent.decision.intent is not None
 
         async with self.write_lock:
+            if self.store.node_types() != planning_node_types:
+                return "stale"
             sequence = int(self.store.snapshot()["sequence"])
             intent = self.store.create_or_merge_intent(
                 provider_name,
@@ -294,19 +308,35 @@ class ProjectSupervisor:
         while not self.cancel_event.is_set():
             if self.max_iterations is not None and iterations >= self.max_iterations:
                 break
-            iterations += 1
+            graph_sequence = self.store.graph_sequence()
             status = await self.run_agent_once(provider_name)
+            if status == "stale":
+                continue
+            iterations += 1
             if status in {"failed", "cancelled"}:
                 if self._failures[provider_name] >= self.failure_threshold:
                     break
             if status == "idle":
                 if self.max_iterations is not None:
                     break
-                self.wake_event.clear()
-                try:
-                    await asyncio.wait_for(self.wake_event.wait(), timeout=1)
-                except asyncio.TimeoutError:
-                    pass
+                await self._wait_for_graph_change(graph_sequence)
+
+    async def _wait_for_graph_change(self, observed_sequence: int) -> None:
+        while not self.cancel_event.is_set():
+            if self.store.graph_sequence() != observed_sequence:
+                return
+            self.wake_event.clear()
+            if self.store.graph_sequence() != observed_sequence:
+                return
+            if self.cancel_event.is_set():
+                return
+            try:
+                await asyncio.wait_for(
+                    self.wake_event.wait(),
+                    timeout=self.idle_poll_interval,
+                )
+            except asyncio.TimeoutError:
+                pass
 
     async def start(self) -> None:
         if any(not task.done() for task in self.tasks.values()):
@@ -330,6 +360,7 @@ class ProjectSupervisor:
 
     async def stop(self) -> None:
         self.cancel_event.set()
+        self.wake_event.set()
         if self.tasks:
             await asyncio.gather(*self.tasks.values(), return_exceptions=True)
         if self.store.snapshot()["project"]["status"] != "achieved":

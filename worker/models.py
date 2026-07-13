@@ -8,6 +8,7 @@ class ProviderConfig:
     priority: int
     command: tuple[str, ...]
     timeout_seconds: float
+    planning_timeout_seconds: float = 120.0
 
 
 @dataclass(frozen=True, slots=True)

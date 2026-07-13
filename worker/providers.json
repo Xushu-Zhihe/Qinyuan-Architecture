@@ -7,16 +7,14 @@
       "command": [
         "codex",
         "exec",
-        "--sandbox",
-        "workspace-write",
+        "--dangerously-bypass-approvals-and-sandbox",
         "--skip-git-repo-check",
         "--ephemeral",
-        "-c",
-        "approval_policy=\"never\"",
         "-C",
         "{work_dir}",
         "-"
       ],
+      "planning_timeout_seconds": 120,
       "timeout_seconds": 900
     },
     {
@@ -28,9 +26,9 @@
         "-p",
         "--output-format",
         "text",
-        "--permission-mode",
-        "dontAsk"
+        "--dangerously-skip-permissions"
       ],
+      "planning_timeout_seconds": 120,
       "timeout_seconds": 900
     },
     {

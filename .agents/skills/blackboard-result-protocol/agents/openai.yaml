@@ -1,0 +1,4 @@
+interface:
+  display_name: "Blackboard Result Protocol"
+  short_description: "Validate strict BLACKBOARD_RESULT output"
+  default_prompt: "Use $blackboard-result-protocol to produce and validate a strict BLACKBOARD_RESULT line."

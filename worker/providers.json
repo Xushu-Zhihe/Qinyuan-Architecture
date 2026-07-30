@@ -1,4 +1,7 @@
 {
+  "execution": {
+    "backend": "local"
+  },
   "coordinator": {
     "max_global_running": 16,
     "max_project_running": 4,
@@ -30,7 +33,10 @@
         "-"
       ],
       "health_check": {
-        "command": ["codex", "--version"],
+        "command": [
+          "codex",
+          "--version"
+        ],
         "timeout_seconds": 10,
         "cooldown_seconds": 15,
         "max_cooldown_seconds": 300,
@@ -52,7 +58,10 @@
         "--dangerously-skip-permissions"
       ],
       "health_check": {
-        "command": ["claude", "--version"],
+        "command": [
+          "claude",
+          "--version"
+        ],
         "timeout_seconds": 10,
         "cooldown_seconds": 15,
         "max_cooldown_seconds": 300,
@@ -66,9 +75,15 @@
       "enabled": true,
       "priority": 80,
       "max_running": 4,
-      "command": ["kimi", "--print"],
+      "command": [
+        "kimi",
+        "--print"
+      ],
       "health_check": {
-        "command": ["kimi", "--version"],
+        "command": [
+          "kimi",
+          "--version"
+        ],
         "timeout_seconds": 10,
         "cooldown_seconds": 15,
         "max_cooldown_seconds": 300,

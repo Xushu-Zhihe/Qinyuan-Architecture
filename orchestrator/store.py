@@ -9,6 +9,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from orchestrator.health import HEALTH_STATUSES, redact_error
+from orchestrator.migrations import apply_migrations, stamp_new_schema
 from orchestrator.models import IntentProposal, RELATION_EDGE_TYPES
 
 
@@ -26,7 +27,8 @@ CREATE TABLE IF NOT EXISTS provider_health (
     last_error TEXT,
     checked_at TEXT NOT NULL,
     cooldown_until TEXT,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    cli_version TEXT NOT NULL DEFAULT 'unknown'
 );
 """
 
@@ -52,7 +54,14 @@ CREATE TABLE IF NOT EXISTS planning_attempts (
     model TEXT NOT NULL DEFAULT 'unknown',
     cli_version TEXT NOT NULL DEFAULT 'unknown',
     token_usage_json TEXT NOT NULL DEFAULT '"unknown"',
-    logs_retained INTEGER NOT NULL DEFAULT 1 CHECK(logs_retained IN (0, 1))
+    logs_retained INTEGER NOT NULL DEFAULT 1 CHECK(logs_retained IN (0, 1)),
+    execution_backend TEXT NOT NULL DEFAULT 'unknown',
+    isolation TEXT NOT NULL DEFAULT 'unknown',
+    backend_run_id TEXT,
+    cleanup_policy TEXT,
+    cleanup_status TEXT NOT NULL DEFAULT 'not_applicable',
+    cleanup_detail TEXT,
+    backend_metadata_json TEXT NOT NULL DEFAULT '{}'
 );
 
 CREATE INDEX IF NOT EXISTS planning_attempts_by_project
@@ -144,6 +153,7 @@ CREATE TABLE intent_executions (
     intent_edge_id TEXT NOT NULL REFERENCES intents(edge_id),
     provider TEXT NOT NULL,
     status TEXT NOT NULL,
+    queued_at TEXT,
     started_at TEXT,
     finished_at TEXT,
     exit_code INTEGER,
@@ -151,7 +161,23 @@ CREATE TABLE intent_executions (
     stderr_path TEXT NOT NULL,
     work_dir TEXT NOT NULL,
     error_message TEXT,
-    retry_of_execution_id TEXT REFERENCES intent_executions(id)
+    queue_seconds REAL NOT NULL DEFAULT 0,
+    duration_seconds REAL,
+    retry_count INTEGER NOT NULL DEFAULT 0,
+    cancel_reason TEXT,
+    wait_reasons_json TEXT NOT NULL DEFAULT '[]',
+    model TEXT NOT NULL DEFAULT 'unknown',
+    cli_version TEXT NOT NULL DEFAULT 'unknown',
+    token_usage_json TEXT NOT NULL DEFAULT '"unknown"',
+    logs_retained INTEGER NOT NULL DEFAULT 1,
+    retry_of_execution_id TEXT REFERENCES intent_executions(id),
+    execution_backend TEXT NOT NULL DEFAULT 'unknown',
+    isolation TEXT NOT NULL DEFAULT 'unknown',
+    backend_run_id TEXT,
+    cleanup_policy TEXT,
+    cleanup_status TEXT NOT NULL DEFAULT 'not_applicable',
+    cleanup_detail TEXT,
+    backend_metadata_json TEXT NOT NULL DEFAULT '{}'
 );
 
 CREATE INDEX executions_by_intent
@@ -218,40 +244,53 @@ def _timestamp_after(value: str, seconds: float) -> str:
     ).isoformat()
 
 
-def _ensure_runtime_schema(connection: sqlite3.Connection) -> None:
-    connection.executescript(PROVIDER_HEALTH_SCHEMA + AUDIT_SCHEMA)
-    execution_columns = {
+BLACKBOARD_SCHEMA_VERSION = 3
+
+
+def _add_columns(
+    connection: sqlite3.Connection,
+    table: str,
+    additions: dict[str, str],
+) -> None:
+    columns = {
         str(row[1])
-        for row in connection.execute("PRAGMA table_info(intent_executions)")
-    }
-    additions = {
-        "queued_at": "TEXT",
-        "queue_seconds": "REAL NOT NULL DEFAULT 0",
-        "duration_seconds": "REAL",
-        "retry_count": "INTEGER NOT NULL DEFAULT 0",
-        "cancel_reason": "TEXT",
-        "wait_reasons_json": "TEXT NOT NULL DEFAULT '[]'",
-        "model": "TEXT NOT NULL DEFAULT 'unknown'",
-        "cli_version": "TEXT NOT NULL DEFAULT 'unknown'",
-        "token_usage_json": "TEXT NOT NULL DEFAULT '\"unknown\"'",
-        "logs_retained": "INTEGER NOT NULL DEFAULT 1",
-        "retry_of_execution_id": "TEXT REFERENCES intent_executions(id)",
+        for row in connection.execute(f"PRAGMA table_info({table})")
     }
     for name, definition in additions.items():
-        if name not in execution_columns:
+        if name not in columns:
             connection.execute(
-                f"ALTER TABLE intent_executions ADD COLUMN {name} {definition}"
+                f"ALTER TABLE {table} ADD COLUMN {name} {definition}"
             )
 
-    health_columns = {
-        str(row[1])
-        for row in connection.execute("PRAGMA table_info(provider_health)")
-    }
-    if "cli_version" not in health_columns:
-        connection.execute(
-            "ALTER TABLE provider_health "
-            "ADD COLUMN cli_version TEXT NOT NULL DEFAULT 'unknown'"
-        )
+
+def _migrate_blackboard_v1(connection: sqlite3.Connection) -> None:
+    connection.executescript(PROVIDER_HEALTH_SCHEMA)
+    _add_columns(
+        connection,
+        "provider_health",
+        {"cli_version": "TEXT NOT NULL DEFAULT 'unknown'"},
+    )
+
+
+def _migrate_blackboard_v2(connection: sqlite3.Connection) -> None:
+    connection.executescript(AUDIT_SCHEMA)
+    _add_columns(
+        connection,
+        "intent_executions",
+        {
+            "queued_at": "TEXT",
+            "queue_seconds": "REAL NOT NULL DEFAULT 0",
+            "duration_seconds": "REAL",
+            "retry_count": "INTEGER NOT NULL DEFAULT 0",
+            "cancel_reason": "TEXT",
+            "wait_reasons_json": "TEXT NOT NULL DEFAULT '[]'",
+            "model": "TEXT NOT NULL DEFAULT 'unknown'",
+            "cli_version": "TEXT NOT NULL DEFAULT 'unknown'",
+            "token_usage_json": "TEXT NOT NULL DEFAULT '\"unknown\"'",
+            "logs_retained": "INTEGER NOT NULL DEFAULT 1",
+            "retry_of_execution_id": "TEXT REFERENCES intent_executions(id)",
+        },
+    )
     connection.execute(
         """
         UPDATE intent_executions
@@ -259,7 +298,110 @@ def _ensure_runtime_schema(connection: sqlite3.Connection) -> None:
         WHERE queued_at IS NULL
         """
     )
-    connection.commit()
+
+
+def _migrate_blackboard_v3(connection: sqlite3.Connection) -> None:
+    backend_columns = {
+        "execution_backend": "TEXT NOT NULL DEFAULT 'unknown'",
+        "isolation": "TEXT NOT NULL DEFAULT 'unknown'",
+        "backend_run_id": "TEXT",
+        "cleanup_policy": "TEXT",
+        "cleanup_status": "TEXT NOT NULL DEFAULT 'not_applicable'",
+        "cleanup_detail": "TEXT",
+        "backend_metadata_json": "TEXT NOT NULL DEFAULT '{}'",
+    }
+    _add_columns(connection, "intent_executions", backend_columns)
+    _add_columns(connection, "planning_attempts", backend_columns)
+
+
+BLACKBOARD_MIGRATIONS = {
+    1: ("provider health state", _migrate_blackboard_v1),
+    2: ("planning and execution audit", _migrate_blackboard_v2),
+    3: ("execution backend audit", _migrate_blackboard_v3),
+}
+
+
+def _ensure_runtime_schema(
+    connection: sqlite3.Connection,
+    path: Path,
+) -> Path | None:
+    backup_path = apply_migrations(
+        connection,
+        path,
+        latest_version=BLACKBOARD_SCHEMA_VERSION,
+        migrations=BLACKBOARD_MIGRATIONS,
+    )
+    _validate_blackboard_schema(connection)
+    return backup_path
+
+
+BLACKBOARD_REQUIRED_SCHEMA = {
+    "projects": {"id", "status", "goal_version"},
+    "provider_health": {"provider", "status", "cli_version"},
+    "planning_attempts": {
+        "id",
+        "queue_seconds",
+        "token_usage_json",
+        "execution_backend",
+        "isolation",
+        "cleanup_status",
+        "backend_metadata_json",
+    },
+    "intent_executions": {
+        "id",
+        "queue_seconds",
+        "token_usage_json",
+        "retry_of_execution_id",
+        "execution_backend",
+        "isolation",
+        "cleanup_status",
+        "backend_metadata_json",
+    },
+}
+
+
+def _validate_blackboard_schema(connection: sqlite3.Connection) -> None:
+    missing_tables: list[str] = []
+    missing_columns: list[str] = []
+    for table, required_columns in BLACKBOARD_REQUIRED_SCHEMA.items():
+        columns = {
+            str(row[1])
+            for row in connection.execute(f"PRAGMA table_info({table})")
+        }
+        if not columns:
+            missing_tables.append(table)
+            continue
+        missing_columns.extend(
+            f"{table}.{column}"
+            for column in sorted(required_columns - columns)
+        )
+    if missing_tables or missing_columns:
+        details: list[str] = []
+        if missing_tables:
+            details.append("missing tables: " + ", ".join(missing_tables))
+        if missing_columns:
+            details.append("missing columns: " + ", ".join(missing_columns))
+        raise RuntimeError("blackboard schema drift detected (" + "; ".join(details) + ")")
+
+
+def _sanitize_backend_metadata(value: object) -> object:
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, str):
+        return redact_error(value, limit=1000)
+    if isinstance(value, dict):
+        return {
+            redact_error(str(key), limit=200): _sanitize_backend_metadata(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_sanitize_backend_metadata(item) for item in value]
+    return redact_error(str(value), limit=1000)
+
+
+def _backend_metadata_json(metadata: dict[str, object] | None) -> str:
+    safe = _sanitize_backend_metadata(metadata or {})
+    return json.dumps(safe, ensure_ascii=False, sort_keys=True)
 
 
 def _normalize(content: str) -> str:
@@ -299,7 +441,11 @@ class BlackboardStore:
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute("PRAGMA busy_timeout = 5000")
-        _ensure_runtime_schema(connection)
+        try:
+            _ensure_runtime_schema(connection, path)
+        except Exception:
+            connection.close()
+            raise
         exists = connection.execute(
             "SELECT 1 FROM projects WHERE id = ?",
             (project_id,),
@@ -324,7 +470,11 @@ class BlackboardStore:
         connection = sqlite3.connect(path, check_same_thread=False)
         connection.row_factory = sqlite3.Row
         connection.executescript(SCHEMA)
-        _ensure_runtime_schema(connection)
+        stamp_new_schema(
+            connection,
+            latest_version=BLACKBOARD_SCHEMA_VERSION,
+            migrations=BLACKBOARD_MIGRATIONS,
+        )
         store = cls(path, connection, project_id)
         now = _now()
         with connection:
@@ -815,17 +965,54 @@ class BlackboardStore:
                 {"edge_id": edge_id, "state": "deleted"},
             )
 
+    def _record_backend_cleanup_event(
+        self,
+        kind: str,
+        record_id: str,
+        provider: str,
+        execution_backend: str,
+        cleanup_policy: str | None,
+        cleanup_status: str,
+        cleanup_detail: str | None,
+    ) -> None:
+        if execution_backend == "unknown" and cleanup_status == "not_applicable":
+            return
+        payload: dict[str, object] = {
+            "kind": kind,
+            "record_id": record_id,
+            "execution_backend": redact_error(
+                execution_backend or "unknown", limit=100
+            ),
+            "cleanup_policy": (
+                redact_error(cleanup_policy, limit=100)
+                if cleanup_policy
+                else None
+            ),
+            "cleanup_status": redact_error(
+                cleanup_status or "not_applicable", limit=100
+            ),
+        }
+        if cleanup_detail:
+            payload["cleanup_detail"] = redact_error(cleanup_detail, limit=1000)
+        self._event("execution_backend.cleanup_finished", provider, payload)
+
     @staticmethod
     def _decode_audit_row(row: sqlite3.Row) -> dict[str, object]:
         record = dict(row)
-        for field in ("wait_reasons_json", "token_usage_json"):
+        for field in (
+            "wait_reasons_json",
+            "token_usage_json",
+            "backend_metadata_json",
+        ):
             if field not in record:
                 continue
             value = record.pop(field)
             try:
                 record[field.removesuffix("_json")] = json.loads(str(value))
             except (json.JSONDecodeError, TypeError):
-                record[field.removesuffix("_json")] = "unknown"
+                record[field.removesuffix("_json")] = (
+                    {} if field == "backend_metadata_json" else "unknown"
+                )
         if "logs_retained" in record:
             record["logs_retained"] = bool(record["logs_retained"])
         return record
@@ -916,6 +1103,13 @@ class BlackboardStore:
         model: str = "unknown",
         cli_version: str = "unknown",
         token_usage: object = "unknown",
+        execution_backend: str = "unknown",
+        isolation: str = "unknown",
+        backend_run_id: str | None = None,
+        cleanup_policy: str | None = None,
+        cleanup_status: str = "not_applicable",
+        cleanup_detail: str | None = None,
+        backend_metadata: dict[str, object] | None = None,
     ) -> None:
         attempt = self.planning_attempt(attempt_id)
         safe_reason = redact_error(decision_reason, limit=1000)
@@ -931,7 +1125,9 @@ class BlackboardStore:
                     queue_seconds = ?, duration_seconds = ?,
                     decision_reason = ?, intent_edge_id = ?,
                     wait_reasons_json = ?, model = ?, cli_version = ?,
-                    token_usage_json = ?
+                    token_usage_json = ?, execution_backend = ?, isolation = ?,
+                    backend_run_id = ?, cleanup_policy = ?, cleanup_status = ?,
+                    cleanup_detail = ?, backend_metadata_json = ?
                 WHERE id = ?
                 """,
                 (
@@ -946,6 +1142,25 @@ class BlackboardStore:
                     model or "unknown",
                     cli_version or "unknown",
                     json.dumps(token_usage, ensure_ascii=False),
+                    redact_error(execution_backend or "unknown", limit=100),
+                    redact_error(isolation or "unknown", limit=100),
+                    (
+                        redact_error(backend_run_id, limit=500)
+                        if backend_run_id
+                        else None
+                    ),
+                    (
+                        redact_error(cleanup_policy, limit=100)
+                        if cleanup_policy
+                        else None
+                    ),
+                    redact_error(cleanup_status or "not_applicable", limit=100),
+                    (
+                        redact_error(cleanup_detail, limit=1000)
+                        if cleanup_detail
+                        else None
+                    ),
+                    _backend_metadata_json(backend_metadata),
                     attempt_id,
                 ),
             )
@@ -969,7 +1184,20 @@ class BlackboardStore:
                     "status": status,
                     "decision_reason": safe_reason,
                     "intent_id": intent_id,
+                    "execution_backend": execution_backend,
+                    "isolation": isolation,
+                    "cleanup_policy": cleanup_policy,
+                    "cleanup_status": cleanup_status,
                 },
+            )
+            self._record_backend_cleanup_event(
+                "planning",
+                attempt_id,
+                str(attempt["provider"]),
+                execution_backend,
+                cleanup_policy,
+                cleanup_status,
+                cleanup_detail,
             )
 
     def planning_attempt(self, attempt_id: str) -> dict[str, object]:
@@ -1201,6 +1429,13 @@ class BlackboardStore:
         model: str = "unknown",
         cli_version: str = "unknown",
         token_usage: object = "unknown",
+        execution_backend: str = "unknown",
+        isolation: str = "unknown",
+        backend_run_id: str | None = None,
+        cleanup_policy: str | None = None,
+        cleanup_status: str = "not_applicable",
+        cleanup_detail: str | None = None,
+        backend_metadata: dict[str, object] | None = None,
     ) -> tuple[str, ...]:
         with self.connection:
             execution = self.connection.execute(
@@ -1276,7 +1511,9 @@ class BlackboardStore:
                 SET status = ?, finished_at = ?, exit_code = ?,
                     queue_seconds = ?, duration_seconds = ?,
                     wait_reasons_json = ?, model = ?, cli_version = ?,
-                    token_usage_json = ?
+                    token_usage_json = ?, execution_backend = ?, isolation = ?,
+                    backend_run_id = ?, cleanup_policy = ?, cleanup_status = ?,
+                    cleanup_detail = ?, backend_metadata_json = ?
                 WHERE id = ?
                 """,
                 (
@@ -1289,6 +1526,25 @@ class BlackboardStore:
                     model or "unknown",
                     cli_version or "unknown",
                     json.dumps(token_usage, ensure_ascii=False),
+                    redact_error(execution_backend or "unknown", limit=100),
+                    redact_error(isolation or "unknown", limit=100),
+                    (
+                        redact_error(backend_run_id, limit=500)
+                        if backend_run_id
+                        else None
+                    ),
+                    (
+                        redact_error(cleanup_policy, limit=100)
+                        if cleanup_policy
+                        else None
+                    ),
+                    redact_error(cleanup_status or "not_applicable", limit=100),
+                    (
+                        redact_error(cleanup_detail, limit=1000)
+                        if cleanup_detail
+                        else None
+                    ),
+                    _backend_metadata_json(backend_metadata),
                     execution_id,
                 ),
             )
@@ -1299,7 +1555,20 @@ class BlackboardStore:
                     "intent_id": intent_id,
                     "execution_id": execution_id,
                     "status": status,
+                    "execution_backend": execution_backend,
+                    "isolation": isolation,
+                    "cleanup_policy": cleanup_policy,
+                    "cleanup_status": cleanup_status,
                 },
+            )
+            self._record_backend_cleanup_event(
+                "execution",
+                execution_id,
+                str(execution["provider"]),
+                execution_backend,
+                cleanup_policy,
+                cleanup_status,
+                cleanup_detail,
             )
             return tuple(dict.fromkeys(refs.values()))
 
@@ -1317,6 +1586,13 @@ class BlackboardStore:
         model: str = "unknown",
         cli_version: str = "unknown",
         token_usage: object = "unknown",
+        execution_backend: str = "unknown",
+        isolation: str = "unknown",
+        backend_run_id: str | None = None,
+        cleanup_policy: str | None = None,
+        cleanup_status: str = "not_applicable",
+        cleanup_detail: str | None = None,
+        backend_metadata: dict[str, object] | None = None,
     ) -> None:
         safe_error = redact_error(error_message, limit=1000)
         safe_cancel = (
@@ -1332,7 +1608,10 @@ class BlackboardStore:
                 SET status = ?, finished_at = ?, exit_code = ?,
                     error_message = ?, queue_seconds = ?, duration_seconds = ?,
                     cancel_reason = ?, wait_reasons_json = ?, model = ?,
-                    cli_version = ?, token_usage_json = ?
+                    cli_version = ?, token_usage_json = ?,
+                    execution_backend = ?, isolation = ?, backend_run_id = ?,
+                    cleanup_policy = ?, cleanup_status = ?, cleanup_detail = ?,
+                    backend_metadata_json = ?
                 WHERE id = ?
                 """,
                 (
@@ -1347,6 +1626,25 @@ class BlackboardStore:
                     model or "unknown",
                     cli_version or "unknown",
                     json.dumps(token_usage, ensure_ascii=False),
+                    redact_error(execution_backend or "unknown", limit=100),
+                    redact_error(isolation or "unknown", limit=100),
+                    (
+                        redact_error(backend_run_id, limit=500)
+                        if backend_run_id
+                        else None
+                    ),
+                    (
+                        redact_error(cleanup_policy, limit=100)
+                        if cleanup_policy
+                        else None
+                    ),
+                    redact_error(cleanup_status or "not_applicable", limit=100),
+                    (
+                        redact_error(cleanup_detail, limit=1000)
+                        if cleanup_detail
+                        else None
+                    ),
+                    _backend_metadata_json(backend_metadata),
                     execution_id,
                 ),
             )
@@ -1371,7 +1669,20 @@ class BlackboardStore:
                     "execution_id": execution_id,
                     "status": status,
                     "error_message": safe_error,
+                    "execution_backend": execution_backend,
+                    "isolation": isolation,
+                    "cleanup_policy": cleanup_policy,
+                    "cleanup_status": cleanup_status,
                 },
+            )
+            self._record_backend_cleanup_event(
+                "execution",
+                execution_id,
+                str(execution["provider"]),
+                execution_backend,
+                cleanup_policy,
+                cleanup_status,
+                cleanup_detail,
             )
 
     def intent_status(self, intent_id: str) -> str:

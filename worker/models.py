@@ -1,4 +1,4 @@
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 
 
 @dataclass(frozen=True, slots=True)
@@ -38,6 +38,33 @@ class ProviderConfig:
     planning_timeout_seconds: float = 120.0
     health_check: HealthCheckConfig | None = None
     max_running: int = 4
+    container_image: str | None = None
+    container_command: tuple[str, ...] | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ContainerBackendConfig:
+    runtime_command: tuple[str, ...] = ("docker",)
+    default_image: str | None = None
+    network: str = "none"
+    capabilities: tuple[str, ...] = ()
+    environment: tuple[tuple[str, str], ...] = ()
+    environment_allowlist: tuple[str, ...] = ()
+    cleanup_policy: str = "remove"
+    challenge_mount_path: str = "/challenge"
+    work_mount_path: str = "/work"
+    read_only_root: bool = True
+    memory_limit: str | None = None
+    cpu_limit: float | None = None
+    pids_limit: int | None = None
+    stop_timeout_seconds: float = 2.0
+    setup_timeout_seconds: float = 300.0
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutionConfig:
+    backend: str = "local"
+    container: ContainerBackendConfig | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,6 +90,13 @@ class WorkerResult:
     model: str = "unknown"
     cli_version: str = "unknown"
     token_usage: object = "unknown"
+    execution_backend: str = "custom"
+    isolation: str = "unspecified"
+    backend_run_id: str | None = None
+    cleanup_policy: str | None = None
+    cleanup_status: str = "not_applicable"
+    cleanup_detail: str | None = None
+    backend_metadata: dict[str, object] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)

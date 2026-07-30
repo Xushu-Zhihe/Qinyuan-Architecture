@@ -12,3 +12,7 @@ frontend/test-results/
 frontend/playwright-report/
 frontend/*.tsbuildinfo
 experiments/results/
+dist/
+build/
+*.egg-info/
+.pytest_cache/

@@ -1,9 +1,16 @@
 import { defineConfig } from '@playwright/test'
 import { fileURLToPath } from 'node:url'
+import fs from 'node:fs'
 import path from 'node:path'
 
 const frontendRoot = path.dirname(fileURLToPath(import.meta.url))
 const projectRoot = path.resolve(frontendRoot, '..')
+const configuredPython = process.env.QINYUAN_PYTHON
+const localPython = process.platform === 'win32'
+  ? path.resolve(projectRoot, '.venv', 'Scripts', 'python.exe')
+  : path.resolve(projectRoot, '.venv', 'bin', 'python')
+const pythonExecutable = configuredPython
+  ?? (fs.existsSync(localPython) ? `"${localPython}"` : 'python')
 const apiPort = Number(process.env.BLACKBOARD_E2E_API_PORT ?? 8000)
 const webPort = Number(process.env.BLACKBOARD_E2E_WEB_PORT ?? 5173)
 const dataRoot = path.resolve(
@@ -26,7 +33,7 @@ export default defineConfig({
   },
   webServer: [
     {
-      command: `python -m uvicorn tests.fixtures.web_test_app:create_app --factory --host 127.0.0.1 --port ${apiPort}`,
+      command: `${pythonExecutable} -m uvicorn tests.fixtures.web_test_app:create_app --factory --host 127.0.0.1 --port ${apiPort}`,
       cwd: projectRoot,
       env: { ...process.env, BLACKBOARD_E2E_DATA_ROOT: dataRoot },
       url: `http://127.0.0.1:${apiPort}/api/projects`,

@@ -1,5 +1,6 @@
 import json
 import sqlite3
+import threading
 from collections.abc import Awaitable, Callable
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -10,6 +11,7 @@ from orchestrator.coordinator import ExecutionCoordinator
 from orchestrator.events import ProjectEventHub
 from orchestrator.health import HealthProbe
 from orchestrator.layout import LayoutStore
+from orchestrator.migrations import apply_migrations
 from orchestrator.store import BlackboardStore
 from orchestrator.supervisor import ProjectSupervisor
 from worker.models import (
@@ -38,6 +40,45 @@ CREATE TABLE IF NOT EXISTS projects (
     last_opened_at TEXT NOT NULL
 );
 """
+
+
+REGISTRY_SCHEMA_VERSION = 1
+
+
+def _migrate_registry_v1(connection: sqlite3.Connection) -> None:
+    connection.executescript(REGISTRY_SCHEMA)
+
+
+REGISTRY_MIGRATIONS = {
+    1: ("project registry", _migrate_registry_v1),
+}
+
+
+def _validate_registry_schema(connection: sqlite3.Connection) -> None:
+    columns = {
+        str(row[1])
+        for row in connection.execute("PRAGMA table_info(projects)")
+    }
+    required = {
+        "id",
+        "name",
+        "mode",
+        "status",
+        "project_path",
+        "challenge_path",
+        "providers_json",
+        "agent_limit",
+        "created_at",
+        "updated_at",
+        "last_opened_at",
+    }
+    missing = sorted(required - columns)
+    if missing:
+        raise RuntimeError(
+            "project registry schema drift detected (missing columns: "
+            + ", ".join(missing)
+            + ")"
+        )
 
 
 class ProjectPathError(ValueError):
@@ -85,7 +126,17 @@ class ProjectRegistry:
             check_same_thread=False,
         )
         self.connection.row_factory = sqlite3.Row
-        self.connection.executescript(REGISTRY_SCHEMA)
+        try:
+            apply_migrations(
+                self.connection,
+                self.data_root / "projects.db",
+                latest_version=REGISTRY_SCHEMA_VERSION,
+                migrations=REGISTRY_MIGRATIONS,
+            )
+            _validate_registry_schema(self.connection)
+        except Exception:
+            self.connection.close()
+            raise
 
     def close(self) -> None:
         self.connection.close()
@@ -217,6 +268,10 @@ class ProjectService:
         self.health_probe = health_probe
         self._handles: dict[str, ProjectHandle] = {}
         self._supervisors: dict[str, ProjectSupervisor] = {}
+        # Registry rows and their Blackboard databases are created together.
+        # Keep readers from observing the small initialization window between
+        # those two writes (notably while /api/runtime polls during E2E).
+        self._lock = threading.RLock()
 
     def _sync_project_status(self, handle: ProjectHandle) -> ProjectRecord:
         status = str(handle.store.snapshot()["project"]["status"])
@@ -245,10 +300,11 @@ class ProjectService:
             )
 
     def close(self) -> None:
-        for handle in self._handles.values():
-            handle.store.close()
-        self._handles.clear()
-        self.registry.close()
+        with self._lock:
+            for handle in self._handles.values():
+                handle.store.close()
+            self._handles.clear()
+            self.registry.close()
 
     async def aclose(self) -> None:
         for supervisor in tuple(self._supervisors.values()):
@@ -268,68 +324,71 @@ class ProjectService:
         agent_limit: int,
         challenge_path: Path | None,
     ) -> ProjectHandle:
-        unknown = set(provider_names) - set(self.provider_configs)
-        if self.provider_configs and unknown:
-            raise ValueError(f"unknown providers: {sorted(unknown)}")
-        record = self.registry.create(
-            name,
-            mode,
-            challenge_path,
-            provider_names,
-            agent_limit,
-        )
-        store = BlackboardStore.create(
-            record.path / "blackboard.db",
-            record.id,
-            goal,
-            origin,
-            hints,
-        )
-        handle = ProjectHandle(
-            record,
-            store,
-            LayoutStore(record.path),
-            ProjectEventHub(),
-        )
-        handle.store.ensure_provider_health(record.providers)
-        self._handles[record.id] = handle
-        return handle
+        with self._lock:
+            unknown = set(provider_names) - set(self.provider_configs)
+            if self.provider_configs and unknown:
+                raise ValueError(f"unknown providers: {sorted(unknown)}")
+            record = self.registry.create(
+                name,
+                mode,
+                challenge_path,
+                provider_names,
+                agent_limit,
+            )
+            store = BlackboardStore.create(
+                record.path / "blackboard.db",
+                record.id,
+                goal,
+                origin,
+                hints,
+            )
+            handle = ProjectHandle(
+                record,
+                store,
+                LayoutStore(record.path),
+                ProjectEventHub(),
+            )
+            handle.store.ensure_provider_health(record.providers)
+            self._handles[record.id] = handle
+            return handle
 
     def get_handle(self, project_id: str) -> ProjectHandle:
-        handle = self._handles.get(project_id)
-        if handle is not None:
-            self._sync_project_status(handle)
+        with self._lock:
+            handle = self._handles.get(project_id)
+            if handle is not None:
+                self._sync_project_status(handle)
+                return handle
+            record = self.registry.get(project_id)
+            handle = ProjectHandle(
+                record,
+                BlackboardStore.open(record.path / "blackboard.db", record.id),
+                LayoutStore(record.path),
+                ProjectEventHub(),
+            )
+            handle.store.ensure_provider_health(record.providers)
+            self._handles[record.id] = handle
+            self._recover_project(handle)
             return handle
-        record = self.registry.get(project_id)
-        handle = ProjectHandle(
-            record,
-            BlackboardStore.open(record.path / "blackboard.db", record.id),
-            LayoutStore(record.path),
-            ProjectEventHub(),
-        )
-        handle.store.ensure_provider_health(record.providers)
-        self._handles[record.id] = handle
-        self._recover_project(handle)
-        return handle
 
     def list_projects(self) -> tuple[dict[str, object], ...]:
-        result = []
-        for record in self.registry.list():
-            handle = self.get_handle(record.id)
-            snapshot = handle.store.snapshot()
-            result.append(
-                {
-                    **project_record_dict(handle.record),
-                    "fact_count": sum(
-                        node["type"] == "fact" for node in snapshot["nodes"]
-                    ),
-                    "intent_count": sum(
-                        edge["type"] == "intent" for edge in snapshot["edges"]
-                    ),
-                    "highest_generation": snapshot["highest_generation"],
-                }
-            )
-        return tuple(result)
+        with self._lock:
+            result = []
+            for record in self.registry.list():
+                handle = self.get_handle(record.id)
+                snapshot = handle.store.snapshot()
+                result.append(
+                    {
+                        **project_record_dict(handle.record),
+                        "fact_count": sum(
+                            node["type"] == "fact" for node in snapshot["nodes"]
+                        ),
+                        "intent_count": sum(
+                            edge["type"] == "intent" for edge in snapshot["edges"]
+                        ),
+                        "highest_generation": snapshot["highest_generation"],
+                    }
+                )
+            return tuple(result)
 
     def _create_supervisor(self, handle: ProjectHandle) -> ProjectSupervisor:
         configs = tuple(

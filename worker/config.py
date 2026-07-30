@@ -5,7 +5,9 @@ from string import Formatter
 
 from worker.models import (
     AuditConfig,
+    ContainerBackendConfig,
     CoordinatorConfig,
+    ExecutionConfig,
     HealthCheckConfig,
     ProviderConfig,
 )
@@ -163,6 +165,28 @@ def _parse_provider(raw: object, index: int) -> ProviderConfig:
         )
 
     _validate_placeholders(name, command)
+    container_image = raw.get("container_image")
+    if container_image is not None and (
+        not isinstance(container_image, str) or not container_image.strip()
+    ):
+        raise ConfigError(
+            f"provider {name!r}.container_image must be a non-empty string"
+        )
+    container_command = raw.get("container_command")
+    if container_command is not None:
+        if (
+            not isinstance(container_command, list)
+            or not container_command
+            or any(
+                not isinstance(argument, str) or not argument
+                for argument in container_command
+            )
+        ):
+            raise ConfigError(
+                f"provider {name!r}.container_command must be a "
+                "non-empty list of strings"
+            )
+        _validate_placeholders(name, container_command)
     health_check = _parse_health_check(raw.get("health_check"), name)
     max_running = _positive_integer(
         raw.get("max_running", 4),
@@ -177,6 +201,16 @@ def _parse_provider(raw: object, index: int) -> ProviderConfig:
         planning_timeout_seconds=float(planning_timeout),
         health_check=health_check,
         max_running=max_running,
+        container_image=(
+            container_image.strip()
+            if isinstance(container_image, str)
+            else None
+        ),
+        container_command=(
+            tuple(container_command)
+            if isinstance(container_command, list)
+            else None
+        ),
     )
 
 
@@ -298,3 +332,161 @@ def load_provider_configs(path: Path) -> tuple[ProviderConfig, ...]:
     if len(names) != len(set(names)):
         raise ConfigError("duplicate provider name in provider config")
     return providers
+
+
+def _string_list(value: object, field: str) -> tuple[str, ...]:
+    if not isinstance(value, list) or any(
+        not isinstance(item, str) or not item.strip() for item in value
+    ):
+        raise ConfigError(f"{field} must be a list of non-empty strings")
+    return tuple(item.strip() for item in value)
+
+
+def load_execution_config(path: Path) -> ExecutionConfig:
+    payload = _load_payload(path)
+    raw = payload.get("execution", {"backend": "local"})
+    if not isinstance(raw, dict):
+        raise ConfigError("execution must be an object")
+    backend = raw.get("backend", "local")
+    if backend not in {"local", "container"}:
+        raise ConfigError("execution.backend must be local or container")
+    if backend == "local":
+        return ExecutionConfig(backend="local")
+
+    container_raw = raw.get("container")
+    if not isinstance(container_raw, dict):
+        raise ConfigError("execution.container must be an object")
+    defaults = ContainerBackendConfig()
+    runtime = _string_list(
+        container_raw.get("runtime_command", list(defaults.runtime_command)),
+        "execution.container.runtime_command",
+    )
+    default_image = container_raw.get("default_image")
+    if default_image is not None and (
+        not isinstance(default_image, str) or not default_image.strip()
+    ):
+        raise ConfigError(
+            "execution.container.default_image must be a non-empty string"
+        )
+    network = container_raw.get("network", defaults.network)
+    if not isinstance(network, str) or not network.strip():
+        raise ConfigError("execution.container.network must be a non-empty string")
+    capabilities = _string_list(
+        container_raw.get("capabilities", []),
+        "execution.container.capabilities",
+    )
+    if any(re.fullmatch(r"[A-Za-z0-9_]+", item) is None for item in capabilities):
+        raise ConfigError("execution.container.capabilities contains an unsafe value")
+    environment_raw = container_raw.get("environment", {})
+    if not isinstance(environment_raw, dict) or any(
+        not isinstance(key, str)
+        or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key) is None
+        or not isinstance(value, str)
+        for key, value in environment_raw.items()
+    ):
+        raise ConfigError(
+            "execution.container.environment must map environment names to strings"
+        )
+    environment_allowlist = _string_list(
+        container_raw.get("environment_allowlist", []),
+        "execution.container.environment_allowlist",
+    )
+    if any(
+        re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name) is None
+        for name in environment_allowlist
+    ):
+        raise ConfigError(
+            "execution.container.environment_allowlist contains an unsafe name"
+        )
+    cleanup_policy = container_raw.get(
+        "cleanup_policy",
+        defaults.cleanup_policy,
+    )
+    if cleanup_policy not in {"keep", "stop", "remove"}:
+        raise ConfigError(
+            "execution.container.cleanup_policy must be keep, stop or remove"
+        )
+    challenge_mount = container_raw.get(
+        "challenge_mount_path",
+        defaults.challenge_mount_path,
+    )
+    work_mount = container_raw.get(
+        "work_mount_path",
+        defaults.work_mount_path,
+    )
+    for value, field in (
+        (challenge_mount, "challenge_mount_path"),
+        (work_mount, "work_mount_path"),
+    ):
+        if not isinstance(value, str) or not value.strip():
+            raise ConfigError(
+                f"execution.container.{field} must be a non-empty string"
+            )
+    if str(challenge_mount).casefold() == str(work_mount).casefold():
+        raise ConfigError(
+            "execution.container challenge and work mount paths must differ"
+        )
+    read_only_root = container_raw.get(
+        "read_only_root",
+        defaults.read_only_root,
+    )
+    if not isinstance(read_only_root, bool):
+        raise ConfigError("execution.container.read_only_root must be a boolean")
+    memory_limit = container_raw.get("memory_limit")
+    if memory_limit is not None and (
+        not isinstance(memory_limit, str) or not memory_limit.strip()
+    ):
+        raise ConfigError(
+            "execution.container.memory_limit must be a non-empty string"
+        )
+    cpu_limit = container_raw.get("cpu_limit")
+    if cpu_limit is not None:
+        cpu_limit = _positive_number(cpu_limit, "execution.container.cpu_limit")
+    pids_limit = container_raw.get("pids_limit")
+    if pids_limit is not None:
+        pids_limit = _positive_integer(
+            pids_limit,
+            "execution.container.pids_limit",
+        )
+    stop_timeout = _positive_number(
+        container_raw.get(
+            "stop_timeout_seconds",
+            defaults.stop_timeout_seconds,
+        ),
+        "execution.container.stop_timeout_seconds",
+    )
+    setup_timeout = _positive_number(
+        container_raw.get(
+            "setup_timeout_seconds",
+            defaults.setup_timeout_seconds,
+        ),
+        "execution.container.setup_timeout_seconds",
+    )
+    return ExecutionConfig(
+        backend="container",
+        container=ContainerBackendConfig(
+            runtime_command=runtime,
+            default_image=(
+                default_image.strip()
+                if isinstance(default_image, str)
+                else None
+            ),
+            network=network.strip(),
+            capabilities=capabilities,
+            environment=tuple(sorted(environment_raw.items())),
+            environment_allowlist=environment_allowlist,
+            cleanup_policy=str(cleanup_policy),
+            challenge_mount_path=str(challenge_mount).strip(),
+            work_mount_path=str(work_mount).strip(),
+            read_only_root=read_only_root,
+            memory_limit=(
+                memory_limit.strip()
+                if isinstance(memory_limit, str)
+                else None
+            ),
+            cpu_limit=float(cpu_limit) if cpu_limit is not None else None,
+            pids_limit=int(pids_limit) if pids_limit is not None else None,
+            stop_timeout_seconds=stop_timeout,
+            setup_timeout_seconds=setup_timeout,
+        ),
+    )

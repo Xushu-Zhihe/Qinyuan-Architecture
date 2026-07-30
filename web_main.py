@@ -4,9 +4,11 @@ from pathlib import Path
 import uvicorn
 
 from web.app import DEFAULT_DATA_ROOT, create_app
+from worker.backends import build_execution_backend
 from worker.config import (
     load_audit_config,
     load_coordinator_config,
+    load_execution_config,
     load_provider_configs,
 )
 
@@ -30,10 +32,13 @@ def create_server_app(
         provider_configs=load_provider_configs(resolved_config),
         coordinator_config=load_coordinator_config(resolved_config),
         audit_config=load_audit_config(resolved_config),
+        execute=build_execution_backend(
+            load_execution_config(resolved_config)
+        ).execute,
     )
 
 
-if __name__ == "__main__":
+def main() -> None:
     uvicorn.run(
         "web_main:create_server_app",
         factory=True,
@@ -41,3 +46,7 @@ if __name__ == "__main__":
         port=8000,
         reload=False,
     )
+
+
+if __name__ == "__main__":
+    main()

@@ -527,6 +527,10 @@ class ProjectSupervisor:
             queue_seconds=lease.queue_seconds,
             wait_reasons=lease.wait_reasons,
             cancel_reason=reason,
+            execution_backend="not_started",
+            isolation="not_started",
+            cleanup_status="not_started",
+            backend_metadata={"reason": "scheduler_cancelled"},
         )
 
     async def _mark_planning_started(
@@ -567,6 +571,13 @@ class ProjectSupervisor:
                 model=result.model,
                 cli_version=result.cli_version,
                 token_usage=result.token_usage,
+                    execution_backend=result.execution_backend,
+                    isolation=result.isolation,
+                    backend_run_id=result.backend_run_id,
+                    cleanup_policy=result.cleanup_policy,
+                    cleanup_status=result.cleanup_status,
+                    cleanup_detail=result.cleanup_detail,
+                    backend_metadata=result.backend_metadata,
             )
             events = self.store.events_after(sequence)
         for event in events:
@@ -947,6 +958,13 @@ class ProjectSupervisor:
                     model=result.model,
                     cli_version=result.cli_version,
                     token_usage=result.token_usage,
+                    execution_backend=result.execution_backend,
+                    isolation=result.isolation,
+                    backend_run_id=result.backend_run_id,
+                    cleanup_policy=result.cleanup_policy,
+                    cleanup_status=result.cleanup_status,
+                    cleanup_detail=result.cleanup_detail,
+                    backend_metadata=result.backend_metadata,
                 )
                 events = self.store.events_after(sequence)
             for event in events:
@@ -977,6 +995,13 @@ class ProjectSupervisor:
                     model=result.model,
                     cli_version=result.cli_version,
                     token_usage=result.token_usage,
+                    execution_backend=result.execution_backend,
+                    isolation=result.isolation,
+                    backend_run_id=result.backend_run_id,
+                    cleanup_policy=result.cleanup_policy,
+                    cleanup_status=result.cleanup_status,
+                    cleanup_detail=result.cleanup_detail,
+                    backend_metadata=result.backend_metadata,
                 )
                 events = self.store.events_after(sequence)
             for event in events:
@@ -1001,6 +1026,13 @@ class ProjectSupervisor:
                 model=result.model,
                 cli_version=result.cli_version,
                 token_usage=result.token_usage,
+                    execution_backend=result.execution_backend,
+                    isolation=result.isolation,
+                    backend_run_id=result.backend_run_id,
+                    cleanup_policy=result.cleanup_policy,
+                    cleanup_status=result.cleanup_status,
+                    cleanup_detail=result.cleanup_detail,
+                    backend_metadata=result.backend_metadata,
             )
             answer = self.store.consensus(self.answer_quorum_provider_count)
             if answer is not None:

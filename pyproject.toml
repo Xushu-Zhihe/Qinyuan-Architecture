@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools==83.0.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "qinyuan-blackboard"
+version = "0.2.0"
+description = "Local multi-CLI-agent blackboard orchestration platform"
+readme = { file = "README.md", content-type = "text/markdown" }
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "fastapi==0.141.1",
+  "httpx==0.28.1",
+  "uvicorn[standard]==0.52.0",
+]
+keywords = ["multi-agent", "blackboard", "cli", "orchestration"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Framework :: FastAPI",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.12",
+  "Operating System :: Microsoft :: Windows",
+  "Operating System :: POSIX :: Linux",
+]
+
+[project.urls]
+Homepage = "https://github.com/Xushu-Zhihe/qinyuan-bat"
+Repository = "https://github.com/Xushu-Zhihe/qinyuan-bat"
+
+[project.scripts]
+qinyuan-blackboard = "main:run_cli"
+qinyuan-blackboard-web = "web_main:main"
+
+[tool.setuptools]
+include-package-data = true
+py-modules = ["main", "web_main"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["experiments*", "orchestrator*", "web*", "worker*"]
+exclude = ["tests*"]
+
+[tool.setuptools.package-data]
+experiments = ["configs/*.json"]
+worker = ["providers.json"]

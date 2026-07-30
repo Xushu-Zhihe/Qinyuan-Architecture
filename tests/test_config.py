@@ -7,6 +7,7 @@ from worker.config import (
     ConfigError,
     load_audit_config,
     load_coordinator_config,
+    load_execution_config,
     load_provider_configs,
 )
 
@@ -44,6 +45,98 @@ class ProviderConfigTests(unittest.TestCase):
             self.assertEqual(providers[0].command[-1], "-")
             self.assertEqual(providers[0].planning_timeout_seconds, 30)
             self.assertIsNone(providers[0].health_check)
+
+    def test_loads_provider_container_overrides(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = self.write_config(
+                directory,
+                {
+                    "providers": [
+                        {
+                            "name": "fake",
+                            "enabled": True,
+                            "priority": 1,
+                            "command": ["host-agent", "{work_dir}"],
+                            "container_image": "agent:test",
+                            "container_command": [
+                                "container-agent",
+                                "{challenge_dir}",
+                                "{work_dir}",
+                            ],
+                            "timeout_seconds": 30,
+                        }
+                    ]
+                },
+            )
+
+            loaded = load_provider_configs(path)[0]
+
+            self.assertEqual(loaded.container_image, "agent:test")
+            self.assertEqual(
+                loaded.container_command,
+                ("container-agent", "{challenge_dir}", "{work_dir}"),
+            )
+
+    def test_loads_default_and_explicit_execution_backends(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            local_path = self.write_config(directory, {"providers": []})
+            self.assertEqual(load_execution_config(local_path).backend, "local")
+
+            container_path = self.write_config(
+                directory,
+                {
+                    "execution": {
+                        "backend": "container",
+                        "container": {
+                            "runtime_command": ["docker", "--context", "test"],
+                            "default_image": "agent:test",
+                            "network": "isolated",
+                            "capabilities": ["NET_BIND_SERVICE"],
+                            "environment": {"LITERAL": "value"},
+                            "environment_allowlist": ["ALLOWED"],
+                            "cleanup_policy": "stop",
+                            "challenge_mount_path": "/input",
+                            "work_mount_path": "/output",
+                            "read_only_root": False,
+                            "memory_limit": "512m",
+                            "cpu_limit": 1.5,
+                            "pids_limit": 64,
+                            "stop_timeout_seconds": 3,
+                            "setup_timeout_seconds": 45,
+                        },
+                    },
+                    "providers": [],
+                },
+            )
+            execution = load_execution_config(container_path)
+
+            self.assertEqual(execution.backend, "container")
+            assert execution.container is not None
+            self.assertEqual(
+                execution.container.runtime_command,
+                ("docker", "--context", "test"),
+            )
+            self.assertEqual(execution.container.cleanup_policy, "stop")
+            self.assertEqual(execution.container.environment, (("LITERAL", "value"),))
+            self.assertEqual(execution.container.cpu_limit, 1.5)
+
+    def test_rejects_unsafe_container_environment_name(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = self.write_config(
+                directory,
+                {
+                    "execution": {
+                        "backend": "container",
+                        "container": {
+                            "default_image": "agent:test",
+                            "environment": {"BAD-NAME": "secret"},
+                        },
+                    },
+                    "providers": [],
+                },
+            )
+            with self.assertRaisesRegex(ConfigError, "environment"):
+                load_execution_config(path)
 
     def test_loads_optional_health_check(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -95,21 +95,37 @@ web-data/
 
 ## 环境要求
 
-- Python 3.10 或更高版本。
-- Node.js 20.19+ 或 22.12+。
-- 至少一个已安装并完成认证的 CLI provider。
+开发和 CI 使用仓库根目录的固定运行时文件：
+
+- Python `3.12.9`（`.python-version`）；
+- Node.js `24.18.1`（`.node-version`）；
+- npm `11.16.0`；
+- Git；
+- 至少一个已安装并完成认证的 CLI provider（Codex、Claude 或 Kimi）；
+- Docker CLI 和可用 daemon 是可选依赖，仅在使用 `container` 后端时需要；
 - Windows、macOS 或 Linux。
+
+如果需要在受支持的 Windows 机器上安装环境，可运行仓库中的
+`QinyuanEnvironmentChecker.exe`。它会把 Docker 标记为可选项，并提供
+`--report <path>` 无界面 JSON 检查模式。
 
 ## 安装与启动
 
+推荐使用固定 Python 版本创建虚拟环境，并用锁定文件安装依赖：
+
 ```powershell
-python -m pip install -r requirements.txt
-cd frontend
-npm install
+py -3.12 -m venv .venv
+.\.venv\Scripts\python -m pip install -r requirements.lock
+Set-Location frontend
+npm ci
 npm run build
-cd ..
-python web_main.py
+Set-Location ..
+.\.venv\Scripts\python web_main.py
 ```
+
+`requirements.txt` 保留为宽范围的开发入口；可复现构建和 CI 必须使用
+`requirements.lock`。前端必须使用 `npm ci`，`frontend/package-lock.json` 和
+`frontend/package.json` 中的依赖版本均已固定。
 
 打开 [http://127.0.0.1:8000](http://127.0.0.1:8000)。服务只监听 localhost。
 
@@ -125,7 +141,6 @@ $env:BLACKBOARD_DATA_ROOT = 'E:\blackboard-data'
 $env:BLACKBOARD_PROVIDER_CONFIG = 'E:\configs\providers.json'
 python web_main.py
 ```
-
 ## 开发模式
 
 先启动后端：
@@ -320,6 +335,71 @@ Execution 另行保存重试编号、取消原因、调度等待原因、模型�
 - 审计下载按钮显式调用现有 ZIP 导出接口。停止、重试、重新打开和启动均需要
   用户操作，不会由状态轮询自动触发。
 
+## 执行后端与隔离边界
+
+默认配置使用本地后端：
+
+```json
+{
+  "execution": {
+    "backend": "local"
+  }
+}
+```
+
+### Local 后端
+
+Local 后端保留 Windows 进程树取消、超时和流式日志能力，但审计明确记录
+`execution_backend=local`、`isolation=unsafe_local` 和
+`challenge_enforcement=prompt_only`。`challenge_dir` 只是提示词和工作流约定，
+不是操作系统强制的只读沙箱；不要在含有宿主机凭据、生产目录或未隔离网络的账户下运行默认
+provider。
+
+### Container 后端（可选）
+
+在 Docker-compatible runtime 可用时，可以在配置中显式启用：
+
+```json
+{
+  "execution": {
+    "backend": "container",
+    "container": {
+      "runtime_command": ["docker"],
+      "default_image": "python:3.12-alpine",
+      "network": "none",
+      "capabilities": [],
+      "environment": {
+        "EXPLICIT_VALUE": "configured"
+      },
+      "environment_allowlist": ["SAFE_INPUT"],
+      "cleanup_policy": "remove",
+      "challenge_mount_path": "/challenge",
+      "work_mount_path": "/work",
+      "read_only_root": true,
+      "memory_limit": "256m",
+      "cpu_limit": 1.0,
+      "pids_limit": 64
+    }
+  }
+}
+```
+
+容器后端将 challenge 目录只读挂载、将 execution 工作目录单独读写挂载，默认不继承
+宿主机完整环境变量，并把网络、额外 capability、镜像、资源限制和清理策略作为显式配置。
+provider 可以用 `container_image` 和 `container_command` 覆盖默认镜像或命令模板。
+`cleanup_policy` 支持 `keep`、`stop`、`remove`，实际结果会写入 Planning Attempt、
+Execution 和审计事件。
+
+当前 Windows Server 2019 工作区没有可用 Docker daemon，因此本地 fake Docker 测试和
+Linux CI 的真实 Docker boundary 测试必须分开标记；不能把 fake 测试结果描述成当前 Windows
+主机已完成容器验收。Windows 容器若使用不同挂载目标或参数语义，应在目标 runtime 上单独验证。
+
+## 数据库迁移与备份
+
+Blackboard SQLite 和项目注册表都维护显式 schema version 与 migration history。打开旧版本
+数据库时会按版本顺序迁移，并在迁移前使用 SQLite backup API 生成
+`*.pre-v<old>-to-v<new>-<timestamp>.bak` 备份；数据库版本高于当前程序时会拒绝打开。
+迁移不会把用户数据库、日志或 challenge 数据写入源码发布包。
 ## Agent 协议
 
 规划阶段最后输出：
@@ -426,8 +506,7 @@ npm test -- --run
 npm run build
 ```
 
-2026-07-30 当前实测：后端 `125/125`、前端 `21/21`、Playwright E2E `8/8`，
-生产构建成功。
+2026-07-30 当前工作区基线：后端全量测试包含容器集成用例（没有显式启用 Docker 时跳过），前端单元测试 `21/21`、Playwright E2E `8/8`，生产构建成功；最终发布前应以本次验收输出的实际测试总数为准。fake Docker backend 测试与真实 Docker boundary 测试必须分别报告。
 
 Playwright E2E 首次运行前安装浏览器：
 
@@ -441,6 +520,26 @@ E2E 使用本地 fake providers，不调用真实模型，不消耗模型额度�
 诊断、Intent 跳转、审计入口、真实日志文件和 WebSocket 更新。测试端口可通过
 `BLACKBOARD_E2E_API_PORT` 与 `BLACKBOARD_E2E_WEB_PORT` 调整。
 
+## 发布与版本
+
+`VERSION` 是当前版本号（目前为 `0.2.0`），并且必须与 `pyproject.toml` 和
+`frontend/package.json` 一致。发布前运行：
+
+```powershell
+.\.venv\Scripts\python tools\build_release.py --check-only
+.\.venv\Scripts\python tools\build_release.py
+```
+
+发布 ZIP 使用固定的源文件清单和 `RELEASE-MANIFEST.json` SHA-256 清单。构建器会拒绝
+SQLite/数据库、日志、凭据、challenge、`experiments/results`、`web-data`、
+`worker/runs`、前端构建产物和用户数据；它也会扫描高置信度的 API key、云访问 key 和
+私钥标记。发布前先阅读 `CHANGELOG.md`，正式开源许可证尚待仓库所有者选择，未加入许可证
+文件前不要自行再分发。
+
+GitHub Actions 位于 `.github/workflows/windows.yml` 和
+`.github/workflows/linux.yml`：Windows 验证后端、前端、生产构建、fake E2E、环境检查器
+和发布包；Linux 另外运行 fake-provider Docker boundary 集成测试。CI 不调用真实模型，
+provider 凭据只应存在于用户自己的环境变量或专用配置文件中。
 ## 安全与授权
 
 本项目可用于 CTF、安全评估、漏洞研究和渗透测试相关任务，但只能在明确获得授权的环境中使用。不要对未经所有者许可的系统、网络、应用或数据运行自动化安全测试。

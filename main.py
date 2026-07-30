@@ -5,10 +5,12 @@ from pathlib import Path
 from typing import Callable, Sequence
 
 from orchestrator.scheduler import run_orchestration
+from worker.backends import build_execution_backend
 from worker.config import (
     ConfigError,
     load_audit_config,
     load_coordinator_config,
+    load_execution_config,
     load_provider_configs,
 )
 
@@ -77,6 +79,9 @@ def run_cli(
         providers = load_provider_configs(args.config.resolve())
         coordinator_config = load_coordinator_config(args.config.resolve())
         audit_config = load_audit_config(args.config.resolve())
+        execution_backend = build_execution_backend(
+            load_execution_config(args.config.resolve())
+        )
         result = asyncio.run(
             run_orchestration(
                 providers=providers,
@@ -90,6 +95,7 @@ def run_cli(
                 max_iterations=args.max_iterations,
                 coordinator_config=coordinator_config,
                 audit_config=audit_config,
+                execute=execution_backend.execute,
             )
         )
     except ConfigError as exc:

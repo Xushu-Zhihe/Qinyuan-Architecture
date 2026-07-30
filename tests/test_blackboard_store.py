@@ -216,6 +216,8 @@ class BlackboardExecutionTests(StoreTestCase):
         path = store.path
         with store.connection:
             store.connection.execute("DROP TABLE provider_health")
+            store.connection.execute("PRAGMA user_version = 0")
+            store.connection.execute("DELETE FROM schema_migrations")
         store.close()
 
         reopened = BlackboardStore.open(path, store.project_id)
@@ -226,6 +228,16 @@ class BlackboardExecutionTests(StoreTestCase):
             reopened.provider_health_for("codex")["status"],
             "unknown",
         )
+        backups = tuple(path.parent.glob("blackboard.db.pre-v0-to-v3-*.bak"))
+        self.assertEqual(len(backups), 1)
+        backup = sqlite3.connect(backups[0])
+        try:
+            self.assertEqual(
+                backup.execute("PRAGMA user_version").fetchone()[0],
+                0,
+            )
+        finally:
+            backup.close()
 
     def test_open_migrates_pre_audit_database(self) -> None:
         store = self.make_store()
@@ -248,8 +260,9 @@ class BlackboardExecutionTests(StoreTestCase):
                 store.connection.execute(
                     f"ALTER TABLE intent_executions DROP COLUMN {column}"
                 )
+            store.connection.execute("PRAGMA user_version = 1")
             store.connection.execute(
-                "ALTER TABLE provider_health DROP COLUMN cli_version"
+                "DELETE FROM schema_migrations WHERE version > 1"
             )
         store.close()
 
@@ -275,6 +288,55 @@ class BlackboardExecutionTests(StoreTestCase):
                 )
             },
         )
+        backups = tuple(path.parent.glob("blackboard.db.pre-v1-to-v3-*.bak"))
+        self.assertEqual(len(backups), 1)
+
+    def test_open_migrates_v2_backend_audit_database(self) -> None:
+        store = self.make_store()
+        path = store.path
+        backend_columns = (
+            "execution_backend",
+            "isolation",
+            "backend_run_id",
+            "cleanup_policy",
+            "cleanup_status",
+            "cleanup_detail",
+            "backend_metadata_json",
+        )
+        with store.connection:
+            for table in ("planning_attempts", "intent_executions"):
+                for column in backend_columns:
+                    store.connection.execute(
+                        f"ALTER TABLE {table} DROP COLUMN {column}"
+                    )
+            store.connection.execute("PRAGMA user_version = 2")
+            store.connection.execute(
+                "DELETE FROM schema_migrations WHERE version > 2"
+            )
+        store.close()
+
+        reopened = BlackboardStore.open(path, "project-1")
+        self.addCleanup(reopened.close)
+        for table in ("planning_attempts", "intent_executions"):
+            columns = {
+                str(row[1])
+                for row in reopened.connection.execute(
+                    f"PRAGMA table_info({table})"
+                )
+            }
+            self.assertTrue(set(backend_columns).issubset(columns))
+        backups = tuple(path.parent.glob("blackboard.db.pre-v2-to-v3-*.bak"))
+        self.assertEqual(len(backups), 1)
+
+    def test_latest_version_schema_drift_is_rejected(self) -> None:
+        store = self.make_store()
+        path = store.path
+        with store.connection:
+            store.connection.execute("DROP TABLE provider_health")
+        store.close()
+
+        with self.assertRaisesRegex(RuntimeError, "schema drift"):
+            BlackboardStore.open(path, "project-1")
 
     def test_planning_attempt_records_decision_metrics_and_intent(self) -> None:
         store = self.make_store()
@@ -309,6 +371,16 @@ class BlackboardExecutionTests(StoreTestCase):
             model="unknown",
             cli_version="codex 1.2.3",
             token_usage={"input_tokens": 12},
+            execution_backend="container",
+            isolation="container",
+            backend_run_id="container-123",
+            cleanup_policy="remove",
+            cleanup_status="removed",
+            cleanup_detail="container removed",
+            backend_metadata={
+                "image": "agent:test",
+                "credential": "token=sk-planning-secret",
+            },
         )
 
         attempt = store.planning_attempt(attempt_id)
@@ -319,7 +391,54 @@ class BlackboardExecutionTests(StoreTestCase):
         self.assertEqual(attempt["duration_seconds"], 2.5)
         self.assertEqual(attempt["wait_reasons"], ["global_planning_limit"])
         self.assertEqual(attempt["token_usage"], {"input_tokens": 12})
+        self.assertEqual(attempt["execution_backend"], "container")
+        self.assertEqual(attempt["cleanup_status"], "removed")
+        self.assertEqual(attempt["backend_metadata"]["image"], "agent:test")
         self.assertNotIn("sk-planning-secret", attempt["decision_reason"])
+        self.assertNotIn("sk-planning-secret", str(attempt["backend_metadata"]))
+        cleanup_events = [
+            event
+            for event in store.events_after(0)
+            if event["type"] == "execution_backend.cleanup_finished"
+        ]
+        self.assertEqual(cleanup_events[-1]["payload"]["cleanup_status"], "removed")
+
+    def test_execution_records_backend_and_cleanup_audit(self) -> None:
+        store, intent = self.make_store_and_intent()
+        execution = store.start_execution(
+            intent.id,
+            "codex",
+            *self.execution_paths(),
+        )
+
+        store.fail_execution(
+            execution.id,
+            "timeout",
+            "provider timed out",
+            execution_backend="container",
+            isolation="container",
+            backend_run_id="container-456",
+            cleanup_policy="stop",
+            cleanup_status="stopped",
+            cleanup_detail="token=sk-cleanup-secret",
+            backend_metadata={"network": "none", "secret": "sk-cleanup-secret"},
+        )
+
+        record = store.execution(execution.id)
+        self.assertEqual(record["execution_backend"], "container")
+        self.assertEqual(record["isolation"], "container")
+        self.assertEqual(record["backend_run_id"], "container-456")
+        self.assertEqual(record["cleanup_policy"], "stop")
+        self.assertEqual(record["cleanup_status"], "stopped")
+        self.assertEqual(record["backend_metadata"]["network"], "none")
+        self.assertNotIn("sk-cleanup-secret", str(record))
+        cleanup_events = [
+            event
+            for event in store.events_after(0)
+            if event["type"] == "execution_backend.cleanup_finished"
+        ]
+        self.assertEqual(cleanup_events[-1]["payload"]["kind"], "execution")
+        self.assertEqual(cleanup_events[-1]["payload"]["cleanup_status"], "stopped")
 
     def test_restart_recovery_is_transactional_and_idempotent(self) -> None:
         store, intent = self.make_store_and_intent()

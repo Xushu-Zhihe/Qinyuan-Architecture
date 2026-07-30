@@ -8,7 +8,12 @@ from orchestrator.models import OrchestrationResult
 from orchestrator.store import BlackboardStore
 from orchestrator.supervisor import ProjectSupervisor
 from worker.executor import execute_provider
-from worker.models import CoordinatorConfig, ProviderConfig, WorkerResult
+from worker.models import (
+    AuditConfig,
+    CoordinatorConfig,
+    ProviderConfig,
+    WorkerResult,
+)
 
 
 Executor = Callable[..., Awaitable[WorkerResult]]
@@ -29,6 +34,7 @@ async def run_orchestration(
     max_iterations: int = 5,
     execute: Executor = execute_provider,
     coordinator_config: CoordinatorConfig | None = None,
+    audit_config: AuditConfig | None = None,
 ) -> OrchestrationResult:
     project_id = _new_project_id()
     run_dir = runs_root / project_id
@@ -54,6 +60,7 @@ async def run_orchestration(
         project_dir=run_dir,
         execute=execute,
         coordinator=ExecutionCoordinator(coordinator_config),
+        audit_config=audit_config,
         max_iterations=max_iterations,
     )
     try:

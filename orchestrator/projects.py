@@ -1,7 +1,7 @@
 import json
 import sqlite3
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
@@ -12,7 +12,12 @@ from orchestrator.health import HealthProbe
 from orchestrator.layout import LayoutStore
 from orchestrator.store import BlackboardStore
 from orchestrator.supervisor import ProjectSupervisor
-from worker.models import CoordinatorConfig, ProviderConfig, WorkerResult
+from worker.models import (
+    AuditConfig,
+    CoordinatorConfig,
+    ProviderConfig,
+    WorkerResult,
+)
 
 
 REGISTRY_SCHEMA = """
@@ -200,12 +205,14 @@ class ProjectService:
         execute: Callable[..., Awaitable[WorkerResult]] | None = None,
         health_probe: HealthProbe | None = None,
         coordinator_config: CoordinatorConfig | None = None,
+        audit_config: AuditConfig | None = None,
     ) -> None:
         self.registry = ProjectRegistry(data_root)
         self.provider_configs = {
             provider.name: provider for provider in provider_configs
         }
         self.coordinator = ExecutionCoordinator(coordinator_config)
+        self.audit_config = audit_config or AuditConfig()
         self.execute = execute
         self.health_probe = health_probe
         self._handles: dict[str, ProjectHandle] = {}
@@ -324,15 +331,7 @@ class ProjectService:
             )
         return tuple(result)
 
-    async def start_project(self, project_id: str) -> ProjectSupervisor:
-        existing = self._supervisors.get(project_id)
-        if existing is not None and any(
-            not task.done() for task in existing.tasks.values()
-        ):
-            return existing
-        handle = self.get_handle(project_id)
-        if handle.store.active_execution_count() != 0:
-            self._recover_project(handle)
+    def _create_supervisor(self, handle: ProjectHandle) -> ProjectSupervisor:
         configs = tuple(
             self.provider_configs[name]
             for name in handle.record.providers
@@ -345,21 +344,121 @@ class ProjectService:
             kwargs["execute"] = self.execute
         if self.health_probe is not None:
             kwargs["health_probe"] = self.health_probe
-        supervisor = ProjectSupervisor(
+        return ProjectSupervisor(
             store=handle.store,
             providers=configs,
             challenge_dir=handle.record.challenge_path,
             project_dir=handle.record.path,
             hub=handle.hub,
             coordinator=self.coordinator,
+            audit_config=self.audit_config,
             project_status_writer=lambda status, final_answer: (
                 self._set_project_status(handle, status, final_answer)
             ),
             **kwargs,
         )
+
+    async def start_project(self, project_id: str) -> ProjectSupervisor:
+        existing = self._supervisors.get(project_id)
+        if existing is not None and any(
+            not task.done() for task in existing.tasks.values()
+        ):
+            return existing
+        handle = self.get_handle(project_id)
+        if handle.store.active_execution_count() != 0:
+            self._recover_project(handle)
+        supervisor = self._create_supervisor(handle)
         self._supervisors[project_id] = supervisor
         await supervisor.start()
         return supervisor
+
+    async def retry_execution(
+        self,
+        project_id: str,
+        execution_id: str,
+    ) -> dict[str, object]:
+        handle = self.get_handle(project_id)
+        try:
+            handle.store.execution(execution_id)
+        except KeyError:
+            raise
+        supervisor = self._supervisors.get(project_id)
+        if supervisor is None:
+            supervisor = self._create_supervisor(handle)
+            self._supervisors[project_id] = supervisor
+        return await supervisor.queue_retry(execution_id)
+
+    async def reopen_project(self, project_id: str) -> dict[str, object]:
+        handle = self.get_handle(project_id)
+        supervisor = self._supervisors.get(project_id)
+        if supervisor is not None and (
+            any(not task.done() for task in supervisor.tasks.values())
+            or any(not task.done() for task in supervisor.manual_tasks.values())
+        ):
+            raise ValueError("stop the project before reopening it")
+        sequence = int(handle.store.snapshot()["sequence"])
+        goal_version = handle.store.reopen_project()
+        handle.record = self.registry.update_status(project_id, "idle")
+        for event in handle.store.events_after(sequence):
+            await handle.hub.publish(event)
+        return {
+            **project_record_dict(handle.record),
+            "goal_version": goal_version,
+            "final_answer": None,
+        }
+
+    async def runtime_snapshot(self) -> dict[str, object]:
+        coordinator = await self.coordinator.snapshot()
+        projects: list[dict[str, object]] = []
+        active_tasks: list[dict[str, object]] = []
+        for summary in self.list_projects():
+            project_id = str(summary["id"])
+            handle = self.get_handle(project_id)
+            planning = [
+                {
+                    "kind": "planning",
+                    "id": attempt["id"],
+                    "project_id": project_id,
+                    "project_name": summary["name"],
+                    "provider": attempt["provider"],
+                    "status": attempt["status"],
+                    "queued_at": attempt["queued_at"],
+                    "started_at": attempt["started_at"],
+                }
+                for attempt in handle.store.planning_attempts()
+                if attempt["status"] in {"queued", "running"}
+            ]
+            executions = [
+                {
+                    "kind": "execution",
+                    "id": execution["id"],
+                    "project_id": project_id,
+                    "project_name": summary["name"],
+                    "provider": execution["provider"],
+                    "status": execution["status"],
+                    "queued_at": execution["queued_at"],
+                    "started_at": execution["started_at"],
+                    "intent_id": execution["intent_edge_id"],
+                }
+                for execution in handle.store.executions()
+                if execution["status"] in {"planned", "running"}
+            ]
+            project_tasks = planning + executions
+            active_tasks.extend(project_tasks)
+            projects.append(
+                {
+                    **summary,
+                    "provider_health": list(handle.store.provider_health()),
+                    "active_task_count": len(project_tasks),
+                    "recovery": handle.store.recovery_summary(),
+                }
+            )
+        return {
+            "limits": asdict(self.coordinator.config),
+            "coordinator": coordinator,
+            "projects": projects,
+            "active_tasks": active_tasks,
+        }
 
     async def stop_project(self, project_id: str) -> ProjectRecord:
         handle = self.get_handle(project_id)

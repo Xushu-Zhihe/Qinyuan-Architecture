@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 from worker import executor
 from worker.executor import execute_provider
-from worker.models import ProviderConfig
+from worker.models import LogChunk, ProviderConfig
 
 
 class ExecutorTests(unittest.IsolatedAsyncioTestCase):
@@ -109,6 +109,40 @@ class ExecutorTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(result.status, "timeout")
             self.assertIsNone(result.exit_code)
+
+    async def test_redacts_and_limits_persisted_and_streamed_logs(self) -> None:
+        provider = ProviderConfig(
+            name="bounded",
+            enabled=True,
+            priority=10,
+            command=(
+                sys.executable,
+                "-c",
+                "print('token=sk-super-secret ' + 'x' * 200)",
+            ),
+            timeout_seconds=5,
+        )
+        chunks: list[LogChunk] = []
+
+        async def on_chunk(chunk: LogChunk) -> None:
+            chunks.append(chunk)
+
+        with tempfile.TemporaryDirectory() as directory:
+            result = await execute_provider(
+                provider,
+                "task",
+                None,
+                Path(directory) / "bounded",
+                on_chunk=on_chunk,
+                max_log_bytes=64,
+            )
+            persisted = Path(result.stdout_path).read_bytes()
+
+        streamed = "".join(chunk.text for chunk in chunks)
+        self.assertLessEqual(len(persisted), 64)
+        self.assertNotIn(b"sk-super-secret", persisted)
+        self.assertNotIn("sk-super-secret", streamed)
+        self.assertIn("[redacted]", result.output)
 
 
 if __name__ == "__main__":

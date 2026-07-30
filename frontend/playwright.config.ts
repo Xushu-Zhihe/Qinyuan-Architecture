@@ -4,6 +4,8 @@ import path from 'node:path'
 
 const frontendRoot = path.dirname(fileURLToPath(import.meta.url))
 const projectRoot = path.resolve(frontendRoot, '..')
+const apiPort = Number(process.env.BLACKBOARD_E2E_API_PORT ?? 8000)
+const webPort = Number(process.env.BLACKBOARD_E2E_WEB_PORT ?? 5173)
 const dataRoot = path.resolve(
   frontendRoot,
   'test-results',
@@ -18,23 +20,23 @@ export default defineConfig({
   expect: { timeout: 15_000 },
   reporter: [['list'], ['html', { open: 'never' }]],
   use: {
-    baseURL: 'http://127.0.0.1:5173',
+    baseURL: `http://127.0.0.1:${webPort}`,
     trace: 'retain-on-failure',
     screenshot: 'only-on-failure',
   },
   webServer: [
     {
-      command: 'python -m uvicorn tests.fixtures.web_test_app:create_app --factory --host 127.0.0.1 --port 8000',
+      command: `python -m uvicorn tests.fixtures.web_test_app:create_app --factory --host 127.0.0.1 --port ${apiPort}`,
       cwd: projectRoot,
       env: { ...process.env, BLACKBOARD_E2E_DATA_ROOT: dataRoot },
-      url: 'http://127.0.0.1:8000/api/projects',
+      url: `http://127.0.0.1:${apiPort}/api/projects`,
       reuseExistingServer: false,
       timeout: 30_000,
     },
     {
-      command: 'npm run dev -- --host 127.0.0.1 --port 5173',
+      command: `npm run dev -- --host 127.0.0.1 --port ${webPort}`,
       cwd: frontendRoot,
-      url: 'http://127.0.0.1:5173',
+      url: `http://127.0.0.1:${webPort}`,
       reuseExistingServer: false,
       timeout: 30_000,
     },

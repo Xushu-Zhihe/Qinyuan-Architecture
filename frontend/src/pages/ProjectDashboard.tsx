@@ -2,7 +2,8 @@ import { Plus, Search } from 'lucide-react'
 import { useMemo, useState } from 'react'
 
 import { ProjectCard } from '../components/ProjectCard'
-import type { ProjectSummary } from '../types'
+import { RuntimeOverview } from '../components/RuntimeOverview'
+import type { ProjectSummary, RuntimeSnapshot } from '../types'
 
 type Filter = 'all' | 'running' | 'manual' | 'achieved'
 
@@ -10,10 +11,12 @@ export function ProjectDashboard({
   projects,
   onOpen,
   onCreate,
+  runtime,
 }: {
   projects: ProjectSummary[]
   onOpen: (id: string) => void
   onCreate: () => void
+  runtime: RuntimeSnapshot | null
 }) {
   const [filter, setFilter] = useState<Filter>('all')
   const [query, setQuery] = useState('')
@@ -41,6 +44,7 @@ export function ProjectDashboard({
           <Plus size={18} /> 新建项目
         </button>
       </header>
+      <RuntimeOverview runtime={runtime} />
       <section className="dashboard-controls" aria-label="项目筛选">
         <div className="filter-tabs">
           {([

@@ -227,6 +227,100 @@ class BlackboardExecutionTests(StoreTestCase):
             "unknown",
         )
 
+    def test_open_migrates_pre_audit_database(self) -> None:
+        store = self.make_store()
+        path = store.path
+        with store.connection:
+            store.connection.execute("DROP TABLE planning_attempts")
+            for column in (
+                "queued_at",
+                "queue_seconds",
+                "duration_seconds",
+                "retry_count",
+                "cancel_reason",
+                "wait_reasons_json",
+                "model",
+                "cli_version",
+                "token_usage_json",
+                "logs_retained",
+                "retry_of_execution_id",
+            ):
+                store.connection.execute(
+                    f"ALTER TABLE intent_executions DROP COLUMN {column}"
+                )
+            store.connection.execute(
+                "ALTER TABLE provider_health DROP COLUMN cli_version"
+            )
+        store.close()
+
+        reopened = BlackboardStore.open(path, "project-1")
+        self.addCleanup(reopened.close)
+        execution_columns = {
+            str(row[1])
+            for row in reopened.connection.execute(
+                "PRAGMA table_info(intent_executions)"
+            )
+        }
+
+        self.assertIn("queue_seconds", execution_columns)
+        self.assertIn("token_usage_json", execution_columns)
+        self.assertIn("retry_of_execution_id", execution_columns)
+        self.assertEqual(reopened.planning_attempts(), ())
+        self.assertIn(
+            "cli_version",
+            {
+                str(row[1])
+                for row in reopened.connection.execute(
+                    "PRAGMA table_info(provider_health)"
+                )
+            },
+        )
+
+    def test_planning_attempt_records_decision_metrics_and_intent(self) -> None:
+        store = self.make_store()
+        attempt_id = store.start_planning_attempt(
+            "codex",
+            7,
+            "logs/plan/stdout.txt",
+            "logs/plan/stderr.txt",
+            "logs/plan",
+        )
+        store.mark_planning_started(
+            attempt_id,
+            1.25,
+            ("global_planning_limit",),
+        )
+        intent = store.create_or_merge_intent(
+            "codex",
+            IntentProposal(
+                store.node_id("origin"),
+                store.node_id("goal"),
+                "Inspect the challenge",
+            ),
+        )
+        store.finish_planning_attempt(
+            attempt_id,
+            "valid",
+            "token=sk-planning-secret accepted",
+            intent_id=intent.id,
+            queue_seconds=1.25,
+            duration_seconds=2.5,
+            wait_reasons=("global_planning_limit",),
+            model="unknown",
+            cli_version="codex 1.2.3",
+            token_usage={"input_tokens": 12},
+        )
+
+        attempt = store.planning_attempt(attempt_id)
+
+        self.assertEqual(attempt["status"], "valid")
+        self.assertEqual(attempt["intent_edge_id"], intent.id)
+        self.assertEqual(attempt["queue_seconds"], 1.25)
+        self.assertEqual(attempt["duration_seconds"], 2.5)
+        self.assertEqual(attempt["wait_reasons"], ["global_planning_limit"])
+        self.assertEqual(attempt["token_usage"], {"input_tokens": 12})
+        self.assertNotIn("sk-planning-secret", attempt["decision_reason"])
+
     def test_restart_recovery_is_transactional_and_idempotent(self) -> None:
         store, intent = self.make_store_and_intent()
         running = store.start_execution(
@@ -288,6 +382,60 @@ class BlackboardExecutionTests(StoreTestCase):
         recovered_sequence = int(store.snapshot()["sequence"])
         self.assertEqual(store.mark_interrupted(), 0)
         self.assertEqual(store.snapshot()["sequence"], recovered_sequence)
+        self.assertEqual(
+            store.recovery_summary()["executions"],
+            2,
+        )
+
+    def test_manual_retry_preserves_source_execution(self) -> None:
+        store, intent = self.make_store_and_intent()
+        source = store.start_execution(
+            intent.id,
+            "codex",
+            *self.execution_paths("source"),
+        )
+        store.fail_execution(source.id, "failed", "provider failed")
+
+        retried = store.start_execution(
+            intent.id,
+            "codex",
+            *self.execution_paths("retry"),
+            retry_count=1,
+            retry_of_execution_id=source.id,
+            defer_start=True,
+        )
+
+        self.assertNotEqual(retried.id, source.id)
+        self.assertEqual(store.execution(source.id)["status"], "failed")
+        retry_record = store.execution(retried.id)
+        self.assertEqual(retry_record["status"], "planned")
+        self.assertEqual(retry_record["retry_count"], 1)
+        self.assertEqual(retry_record["retry_of_execution_id"], source.id)
+        self.assertTrue(
+            any(
+                event["type"] == "intent.execution_retried"
+                and event["payload"]["execution_id"] == retried.id
+                for event in store.events_after(0)
+            )
+        )
+
+    def test_reopen_increments_goal_version_and_isolates_old_answers(self) -> None:
+        store = self.make_store()
+        store.record_answer("codex", "flag{old}")
+        store.record_answer("claude", "flag{old}")
+        store.set_project_status("achieved", "flag{old}")
+
+        goal_version = store.reopen_project()
+        snapshot = store.snapshot()
+
+        self.assertEqual(goal_version, 2)
+        self.assertEqual(snapshot["project"]["status"], "idle")
+        self.assertEqual(snapshot["project"]["goal_version"], 2)
+        self.assertIsNone(snapshot["project"]["final_answer"])
+        self.assertEqual(store.candidates(), ())
+        self.assertIsNone(store.consensus(available_providers=2))
+        with self.assertRaisesRegex(ValueError, "only an achieved"):
+            store.reopen_project()
 
     def test_execution_output_links_fact_to_intent(self) -> None:
         store, intent = self.make_store_and_intent()

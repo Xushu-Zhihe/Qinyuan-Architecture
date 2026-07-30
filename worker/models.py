@@ -11,6 +11,15 @@ class CoordinatorConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class AuditConfig:
+    max_log_bytes: int = 8 * 1024 * 1024
+    max_retained_log_sets: int = 500
+    max_retained_exports: int = 5
+    default_log_page_bytes: int = 256 * 1024
+    max_log_page_bytes: int = 1024 * 1024
+
+
+@dataclass(frozen=True, slots=True)
 class HealthCheckConfig:
     command: tuple[str, ...]
     timeout_seconds: float
@@ -48,6 +57,12 @@ class WorkerResult:
     stdout_path: str
     stderr_path: str
     work_dir: str
+    queue_seconds: float = 0.0
+    wait_reasons: tuple[str, ...] = ()
+    cancel_reason: str | None = None
+    model: str = "unknown"
+    cli_version: str = "unknown"
+    token_usage: object = "unknown"
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)

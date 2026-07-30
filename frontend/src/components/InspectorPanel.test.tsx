@@ -85,6 +85,9 @@ const snapshot: ProjectSnapshot = {
   candidates: [],
   highest_generation: 2,
   sequence: 8,
+  planning_attempts: [],
+  provider_health: [],
+  recovery: { planning_attempts: 0, executions: 0, total: 0, latest_at: null },
 }
 
 describe('InspectorPanel', () => {

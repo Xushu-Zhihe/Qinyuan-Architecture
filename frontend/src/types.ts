@@ -31,6 +31,59 @@ export interface IntentExecution {
   stderr_path: string
   work_dir: string
   error_message: string | null
+  queued_at?: string | null
+  queue_seconds?: number
+  duration_seconds?: number | null
+  retry_count?: number
+  retry_of_execution_id?: string | null
+  cancel_reason?: string | null
+  wait_reasons?: string[]
+  model?: string
+  cli_version?: string
+  token_usage?: object | string
+  logs_retained?: boolean
+}
+
+export interface PlanningAttempt {
+  id: string
+  project_id: string
+  provider: string
+  status: string
+  snapshot_sequence: number
+  queued_at: string
+  started_at: string | null
+  finished_at: string | null
+  queue_seconds: number
+  duration_seconds: number | null
+  stdout_path: string
+  stderr_path: string
+  work_dir: string
+  decision_reason: string | null
+  intent_edge_id: string | null
+  retry_count: number
+  wait_reasons: string[]
+  model: string
+  cli_version: string
+  token_usage: object | string
+  logs_retained: boolean
+}
+
+export interface ProviderHealth {
+  provider: string
+  status: string
+  consecutive_failures: number
+  last_error: string | null
+  checked_at: string
+  cooldown_until: string | null
+  updated_at: string
+  cli_version: string
+}
+
+export interface RecoverySummary {
+  planning_attempts: number
+  executions: number
+  total: number
+  latest_at: string | null
 }
 
 export interface BlackboardEdge {
@@ -61,6 +114,8 @@ export interface ProjectSummary {
   intent_count?: number
   highest_generation?: number
   final_answer?: string | null
+  goal_version?: number
+  recovery?: RecoverySummary
 }
 
 export interface LayoutSnapshot {
@@ -78,6 +133,9 @@ export interface ProjectSnapshot {
   candidates: string[]
   highest_generation: number
   sequence: number
+  planning_attempts: PlanningAttempt[]
+  provider_health: ProviderHealth[]
+  recovery: RecoverySummary
 }
 
 export interface ProjectEvent {
@@ -92,4 +150,58 @@ export interface ProjectEvent {
 export interface ExecutionLogs {
   stdout: string
   stderr: string
+}
+
+export interface RuntimeTask {
+  kind: 'planning' | 'execution'
+  id: string
+  project_id: string
+  project_name: string
+  provider: string
+  status: string
+  queued_at: string
+  started_at: string | null
+  intent_id?: string
+}
+
+export interface PendingTask {
+  project_id: string
+  provider: string
+  kind: 'planning' | 'execution'
+  priority: number
+  queue_seconds: number
+  wait_reasons: string[]
+}
+
+export interface RuntimeProject extends ProjectSummary {
+  provider_health: ProviderHealth[]
+  active_task_count: number
+  recovery: RecoverySummary
+}
+
+export interface RuntimeSnapshot {
+  limits: {
+    max_global_running: number
+    max_project_running: number
+    max_global_planning: number
+    max_project_planning: number
+    aging_seconds: number
+  }
+  coordinator: {
+    running: {
+      global: number
+      planning: number
+      execution: number
+      by_project: Record<string, number>
+      by_provider: Record<string, number>
+    }
+    pending: {
+      total: number
+      planning: number
+      execution: number
+      items: PendingTask[]
+    }
+  }
+  projects: RuntimeProject[]
+  active_tasks: RuntimeTask[]
 }

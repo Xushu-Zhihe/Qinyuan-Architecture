@@ -10,6 +10,7 @@ from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 from worker.models import LogChunk, ProviderConfig, WorkerResult
+from worker.redaction import redact_text
 
 
 ChunkCallback = Callable[[LogChunk], Awaitable[None] | None]
@@ -53,26 +54,53 @@ async def _read_stream(
     stream_name: str,
     path: Path,
     on_chunk: ChunkCallback | None,
+    max_log_bytes: int,
 ) -> str:
     decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
     parts: list[str] = []
+    pending = ""
+    written_bytes = 0
+
+    async def write_safe(text: str, handle) -> None:
+        nonlocal written_bytes
+        if not text or written_bytes >= max_log_bytes:
+            return
+        safe = redact_text(text)
+        encoded = safe.encode("utf-8")
+        remaining = max_log_bytes - written_bytes
+        if len(encoded) > remaining:
+            safe = encoded[:remaining].decode("utf-8", errors="ignore")
+            encoded = safe.encode("utf-8")
+        if not safe:
+            return
+        written_bytes += len(encoded)
+        handle.write(safe)
+        handle.flush()
+        parts.append(safe)
+        await _emit(on_chunk, LogChunk(stream_name, safe))
+
     with path.open("w", encoding="utf-8", newline="") as handle:
         while True:
             raw = await stream.read(4096)
             if not raw:
                 break
             text = decoder.decode(raw)
-            if text:
-                handle.write(text)
-                handle.flush()
-                parts.append(text)
-                await _emit(on_chunk, LogChunk(stream_name, text))
-        tail = decoder.decode(b"", final=True)
-        if tail:
-            handle.write(tail)
-            handle.flush()
-            parts.append(tail)
-            await _emit(on_chunk, LogChunk(stream_name, tail))
+            pending += text
+            if written_bytes >= max_log_bytes:
+                pending = ""
+                continue
+            lines = pending.splitlines(keepends=True)
+            if lines and not lines[-1].endswith(("\n", "\r")):
+                pending = lines.pop()
+            else:
+                pending = ""
+            for line in lines:
+                await write_safe(line, handle)
+            if len(pending.encode("utf-8")) >= max_log_bytes:
+                await write_safe(pending, handle)
+                pending = ""
+        pending += decoder.decode(b"", final=True)
+        await write_safe(pending, handle)
     return "".join(parts)
 
 
@@ -137,11 +165,22 @@ async def _append_stderr(
     path: Path,
     text: str,
     on_chunk: ChunkCallback | None,
+    max_log_bytes: int,
 ) -> None:
+    safe = redact_text(text)
+    try:
+        written_bytes = path.stat().st_size
+    except OSError:
+        written_bytes = 0
+    remaining = max(0, max_log_bytes - written_bytes)
+    encoded = safe.encode("utf-8")[:remaining]
+    safe = encoded.decode("utf-8", errors="ignore")
+    if not safe:
+        return
     with path.open("a", encoding="utf-8", newline="") as handle:
-        handle.write(text)
+        handle.write(safe)
         handle.flush()
-    await _emit(on_chunk, LogChunk("stderr", text))
+    await _emit(on_chunk, LogChunk("stderr", safe))
 
 
 async def execute_provider(
@@ -151,6 +190,7 @@ async def execute_provider(
     work_dir: Path,
     on_chunk: ChunkCallback | None = None,
     cancel_event: asyncio.Event | None = None,
+    max_log_bytes: int = 8 * 1024 * 1024,
 ) -> WorkerResult:
     work_dir.mkdir(parents=True, exist_ok=True)
     stdout_path = work_dir / "stdout.txt"
@@ -185,10 +225,22 @@ async def execute_provider(
         assert process.stderr is not None
         stdin_task = asyncio.create_task(_write_stdin(process.stdin, request))
         stdout_task = asyncio.create_task(
-            _read_stream(process.stdout, "stdout", stdout_path, on_chunk)
+            _read_stream(
+                process.stdout,
+                "stdout",
+                stdout_path,
+                on_chunk,
+                max_log_bytes,
+            )
         )
         stderr_task = asyncio.create_task(
-            _read_stream(process.stderr, "stderr", stderr_path, on_chunk)
+            _read_stream(
+                process.stderr,
+                "stderr",
+                stderr_path,
+                on_chunk,
+                max_log_bytes,
+            )
         )
         wait_task = asyncio.create_task(process.wait())
         cancel_task = (
@@ -229,10 +281,20 @@ async def execute_provider(
             await asyncio.gather(cancel_task, return_exceptions=True)
         stdout_text, _ = await asyncio.gather(stdout_task, stderr_task)
         if diagnostic is not None:
-            await _append_stderr(stderr_path, diagnostic, on_chunk)
+            await _append_stderr(
+                stderr_path,
+                diagnostic,
+                on_chunk,
+                max_log_bytes,
+            )
     except OSError as exc:
         message = f"cannot start provider command {command[0]!r}: {exc}\n"
-        await _append_stderr(stderr_path, message, on_chunk)
+        await _append_stderr(
+            stderr_path,
+            message,
+            on_chunk,
+            max_log_bytes,
+        )
 
     return WorkerResult(
         provider=provider.name,
@@ -244,4 +306,7 @@ async def execute_provider(
         stdout_path=str(stdout_path.resolve()),
         stderr_path=str(stderr_path.resolve()),
         work_dir=str(work_dir.resolve()),
+        cancel_reason=(
+            "project stop requested" if status == "cancelled" else None
+        ),
     )

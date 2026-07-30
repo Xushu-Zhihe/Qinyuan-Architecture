@@ -30,6 +30,35 @@ CREATE TABLE IF NOT EXISTS provider_health (
 );
 """
 
+AUDIT_SCHEMA = """
+CREATE TABLE IF NOT EXISTS planning_attempts (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    provider TEXT NOT NULL,
+    status TEXT NOT NULL,
+    snapshot_sequence INTEGER NOT NULL CHECK(snapshot_sequence >= 0),
+    queued_at TEXT NOT NULL,
+    started_at TEXT,
+    finished_at TEXT,
+    queue_seconds REAL NOT NULL DEFAULT 0 CHECK(queue_seconds >= 0),
+    duration_seconds REAL,
+    stdout_path TEXT NOT NULL,
+    stderr_path TEXT NOT NULL,
+    work_dir TEXT NOT NULL,
+    decision_reason TEXT,
+    intent_edge_id TEXT REFERENCES intents(edge_id) ON DELETE SET NULL,
+    retry_count INTEGER NOT NULL DEFAULT 0 CHECK(retry_count >= 0),
+    wait_reasons_json TEXT NOT NULL DEFAULT '[]',
+    model TEXT NOT NULL DEFAULT 'unknown',
+    cli_version TEXT NOT NULL DEFAULT 'unknown',
+    token_usage_json TEXT NOT NULL DEFAULT '"unknown"',
+    logs_retained INTEGER NOT NULL DEFAULT 1 CHECK(logs_retained IN (0, 1))
+);
+
+CREATE INDEX IF NOT EXISTS planning_attempts_by_project
+ON planning_attempts(project_id, queued_at, id);
+"""
+
 
 SCHEMA = """
 PRAGMA foreign_keys = ON;
@@ -121,7 +150,8 @@ CREATE TABLE intent_executions (
     stdout_path TEXT NOT NULL,
     stderr_path TEXT NOT NULL,
     work_dir TEXT NOT NULL,
-    error_message TEXT
+    error_message TEXT,
+    retry_of_execution_id TEXT REFERENCES intent_executions(id)
 );
 
 CREATE INDEX executions_by_intent
@@ -149,7 +179,7 @@ CREATE TABLE events (
     payload_json TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
-""" + PROVIDER_HEALTH_SCHEMA
+""" + PROVIDER_HEALTH_SCHEMA + AUDIT_SCHEMA
 
 
 @dataclass(frozen=True, slots=True)
@@ -175,6 +205,61 @@ def _id(prefix: str) -> str:
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _timestamp_after(value: str, seconds: float) -> str:
+    try:
+        moment = datetime.fromisoformat(value)
+    except ValueError:
+        moment = datetime.now(timezone.utc)
+    return datetime.fromtimestamp(
+        moment.timestamp() + max(0.0, seconds),
+        timezone.utc,
+    ).isoformat()
+
+
+def _ensure_runtime_schema(connection: sqlite3.Connection) -> None:
+    connection.executescript(PROVIDER_HEALTH_SCHEMA + AUDIT_SCHEMA)
+    execution_columns = {
+        str(row[1])
+        for row in connection.execute("PRAGMA table_info(intent_executions)")
+    }
+    additions = {
+        "queued_at": "TEXT",
+        "queue_seconds": "REAL NOT NULL DEFAULT 0",
+        "duration_seconds": "REAL",
+        "retry_count": "INTEGER NOT NULL DEFAULT 0",
+        "cancel_reason": "TEXT",
+        "wait_reasons_json": "TEXT NOT NULL DEFAULT '[]'",
+        "model": "TEXT NOT NULL DEFAULT 'unknown'",
+        "cli_version": "TEXT NOT NULL DEFAULT 'unknown'",
+        "token_usage_json": "TEXT NOT NULL DEFAULT '\"unknown\"'",
+        "logs_retained": "INTEGER NOT NULL DEFAULT 1",
+        "retry_of_execution_id": "TEXT REFERENCES intent_executions(id)",
+    }
+    for name, definition in additions.items():
+        if name not in execution_columns:
+            connection.execute(
+                f"ALTER TABLE intent_executions ADD COLUMN {name} {definition}"
+            )
+
+    health_columns = {
+        str(row[1])
+        for row in connection.execute("PRAGMA table_info(provider_health)")
+    }
+    if "cli_version" not in health_columns:
+        connection.execute(
+            "ALTER TABLE provider_health "
+            "ADD COLUMN cli_version TEXT NOT NULL DEFAULT 'unknown'"
+        )
+    connection.execute(
+        """
+        UPDATE intent_executions
+        SET queued_at = COALESCE(queued_at, started_at)
+        WHERE queued_at IS NULL
+        """
+    )
+    connection.commit()
 
 
 def _normalize(content: str) -> str:
@@ -214,7 +299,7 @@ class BlackboardStore:
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute("PRAGMA busy_timeout = 5000")
-        connection.executescript(PROVIDER_HEALTH_SCHEMA)
+        _ensure_runtime_schema(connection)
         exists = connection.execute(
             "SELECT 1 FROM projects WHERE id = ?",
             (project_id,),
@@ -239,6 +324,7 @@ class BlackboardStore:
         connection = sqlite3.connect(path, check_same_thread=False)
         connection.row_factory = sqlite3.Row
         connection.executescript(SCHEMA)
+        _ensure_runtime_schema(connection)
         store = cls(path, connection, project_id)
         now = _now()
         with connection:
@@ -729,6 +815,184 @@ class BlackboardStore:
                 {"edge_id": edge_id, "state": "deleted"},
             )
 
+    @staticmethod
+    def _decode_audit_row(row: sqlite3.Row) -> dict[str, object]:
+        record = dict(row)
+        for field in ("wait_reasons_json", "token_usage_json"):
+            if field not in record:
+                continue
+            value = record.pop(field)
+            try:
+                record[field.removesuffix("_json")] = json.loads(str(value))
+            except (json.JSONDecodeError, TypeError):
+                record[field.removesuffix("_json")] = "unknown"
+        if "logs_retained" in record:
+            record["logs_retained"] = bool(record["logs_retained"])
+        return record
+
+    def start_planning_attempt(
+        self,
+        provider: str,
+        snapshot_sequence: int,
+        stdout_path: str,
+        stderr_path: str,
+        work_dir: str,
+    ) -> str:
+        attempt_id = _id("planning")
+        queued_at = _now()
+        with self.connection:
+            self.connection.execute(
+                """
+                INSERT INTO planning_attempts(
+                    id, project_id, provider, status, snapshot_sequence,
+                    queued_at, stdout_path, stderr_path, work_dir
+                ) VALUES (?, ?, ?, 'queued', ?, ?, ?, ?, ?)
+                """,
+                (
+                    attempt_id,
+                    self.project_id,
+                    provider,
+                    snapshot_sequence,
+                    queued_at,
+                    stdout_path,
+                    stderr_path,
+                    work_dir,
+                ),
+            )
+            self._event(
+                "planning.queued",
+                provider,
+                {
+                    "planning_attempt_id": attempt_id,
+                    "snapshot_sequence": snapshot_sequence,
+                },
+            )
+        return attempt_id
+
+    def mark_planning_started(
+        self,
+        attempt_id: str,
+        queue_seconds: float,
+        wait_reasons: tuple[str, ...],
+    ) -> None:
+        attempt = self.planning_attempt(attempt_id)
+        started_at = _timestamp_after(str(attempt["queued_at"]), queue_seconds)
+        with self.connection:
+            self.connection.execute(
+                """
+                UPDATE planning_attempts
+                SET status = 'running', started_at = ?, queue_seconds = ?,
+                    wait_reasons_json = ?
+                WHERE id = ?
+                """,
+                (
+                    started_at,
+                    max(0.0, queue_seconds),
+                    json.dumps(wait_reasons),
+                    attempt_id,
+                ),
+            )
+            self._event(
+                "scheduler.permit_acquired",
+                str(attempt["provider"]),
+                {
+                    "kind": "planning",
+                    "planning_attempt_id": attempt_id,
+                    "queue_seconds": round(max(0.0, queue_seconds), 6),
+                    "wait_reasons": list(wait_reasons),
+                },
+            )
+
+    def finish_planning_attempt(
+        self,
+        attempt_id: str,
+        status: str,
+        decision_reason: str,
+        *,
+        intent_id: str | None = None,
+        queue_seconds: float = 0.0,
+        duration_seconds: float | None = None,
+        wait_reasons: tuple[str, ...] = (),
+        model: str = "unknown",
+        cli_version: str = "unknown",
+        token_usage: object = "unknown",
+    ) -> None:
+        attempt = self.planning_attempt(attempt_id)
+        safe_reason = redact_error(decision_reason, limit=1000)
+        started_at = attempt.get("started_at") or _timestamp_after(
+            str(attempt["queued_at"]),
+            queue_seconds,
+        )
+        with self.connection:
+            self.connection.execute(
+                """
+                UPDATE planning_attempts
+                SET status = ?, started_at = ?, finished_at = ?,
+                    queue_seconds = ?, duration_seconds = ?,
+                    decision_reason = ?, intent_edge_id = ?,
+                    wait_reasons_json = ?, model = ?, cli_version = ?,
+                    token_usage_json = ?
+                WHERE id = ?
+                """,
+                (
+                    status,
+                    started_at,
+                    _now(),
+                    max(0.0, queue_seconds),
+                    duration_seconds,
+                    safe_reason,
+                    intent_id,
+                    json.dumps(wait_reasons),
+                    model or "unknown",
+                    cli_version or "unknown",
+                    json.dumps(token_usage, ensure_ascii=False),
+                    attempt_id,
+                ),
+            )
+            if status == "cancelled" and wait_reasons:
+                self._event(
+                    "scheduler.wait_cancelled",
+                    str(attempt["provider"]),
+                    {
+                        "kind": "planning",
+                        "planning_attempt_id": attempt_id,
+                        "queue_seconds": round(max(0.0, queue_seconds), 6),
+                        "wait_reasons": list(wait_reasons),
+                        "reason": safe_reason,
+                    },
+                )
+            self._event(
+                "planning.finished",
+                str(attempt["provider"]),
+                {
+                    "planning_attempt_id": attempt_id,
+                    "status": status,
+                    "decision_reason": safe_reason,
+                    "intent_id": intent_id,
+                },
+            )
+
+    def planning_attempt(self, attempt_id: str) -> dict[str, object]:
+        row = self.connection.execute(
+            "SELECT * FROM planning_attempts WHERE id = ? AND project_id = ?",
+            (attempt_id, self.project_id),
+        ).fetchone()
+        if row is None:
+            raise KeyError(attempt_id)
+        return self._decode_audit_row(row)
+
+    def planning_attempts(self) -> tuple[dict[str, object], ...]:
+        return tuple(
+            self._decode_audit_row(row)
+            for row in self.connection.execute(
+                """
+                SELECT * FROM planning_attempts
+                WHERE project_id = ? ORDER BY queued_at, id
+                """,
+                (self.project_id,),
+            ).fetchall()
+        )
+
     def start_execution(
         self,
         intent_id: str,
@@ -736,8 +1000,15 @@ class BlackboardStore:
         stdout_path: str,
         stderr_path: str,
         work_dir: str,
+        *,
+        retry_count: int = 0,
+        retry_of_execution_id: str | None = None,
+        defer_start: bool = False,
     ) -> ExecutionRecord:
         execution_id = _id("execution")
+        queued_at = _now()
+        initial_status = "planned" if defer_start else "running"
+        started_at = None if defer_start else queued_at
         with self.connection:
             exists = self.connection.execute(
                 "SELECT 1 FROM intents WHERE edge_id = ?",
@@ -745,37 +1016,120 @@ class BlackboardStore:
             ).fetchone()
             if exists is None:
                 raise KeyError(intent_id)
+            if retry_of_execution_id is not None:
+                retry_source = self.connection.execute(
+                    """
+                    SELECT intent_edge_id FROM intent_executions
+                    WHERE id = ?
+                    """,
+                    (retry_of_execution_id,),
+                ).fetchone()
+                if retry_source is None:
+                    raise KeyError(retry_of_execution_id)
+                if retry_source["intent_edge_id"] != intent_id:
+                    raise ValueError("retry source belongs to another intent")
             self.connection.execute(
                 """
                 INSERT INTO intent_executions(
                     id, intent_edge_id, provider, status, started_at,
-                    stdout_path, stderr_path, work_dir
-                ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?)
+                    stdout_path, stderr_path, work_dir, queued_at, retry_count,
+                    retry_of_execution_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     execution_id,
                     intent_id,
                     provider,
-                    _now(),
+                    initial_status,
+                    started_at,
                     stdout_path,
                     stderr_path,
                     work_dir,
+                    queued_at,
+                    retry_count,
+                    retry_of_execution_id,
                 ),
             )
             self._event(
-                "intent.execution_started",
+                "scheduler.wait_started",
                 provider,
                 {
+                    "kind": "execution",
                     "intent_id": intent_id,
                     "execution_id": execution_id,
+                    "retry_count": retry_count,
+                    "retry_of_execution_id": retry_of_execution_id,
                 },
             )
+            if retry_of_execution_id is not None:
+                self._event(
+                    "intent.execution_retried",
+                    provider,
+                    {
+                        "intent_id": intent_id,
+                        "execution_id": execution_id,
+                        "retry_of_execution_id": retry_of_execution_id,
+                        "retry_count": retry_count,
+                    },
+                )
+            if not defer_start:
+                self._event(
+                    "intent.execution_started",
+                    provider,
+                    {
+                        "intent_id": intent_id,
+                        "execution_id": execution_id,
+                    },
+                )
         return ExecutionRecord(
             execution_id,
             intent_id,
             provider,
-            "running",
+            initial_status,
         )
+
+    def mark_execution_started(
+        self,
+        execution_id: str,
+        queue_seconds: float,
+        wait_reasons: tuple[str, ...],
+    ) -> None:
+        execution = self.execution(execution_id)
+        queued_at = str(execution.get("queued_at") or execution["started_at"])
+        with self.connection:
+            self.connection.execute(
+                """
+                UPDATE intent_executions
+                SET status = 'running', started_at = ?, queue_seconds = ?,
+                    wait_reasons_json = ?
+                WHERE id = ?
+                """,
+                (
+                    _timestamp_after(queued_at, queue_seconds),
+                    max(0.0, queue_seconds),
+                    json.dumps(wait_reasons),
+                    execution_id,
+                ),
+            )
+            self._event(
+                "scheduler.permit_acquired",
+                str(execution["provider"]),
+                {
+                    "kind": "execution",
+                    "intent_id": execution["intent_edge_id"],
+                    "execution_id": execution_id,
+                    "queue_seconds": round(max(0.0, queue_seconds), 6),
+                    "wait_reasons": list(wait_reasons),
+                },
+            )
+            self._event(
+                "intent.execution_started",
+                str(execution["provider"]),
+                {
+                    "intent_id": execution["intent_edge_id"],
+                    "execution_id": execution_id,
+                },
+            )
 
     def execution(self, execution_id: str) -> dict[str, object]:
         row = self.connection.execute(
@@ -784,7 +1138,55 @@ class BlackboardStore:
         ).fetchone()
         if row is None:
             raise KeyError(execution_id)
-        return dict(row)
+        return self._decode_audit_row(row)
+
+    def intent(self, intent_id: str) -> IntentRecord:
+        row = self.connection.execute(
+            """
+            SELECT e.id, e.from_node, e.to_node, e.generation, i.content
+            FROM edges AS e
+            JOIN intents AS i ON i.edge_id = e.id
+            WHERE e.id = ? AND e.project_id = ?
+            """,
+            (intent_id, self.project_id),
+        ).fetchone()
+        if row is None:
+            raise KeyError(intent_id)
+        return IntentRecord(
+            id=str(row["id"]),
+            source_node_id=str(row["from_node"]),
+            target_node_id=str(row["to_node"]),
+            content=str(row["content"]),
+            generation=int(row["generation"]),
+        )
+
+    def executions(self) -> tuple[dict[str, object], ...]:
+        return tuple(
+            self._decode_audit_row(row)
+            for row in self.connection.execute(
+                """
+                SELECT execution.*
+                FROM intent_executions AS execution
+                JOIN intents ON intents.edge_id = execution.intent_edge_id
+                JOIN edges ON edges.id = intents.edge_id
+                WHERE edges.project_id = ?
+                ORDER BY COALESCE(execution.queued_at, execution.started_at),
+                    execution.id
+                """,
+                (self.project_id,),
+            ).fetchall()
+        )
+
+    def execution_count(self, intent_id: str) -> int:
+        row = self.connection.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM intent_executions
+            WHERE intent_edge_id = ?
+            """,
+            (intent_id,),
+        ).fetchone()
+        return int(row["count"])
 
     def finish_execution(
         self,
@@ -792,6 +1194,13 @@ class BlackboardStore:
         update,
         exit_code: int | None,
         status: str,
+        *,
+        queue_seconds: float = 0.0,
+        duration_seconds: float | None = None,
+        wait_reasons: tuple[str, ...] = (),
+        model: str = "unknown",
+        cli_version: str = "unknown",
+        token_usage: object = "unknown",
     ) -> tuple[str, ...]:
         with self.connection:
             execution = self.connection.execute(
@@ -864,10 +1273,24 @@ class BlackboardStore:
             self.connection.execute(
                 """
                 UPDATE intent_executions
-                SET status = ?, finished_at = ?, exit_code = ?
+                SET status = ?, finished_at = ?, exit_code = ?,
+                    queue_seconds = ?, duration_seconds = ?,
+                    wait_reasons_json = ?, model = ?, cli_version = ?,
+                    token_usage_json = ?
                 WHERE id = ?
                 """,
-                (status, _now(), exit_code, execution_id),
+                (
+                    status,
+                    _now(),
+                    exit_code,
+                    max(0.0, queue_seconds),
+                    duration_seconds,
+                    json.dumps(wait_reasons),
+                    model or "unknown",
+                    cli_version or "unknown",
+                    json.dumps(token_usage, ensure_ascii=False),
+                    execution_id,
+                ),
             )
             self._event(
                 "intent.execution_finished",
@@ -886,18 +1309,60 @@ class BlackboardStore:
         status: str,
         error_message: str,
         exit_code: int | None = None,
+        *,
+        queue_seconds: float = 0.0,
+        duration_seconds: float | None = None,
+        cancel_reason: str | None = None,
+        wait_reasons: tuple[str, ...] = (),
+        model: str = "unknown",
+        cli_version: str = "unknown",
+        token_usage: object = "unknown",
     ) -> None:
+        safe_error = redact_error(error_message, limit=1000)
+        safe_cancel = (
+            redact_error(cancel_reason, limit=1000)
+            if cancel_reason
+            else None
+        )
         with self.connection:
             execution = self.execution(execution_id)
             self.connection.execute(
                 """
                 UPDATE intent_executions
                 SET status = ?, finished_at = ?, exit_code = ?,
-                    error_message = ?
+                    error_message = ?, queue_seconds = ?, duration_seconds = ?,
+                    cancel_reason = ?, wait_reasons_json = ?, model = ?,
+                    cli_version = ?, token_usage_json = ?
                 WHERE id = ?
                 """,
-                (status, _now(), exit_code, error_message, execution_id),
+                (
+                    status,
+                    _now(),
+                    exit_code,
+                    safe_error,
+                    max(0.0, queue_seconds),
+                    duration_seconds,
+                    safe_cancel,
+                    json.dumps(wait_reasons),
+                    model or "unknown",
+                    cli_version or "unknown",
+                    json.dumps(token_usage, ensure_ascii=False),
+                    execution_id,
+                ),
             )
+            if status == "cancelled" and wait_reasons:
+                self._event(
+                    "scheduler.wait_cancelled",
+                    str(execution["provider"]),
+                    {
+                        "kind": "execution",
+                        "intent_id": execution["intent_edge_id"],
+                        "execution_id": execution_id,
+                        "queue_seconds": round(max(0.0, queue_seconds), 6),
+                        "wait_reasons": list(wait_reasons),
+                        "reason": safe_cancel or safe_error,
+                    },
+                )
             self._event(
                 "intent.execution_finished",
                 str(execution["provider"]),
@@ -905,6 +1370,7 @@ class BlackboardStore:
                     "intent_id": execution["intent_edge_id"],
                     "execution_id": execution_id,
                     "status": status,
+                    "error_message": safe_error,
                 },
             )
 
@@ -1062,6 +1528,7 @@ class BlackboardStore:
         last_error: str | None = None,
         cooldown_until: str | None = None,
         checked_at: str | None = None,
+        cli_version: str = "unknown",
     ) -> dict[str, object]:
         if status not in HEALTH_STATUSES:
             raise ValueError(f"invalid provider health status: {status}")
@@ -1077,21 +1544,23 @@ class BlackboardStore:
             "last_error": safe_error,
             "checked_at": checked,
             "cooldown_until": cooldown_until,
+            "cli_version": redact_error(cli_version, limit=200) or "unknown",
         }
         with self.connection:
             self.connection.execute(
                 """
                 INSERT INTO provider_health(
                     provider, status, consecutive_failures, last_error,
-                    checked_at, cooldown_until, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    checked_at, cooldown_until, updated_at, cli_version
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(provider) DO UPDATE SET
                     status = excluded.status,
                     consecutive_failures = excluded.consecutive_failures,
                     last_error = excluded.last_error,
                     checked_at = excluded.checked_at,
                     cooldown_until = excluded.cooldown_until,
-                    updated_at = excluded.updated_at
+                    updated_at = excluded.updated_at,
+                    cli_version = excluded.cli_version
                 """,
                 (
                     provider,
@@ -1101,6 +1570,7 @@ class BlackboardStore:
                     checked,
                     cooldown_until,
                     updated,
+                    payload["cli_version"],
                 ),
             )
             self._event("provider.health_changed", provider, payload)
@@ -1137,6 +1607,35 @@ class BlackboardStore:
         now = _now()
         recovered = 0
         with self.connection:
+            planning_attempts = self.connection.execute(
+                """
+                SELECT id, provider FROM planning_attempts
+                WHERE project_id = ? AND status IN ('queued', 'running')
+                ORDER BY queued_at, id
+                """,
+                (self.project_id,),
+            ).fetchall()
+            for attempt in planning_attempts:
+                cursor = self.connection.execute(
+                    """
+                    UPDATE planning_attempts
+                    SET status = 'interrupted', finished_at = ?,
+                        decision_reason = 'server restarted'
+                    WHERE id = ? AND status IN ('queued', 'running')
+                    """,
+                    (now, attempt["id"]),
+                )
+                if cursor.rowcount == 1:
+                    self._event(
+                        "planning.finished",
+                        str(attempt["provider"]),
+                        {
+                            "planning_attempt_id": attempt["id"],
+                            "status": "interrupted",
+                            "decision_reason": "server restarted",
+                            "intent_id": None,
+                        },
+                    )
             executions = self.connection.execute(
                 """
                 SELECT id, intent_edge_id, provider
@@ -1150,7 +1649,8 @@ class BlackboardStore:
                     """
                     UPDATE intent_executions
                     SET status = 'interrupted', finished_at = ?,
-                        error_message = 'server restarted'
+                        error_message = 'server restarted',
+                        cancel_reason = 'server restarted'
                     WHERE id = ? AND status IN ('planned', 'running')
                     """,
                     (now, execution["id"]),
@@ -1198,6 +1698,86 @@ class BlackboardStore:
                 )
         return recovered
 
+    def recovery_summary(self) -> dict[str, object]:
+        planning = self.connection.execute(
+            """
+            SELECT COUNT(*) AS count, MAX(finished_at) AS latest
+            FROM planning_attempts
+            WHERE project_id = ? AND status = 'interrupted'
+                AND decision_reason = 'server restarted'
+            """,
+            (self.project_id,),
+        ).fetchone()
+        executions = self.connection.execute(
+            """
+            SELECT COUNT(*) AS count, MAX(finished_at) AS latest
+            FROM intent_executions AS execution
+            JOIN intents ON intents.edge_id = execution.intent_edge_id
+            JOIN edges ON edges.id = intents.edge_id
+            WHERE edges.project_id = ? AND execution.status = 'interrupted'
+                AND execution.cancel_reason = 'server restarted'
+            """,
+            (self.project_id,),
+        ).fetchone()
+        latest_values = [
+            str(value)
+            for value in (planning["latest"], executions["latest"])
+            if value is not None
+        ]
+        planning_count = int(planning["count"])
+        execution_count = int(executions["count"])
+        return {
+            "planning_attempts": planning_count,
+            "executions": execution_count,
+            "total": planning_count + execution_count,
+            "latest_at": max(latest_values) if latest_values else None,
+        }
+
+    def audit_log_records(self) -> tuple[dict[str, object], ...]:
+        records: list[dict[str, object]] = []
+        for attempt in self.planning_attempts():
+            records.append(
+                {
+                    "kind": "planning",
+                    "id": attempt["id"],
+                    "status": attempt["status"],
+                    "queued_at": attempt["queued_at"],
+                    "stdout_path": attempt["stdout_path"],
+                    "stderr_path": attempt["stderr_path"],
+                    "logs_retained": attempt["logs_retained"],
+                }
+            )
+        for execution in self.executions():
+            records.append(
+                {
+                    "kind": "execution",
+                    "id": execution["id"],
+                    "status": execution["status"],
+                    "queued_at": execution.get("queued_at") or execution["started_at"],
+                    "stdout_path": execution["stdout_path"],
+                    "stderr_path": execution["stderr_path"],
+                    "logs_retained": execution["logs_retained"],
+                }
+            )
+        return tuple(
+            sorted(
+                records,
+                key=lambda record: (str(record["queued_at"]), str(record["id"])),
+            )
+        )
+
+    def mark_logs_pruned(self, kind: str, record_id: str) -> None:
+        table = (
+            "planning_attempts" if kind == "planning" else "intent_executions"
+        )
+        if kind not in {"planning", "execution"}:
+            raise ValueError(f"unsupported audit log kind: {kind}")
+        with self.connection:
+            self.connection.execute(
+                f"UPDATE {table} SET logs_retained = 0 WHERE id = ?",
+                (record_id,),
+            )
+
     def set_project_status(
         self,
         status: str,
@@ -1217,6 +1797,50 @@ class BlackboardStore:
                 "orchestrator",
                 {"status": status, "final_answer": final_answer},
             )
+
+    def reopen_project(self) -> int:
+        with self.connection:
+            project = self.connection.execute(
+                """
+                SELECT status, goal_version FROM projects WHERE id = ?
+                """,
+                (self.project_id,),
+            ).fetchone()
+            if project is None:
+                raise KeyError(self.project_id)
+            if project["status"] != "achieved":
+                raise ValueError("only an achieved project can be reopened")
+            if self.active_execution_count() != 0:
+                raise ValueError("project still has active executions")
+            previous_version = int(project["goal_version"])
+            next_version = previous_version + 1
+            self.connection.execute(
+                """
+                UPDATE projects
+                SET status = 'idle', goal_version = ?, final_answer = NULL,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (next_version, _now(), self.project_id),
+            )
+            self._event(
+                "project.reopened",
+                "human",
+                {
+                    "previous_goal_version": previous_version,
+                    "goal_version": next_version,
+                },
+            )
+            self._event(
+                "project.status_changed",
+                "orchestrator",
+                {
+                    "status": "idle",
+                    "final_answer": None,
+                    "goal_version": next_version,
+                },
+            )
+        return next_version
 
     def archive_node(self, node_id: str, source: str = "human") -> None:
         with self.connection:
@@ -1324,7 +1948,7 @@ class BlackboardStore:
             if edge["type"] == "intent":
                 edge["status"] = self.intent_status(str(edge["id"]))
                 edge["executions"] = [
-                    dict(item)
+                    self._decode_audit_row(item)
                     for item in self.connection.execute(
                         """
                         SELECT * FROM intent_executions
@@ -1348,6 +1972,7 @@ class BlackboardStore:
             "project": dict(project_row),
             "nodes": nodes,
             "edges": edges,
+            "planning_attempts": list(self.planning_attempts()),
             "provider_health": list(self.provider_health()),
             "candidates": list(self.candidates()),
             "highest_generation": highest_generation,

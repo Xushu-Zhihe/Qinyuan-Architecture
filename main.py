@@ -7,6 +7,7 @@ from typing import Callable, Sequence
 from orchestrator.scheduler import run_orchestration
 from worker.config import (
     ConfigError,
+    load_audit_config,
     load_coordinator_config,
     load_provider_configs,
 )
@@ -75,6 +76,7 @@ def run_cli(
     try:
         providers = load_provider_configs(args.config.resolve())
         coordinator_config = load_coordinator_config(args.config.resolve())
+        audit_config = load_audit_config(args.config.resolve())
         result = asyncio.run(
             run_orchestration(
                 providers=providers,
@@ -87,6 +89,7 @@ def run_cli(
                 runs_root=DEFAULT_RUNS_ROOT,
                 max_iterations=args.max_iterations,
                 coordinator_config=coordinator_config,
+                audit_config=audit_config,
             )
         )
     except ConfigError as exc:

@@ -3,7 +3,12 @@ import re
 from pathlib import Path
 from string import Formatter
 
-from worker.models import CoordinatorConfig, HealthCheckConfig, ProviderConfig
+from worker.models import (
+    AuditConfig,
+    CoordinatorConfig,
+    HealthCheckConfig,
+    ProviderConfig,
+)
 
 
 ALLOWED_PLACEHOLDERS = {"challenge_dir", "work_dir"}
@@ -241,6 +246,45 @@ def load_coordinator_config(path: Path) -> CoordinatorConfig:
             "coordinator.max_project_planning cannot exceed max_project_running"
         )
     return config
+
+
+def load_audit_config(path: Path) -> AuditConfig:
+    payload = _load_payload(path)
+    raw = payload.get("audit", {})
+    if not isinstance(raw, dict):
+        raise ConfigError("audit must be an object")
+    defaults = AuditConfig()
+    max_log_page_bytes = _positive_integer(
+        raw.get("max_log_page_bytes", defaults.max_log_page_bytes),
+        "audit.max_log_page_bytes",
+    )
+    default_log_page_bytes = _positive_integer(
+        raw.get("default_log_page_bytes", defaults.default_log_page_bytes),
+        "audit.default_log_page_bytes",
+    )
+    if default_log_page_bytes > max_log_page_bytes:
+        raise ConfigError(
+            "audit.default_log_page_bytes cannot exceed max_log_page_bytes"
+        )
+    return AuditConfig(
+        max_log_bytes=_positive_integer(
+            raw.get("max_log_bytes", defaults.max_log_bytes),
+            "audit.max_log_bytes",
+        ),
+        max_retained_log_sets=_positive_integer(
+            raw.get(
+                "max_retained_log_sets",
+                defaults.max_retained_log_sets,
+            ),
+            "audit.max_retained_log_sets",
+        ),
+        max_retained_exports=_positive_integer(
+            raw.get("max_retained_exports", defaults.max_retained_exports),
+            "audit.max_retained_exports",
+        ),
+        default_log_page_bytes=default_log_page_bytes,
+        max_log_page_bytes=max_log_page_bytes,
+    )
 
 
 def load_provider_configs(path: Path) -> tuple[ProviderConfig, ...]:

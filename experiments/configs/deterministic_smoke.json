@@ -1,0 +1,62 @@
+{
+  "name": "deterministic-smoke-v1",
+  "mode": "fake",
+  "seed": 20260730,
+  "repetitions": 3,
+  "providers": ["agent-a", "agent-b", "agent-c"],
+  "conditions": [
+    "single_agent_serial",
+    "fixed_roles",
+    "round_robin",
+    "role_free_async",
+    "no_stale_check",
+    "no_protocol_correction",
+    "single_execution_per_intent"
+  ],
+  "budget": {
+    "max_model_calls": 24,
+    "timeout_seconds": 5,
+    "concurrent_projects": 3
+  },
+  "input_cost_per_1k_tokens": 0,
+  "output_cost_per_1k_tokens": 0,
+  "tasks": [
+    {
+      "id": "direct-solve",
+      "goal": "Return the deterministic answer.",
+      "origin": "Offline deterministic task without network access.",
+      "expected_answer": "answer{direct}"
+    },
+    {
+      "id": "protocol-recovery",
+      "goal": "Return the answer after correcting the result protocol.",
+      "origin": "The fake provider requires an explicit correction attempt.",
+      "expected_answer": "answer{protocol}",
+      "fake": {
+        "requires_protocol_correction": true
+      }
+    },
+    {
+      "id": "provider-recovery",
+      "goal": "Return the answer after a temporary provider failure.",
+      "origin": "Every fake provider fails its first execution deterministically.",
+      "expected_answer": "answer{recovery}",
+      "fake": {
+        "execution_failures_each": 1
+      }
+    },
+    {
+      "id": "stale-race",
+      "goal": "Return the answer while concurrent plans age at different rates.",
+      "origin": "Provider planning delays deterministically create a stale snapshot.",
+      "expected_answer": "answer{stale}",
+      "fake": {
+        "planning_delay_ms": {
+          "agent-a": 0,
+          "agent-b": 20,
+          "agent-c": 40
+        }
+      }
+    }
+  ]
+}

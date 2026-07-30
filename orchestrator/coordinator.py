@@ -9,7 +9,20 @@ from worker.models import CoordinatorConfig
 
 
 class PermitCancelled(Exception):
-    pass
+    def __init__(
+        self,
+        queue_seconds: float = 0.0,
+        wait_reasons: tuple[str, ...] = (),
+    ) -> None:
+        super().__init__("coordinator permit wait was cancelled")
+        self.queue_seconds = queue_seconds
+        self.wait_reasons = wait_reasons
+
+
+@dataclass(frozen=True, slots=True)
+class PermitLease:
+    queue_seconds: float
+    wait_reasons: tuple[str, ...]
 
 
 @dataclass(slots=True)
@@ -22,6 +35,8 @@ class _PermitRequest:
     queued_at: float
     sequence: int
     future: asyncio.Future[None]
+    wait_reasons: tuple[str, ...] = ()
+    acquired_at: float | None = None
     granted: bool = False
     released: bool = False
 
@@ -82,7 +97,7 @@ class ExecutionCoordinator:
         priority: int,
         provider_limit: int,
         cancel_event: asyncio.Event | None = None,
-    ) -> AsyncIterator[None]:
+    ) -> AsyncIterator[PermitLease]:
         request = await self._acquire(
             project_id=project_id,
             provider=provider,
@@ -92,7 +107,11 @@ class ExecutionCoordinator:
             cancel_event=cancel_event,
         )
         try:
-            yield
+            acquired_at = request.acquired_at or self._clock()
+            yield PermitLease(
+                queue_seconds=max(0.0, acquired_at - request.queued_at),
+                wait_reasons=request.wait_reasons,
+            )
         finally:
             await self._release(request)
 
@@ -111,7 +130,7 @@ class ExecutionCoordinator:
         if provider_limit <= 0:
             raise ValueError("provider_limit must be positive")
         if cancel_event is not None and cancel_event.is_set():
-            raise PermitCancelled
+            raise PermitCancelled()
 
         loop = asyncio.get_running_loop()
         async with self._lock:
@@ -126,6 +145,9 @@ class ExecutionCoordinator:
                 sequence=self._sequence,
                 future=loop.create_future(),
             )
+            request.wait_reasons = self._blocking_reasons(request)
+            if not request.wait_reasons and self._pending:
+                request.wait_reasons = ("fair_or_priority_queue",)
             self._pending.append(request)
             if project_id not in self._project_order:
                 self._project_order.append(project_id)
@@ -142,8 +164,9 @@ class ExecutionCoordinator:
                     return_when=asyncio.FIRST_COMPLETED,
                 )
                 if request.future not in done:
+                    queue_seconds = max(0.0, self._clock() - request.queued_at)
                     await self._abandon(request)
-                    raise PermitCancelled
+                    raise PermitCancelled(queue_seconds, request.wait_reasons)
             return request
         except asyncio.CancelledError:
             await self._abandon(request)
@@ -200,25 +223,29 @@ class ExecutionCoordinator:
         self._discard_empty_projects_locked()
 
     def _eligible(self, request: _PermitRequest) -> bool:
+        return not self._blocking_reasons(request)
+
+    def _blocking_reasons(self, request: _PermitRequest) -> tuple[str, ...]:
         config = self.config
+        reasons: list[str] = []
         if self._running_global >= config.max_global_running:
-            return False
+            reasons.append("global_limit")
         if (
             self._running_by_project[request.project_id]
             >= config.max_project_running
         ):
-            return False
+            reasons.append("project_limit")
         if self._running_by_provider[request.provider] >= request.provider_limit:
-            return False
+            reasons.append("provider_limit")
         if request.kind == "planning":
             if self._running_planning >= config.max_global_planning:
-                return False
+                reasons.append("global_planning_limit")
             if (
                 self._running_planning_by_project[request.project_id]
                 >= config.max_project_planning
             ):
-                return False
-        return True
+                reasons.append("project_planning_limit")
+        return tuple(reasons)
 
     def _effective_priority(self, request: _PermitRequest) -> float:
         waited = max(0.0, self._clock() - request.queued_at)
@@ -251,6 +278,7 @@ class ExecutionCoordinator:
                 return
             self._pending.remove(request)
             request.granted = True
+            request.acquired_at = self._clock()
             self._running_global += 1
             self._running_by_project[request.project_id] += 1
             self._running_by_provider[request.provider] += 1
@@ -293,5 +321,26 @@ class ExecutionCoordinator:
                     "execution": sum(
                         request.kind == "execution" for request in self._pending
                     ),
+                    "items": [
+                        {
+                            "project_id": request.project_id,
+                            "provider": request.provider,
+                            "kind": request.kind,
+                            "priority": request.priority,
+                            "queue_seconds": max(
+                                0.0,
+                                self._clock() - request.queued_at,
+                            ),
+                            "wait_reasons": list(
+                                self._blocking_reasons(request)
+                                or request.wait_reasons
+                                or ("fair_or_priority_queue",)
+                            ),
+                        }
+                        for request in sorted(
+                            self._pending,
+                            key=lambda item: item.sequence,
+                        )
+                    ],
                 },
             }

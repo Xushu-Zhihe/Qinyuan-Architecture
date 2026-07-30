@@ -144,6 +144,14 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             [edge["type"] for edge in store.snapshot()["edges"]],
             ["intent"],
         )
+        planning = store.planning_attempts()
+        executions = store.executions()
+        self.assertEqual(len(planning), 1)
+        self.assertEqual(planning[0]["status"], "valid")
+        self.assertEqual(planning[0]["intent_edge_id"], executions[0]["intent_edge_id"])
+        self.assertEqual(executions[0]["status"], "completed")
+        self.assertEqual(executions[0]["retry_count"], 0)
+        self.assertEqual(executions[0]["duration_seconds"], 0.01)
 
     async def test_planning_uses_dedicated_timeout(self) -> None:
         store, root = self.make_store()
@@ -422,7 +430,7 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         async def health_probe(config):
             if config.name == "missing":
                 return ProbeResult("missing", "not found")
-            return ProbeResult("success")
+            return ProbeResult("success", cli_version="healthy-cli 1.0")
 
         async def execute(config, request, challenge_dir, work_dir, **kwargs):
             execution_calls.append(config.name)
@@ -454,6 +462,10 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             store.provider_health_for("healthy")["status"],
             "healthy",
+        )
+        self.assertEqual(
+            store.provider_health_for("healthy")["cli_version"],
+            "healthy-cli 1.0",
         )
         self.assertEqual(store.snapshot()["project"]["status"], "degraded")
 
@@ -741,6 +753,10 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             ["protocol_error", "completed"],
         )
         self.assertEqual(
+            [item["retry_count"] for item in intent["executions"]],
+            [0, 1],
+        )
+        self.assertEqual(
             len({item["work_dir"] for item in intent["executions"]}),
             2,
         )
@@ -928,6 +944,14 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(store.snapshot()["project"]["status"], "stopped")
         self.assertEqual(snapshot["pending"]["total"], 0)
         self.assertEqual(snapshot["running"]["global"], 1)
+        planning = store.planning_attempts()
+        self.assertEqual(len(planning), 1)
+        self.assertEqual(planning[0]["status"], "cancelled")
+        self.assertEqual(
+            planning[0]["decision_reason"],
+            "scheduler permit wait cancelled",
+        )
+        self.assertIn("global_limit", planning[0]["wait_reasons"])
 
         blocker_release.set()
         await blocker

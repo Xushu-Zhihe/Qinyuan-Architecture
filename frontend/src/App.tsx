@@ -4,24 +4,34 @@ import { api } from './api/client'
 import { NewProjectDialog, type NewProjectPayload } from './components/NewProjectDialog'
 import { ProjectDashboard } from './pages/ProjectDashboard'
 import { BlackboardWorkspace } from './pages/BlackboardWorkspace'
-import type { ProjectSummary } from './types'
+import type { ProjectSummary, RuntimeSnapshot } from './types'
 
 export default function App() {
   const [projects, setProjects] = useState<ProjectSummary[]>([])
+  const [runtime, setRuntime] = useState<RuntimeSnapshot | null>(null)
   const [dialogOpen, setDialogOpen] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [path, setPath] = useState(window.location.pathname)
 
   async function refresh() {
     try {
-      setProjects(await api.listProjects())
+      const [nextProjects, nextRuntime] = await Promise.all([
+        api.listProjects(),
+        api.getRuntime(),
+      ])
+      setProjects(nextProjects)
+      setRuntime(nextRuntime)
       setError(null)
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught))
     }
   }
 
-  useEffect(() => { void refresh() }, [])
+  useEffect(() => {
+    void refresh()
+    const timer = window.setInterval(() => { void refresh() }, 3000)
+    return () => window.clearInterval(timer)
+  }, [])
   useEffect(() => {
     const listener = () => setPath(window.location.pathname)
     window.addEventListener('popstate', listener)
@@ -48,7 +58,7 @@ export default function App() {
   return (
     <>
       {error && <div className="error-banner">{error}</div>}
-      <ProjectDashboard projects={projects} onOpen={openProject} onCreate={() => setDialogOpen(true)} />
+      <ProjectDashboard projects={projects} runtime={runtime} onOpen={openProject} onCreate={() => setDialogOpen(true)} />
       <NewProjectDialog
         open={dialogOpen}
         providers={['codex', 'claude', 'kimi']}

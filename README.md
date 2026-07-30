@@ -13,6 +13,10 @@ Web 工作区使用节点表示 `Goal`、`Origin`、`Fact` 和 `Hint`，使用�
 - 同一 Intent 合并语义边，同时保留各 provider 的独立 execution 和日志。
 - 通过项目级 WebSocket 实时接收图事件和 stdout/stderr 分块。
 - 从 Fact 追溯 producing Intent、execution 和 provider。
+- 持久化 Planning Attempt、调度等待、健康检查、熔断、恢复和执行指标。
+- 分页读取受大小与保留策略约束的日志，并导出二次脱敏的项目审计包。
+- 从全局运行面板查看配额、排队任务、活动任务和 provider 健康状态。
+- 在项目诊断侧栏筛选规划/执行记录、查看日志、人工重试和受控重新打开项目。
 - 同时运行多个相互隔离的项目。
 - 通过 FastAPI 提供 REST、WebSocket 和生产前端静态资源。
 
@@ -70,10 +74,14 @@ web-data/
       blackboard.db
       layout.json
       executions/
-        <execution-id>/
+        plan-<provider>-<id>/
           stdout.txt
           stderr.txt
-          work/
+        run-<provider>-<id>/
+          stdout.txt
+          stderr.txt
+      audit-exports/
+        audit-<timestamp>-<id>.zip
 ```
 
 - 每个项目使用独立 SQLite 和目录。
@@ -157,6 +165,13 @@ Vite 默认地址为 `http://127.0.0.1:5173`，并将 `/api` 和 `/ws` 代理到
     "max_global_planning": 4,
     "max_project_planning": 2,
     "aging_seconds": 30
+  },
+  "audit": {
+    "max_log_bytes": 8388608,
+    "max_retained_log_sets": 500,
+    "max_retained_exports": 5,
+    "default_log_page_bytes": 262144,
+    "max_log_page_bytes": 1048576
   },
   "providers": [
     {
@@ -248,6 +263,63 @@ Web 服务中的项目共享一个 `ExecutionCoordinator`。它只决定外部 C
 事件流，可通过 WebSocket 的 `after` 参数回放。未配置 `health_check` 的自定义
 provider 保持兼容，启动时显示 `unknown`，首次完整调用成功后变为 `healthy`。
 
+### 审计与日志
+
+每次规划都会创建独立的 Planning Attempt，保存 provider、快照 sequence、排队与
+执行时间、stdout/stderr 路径、工作目录、最终判定原因和产生的 Intent。判定状态
+包括 `valid`、`idle`、`stale`、`protocol_error`、取消和 provider 进程状态。
+Execution 另行保存重试编号、取消原因、调度等待原因、模型、CLI 版本与 token
+用量；无法从 CLI 获得的字段明确保存为 `unknown`。
+
+| 字段 | 说明 |
+| --- | --- |
+| `audit.max_log_bytes` | 每次调用的单个 stdout 或 stderr 文件上限；默认 8 MiB |
+| `audit.max_retained_log_sets` | 每个项目保留的已结束规划/执行日志组总数；默认 500 |
+| `audit.max_retained_exports` | 每个项目保留的审计 ZIP 数量；默认 5 |
+| `audit.default_log_page_bytes` | 日志接口默认单流页大小；默认 256 KiB |
+| `audit.max_log_page_bytes` | 日志接口允许的单流页大小上限；默认 1 MiB |
+
+日志在写盘和 WebSocket 推送前脱敏；读取接口保留原有 `stdout`、`stderr` 字段，
+同时返回字节偏移、总大小和是否还有下一页。超过保留数量的旧日志文件会删除，
+数据库记录保留并标记 `logs_retained=false`。命令参数和环境变量不写入审计表或
+导出文件。
+
+审计接口：
+
+- `GET /api/projects/{project_id}/planning-attempts`
+- `GET /api/projects/{project_id}/planning-attempts/{attempt_id}`
+- `GET /api/projects/{project_id}/planning-attempts/{attempt_id}/logs`
+- `GET /api/projects/{project_id}/executions`
+- `GET /api/projects/{project_id}/executions/{execution_id}/logs`
+- `GET /api/projects/{project_id}/audit/export`
+
+日志接口接受 `stdout_offset`、`stderr_offset` 和 `limit` 查询参数。审计 ZIP 包含图
+快照、Planning Attempt、Execution、provider 健康、事件流和仍被保留的日志；
+结构化数据与日志在写入 ZIP 前会再次脱敏。
+
+### Web 操作与诊断
+
+项目总览通过 `GET /api/runtime` 展示全局、单项目与规划配额，以及当前活动任务、
+等待队列和各项目 provider 健康状态。页面每 3 秒刷新一次；它只读取运行状态，
+不会自动启动项目、重试调用或恢复外部 CLI。
+
+工作区“诊断”侧栏提供 Execution 与 Planning Attempt 两个视图，可按 provider、
+状态和时间过滤。选择记录后复用底部日志面板读取持久日志；Planning Attempt 可
+定位到其产生的 Intent。`interrupted`、`auth_failed`、`cooldown`、协议错误和
+超时均使用独立状态文案。服务重启恢复过项目时，工作区会显示被中断的规划与
+执行数量。
+
+人工操作：
+
+- `POST /api/projects/{project_id}/executions/{execution_id}/retry` 只由用户点击
+  触发。它先创建新的 Execution，使用 `retry_of_execution_id` 关联来源记录，
+  不覆盖原状态、日志或产出；活动 Execution 和已完成但尚未重新打开的项目不能重试。
+- `POST /api/projects/{project_id}/reopen` 仅接受 `achieved` 项目。它递增
+  `goal_version`、清除当前展示的最终答案并恢复为 `idle`；旧答案和完整审计历史
+  仍保留，但不会参与新版本共识。重新打开不会自动启动 Agent。
+- 审计下载按钮显式调用现有 ZIP 导出接口。停止、重试、重新打开和启动均需要
+  用户操作，不会由状态轮询自动触发。
+
 ## Agent 协议
 
 规划阶段最后输出：
@@ -271,6 +343,63 @@ BLACKBOARD_RESULT: {"intent_id":"intent-...","facts":[{"ref":"flag-fact","conten
 `facts` 项只能包含 `ref`、`content`；`edges` 项只能包含 `type`、`from`、`to`。结构化结果整份校验并在单个事务中合并。协议错误不会留下部分 Fact 或关系，原始 stdout/stderr 仍会保留。
 
 执行进程成功但协议解析失败时，Supervisor 会保留失败 execution，并针对同一 Intent 创建一次带解析错误反馈的纠错 execution。第二次仍失败才把本轮计为失败。
+
+## 实验与效果评估
+
+`experiments/` 提供与生产 `BlackboardStore`、`ProjectSupervisor`、Intent-Execution
+协议和共享调度器相连的可重复实验 Runner，不使用另一套纯模拟状态机。默认配置只
+运行 deterministic fake providers：
+
+```powershell
+python -m experiments `
+  --config experiments/configs/deterministic_smoke.json `
+  --output experiments/results/deterministic-smoke-v1-20260730
+```
+
+默认套件对每个条件使用相同的四项任务、Prompt、24 次模型调用上限、5 秒超时和
+随机种子，并重复三次；最多三个项目共享同一个 `ExecutionCoordinator` 并发运行。
+七个条件为：
+
+| 条件 | 调度与策略 |
+| --- | --- |
+| `single_agent_serial` | 单 Agent 串行规划与执行 |
+| `fixed_roles` | 固定 Planner 与 Executor，串行交接 |
+| `round_robin` | 多 Agent 按固定轮询顺序串行运行 |
+| `role_free_async` | 当前无角色异步协作方案 |
+| `no_stale_check` | 关闭两次 stale-plan 检查 |
+| `no_protocol_correction` | 协议错误后不创建纠错 Execution |
+| `single_execution_per_intent` | 每个 Intent 最多保留一次 Execution |
+
+每次运行保存 `blackboard.db`、完整事件、Planning/Execution 原始日志、图快照和
+`result.json`。套件根目录保存规范化配置、环境与源码 SHA-256、随机种子、
+`raw_results.jsonl`、`summary.json` 和当次分析脚本副本。可以从原始结果重新分析：
+
+```powershell
+python -m experiments.analyze experiments/results/deterministic-smoke-v1-20260730
+```
+
+采集指标包括任务成功率、规则判定的答案正确率、总耗时、首个 Fact/达到目标时间、
+实际模型调用和统一预算、可获得的 token 与估算成本、重复 Intent、无效 Execution、
+协议错误、stale plan、provider 恢复时间、故障后剩余任务完成率、吞吐量和并发项目
+Jain 公平指数。答案一致性仅保留为提议数量、唯一答案数和最大一致组等信号，正确性
+由任务的 `expected_answer` 规则独立判定。
+
+真实 CLI 模式不会被默认命令触发。只有配置显式设置 `"mode": "real"`，同时提供
+provider 配置并传入费用授权开关时才会运行：
+
+```powershell
+python -m experiments `
+  --config E:\experiment\real-suite.json `
+  --provider-config worker/providers.json `
+  --allow-real-providers `
+  --output E:\experiment\results\real-run-01
+```
+
+2026-07-30 的默认 fake 套件完成 84 个运行，`runner_errors=0`，并保留 84 份
+SQLite。四个对照/当前条件与 stale 消融均为 12/12；关闭协议纠错为 9/12，单
+Intent 一次 Execution 为 6/12，失败集中在专门要求纠错或失败后重试的夹具。
+这只能证明实验框架可重复执行、消融约束生效且工程指标可采集，不能证明无角色
+异步方案在真实模型上的质量或效率优势。
 
 ## CLI 入口
 
@@ -297,6 +426,9 @@ npm test -- --run
 npm run build
 ```
 
+2026-07-30 当前实测：后端 `125/125`、前端 `21/21`、Playwright E2E `8/8`，
+生产构建成功。
+
 Playwright E2E 首次运行前安装浏览器：
 
 ```powershell
@@ -304,7 +436,10 @@ npx playwright install chromium
 npm run test:e2e
 ```
 
-E2E 使用本地 fake providers，不调用真实模型，不消耗模型额度。测试覆盖桌面 `1440x900`、窄屏 `390x844`、多项目隔离、人工建图后启动、真实日志文件和 WebSocket 更新。
+E2E 使用本地 fake providers，不调用真实模型，不消耗模型额度。测试覆盖桌面
+`1440x900`、窄屏 `390x844`、多项目隔离、人工建图后启动、运行总览、规划/执行
+诊断、Intent 跳转、审计入口、真实日志文件和 WebSocket 更新。测试端口可通过
+`BLACKBOARD_E2E_API_PORT` 与 `BLACKBOARD_E2E_WEB_PORT` 调整。
 
 ## 安全与授权
 
@@ -316,8 +451,9 @@ E2E 使用本地 fake providers，不调用真实模型，不消耗模型额度�
 
 - 这是本机单进程调度平台，不是分布式任务系统。
 - 第一版没有登录、组织、共享或多用户并发编辑。
-- 服务重启后首次打开项目时，会把遗留的 `planned`/`running` execution
-  幂等标记为 `interrupted`，记录 `server restarted` 事件，并把遗留的
+- 服务重启后首次打开项目时，会把遗留的 `queued`/`running` Planning Attempt
+  和 `planned`/`running` execution 幂等标记为 `interrupted`，记录
+  `server restarted` 事件，并把遗留的
   `running` 项目恢复为 `idle`。恢复事件可通过 WebSocket `after` 参数重放；
   外部 CLI 不会自动重启，必须由用户再次启动项目。
 - 最终答案共识使用规范化后的精确文本，不自动向 CTF 平台提交答案。

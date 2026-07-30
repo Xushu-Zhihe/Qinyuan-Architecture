@@ -41,6 +41,7 @@ describe('ProjectDashboard', () => {
     render(
       <ProjectDashboard
         projects={projects}
+        runtime={null}
         onOpen={onOpen}
         onCreate={() => {}}
       />,

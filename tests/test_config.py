@@ -5,6 +5,7 @@ from pathlib import Path
 
 from worker.config import (
     ConfigError,
+    load_audit_config,
     load_coordinator_config,
     load_provider_configs,
 )
@@ -109,6 +110,46 @@ class ProviderConfigTests(unittest.TestCase):
             self.assertEqual(coordinator.max_project_planning, 1)
             self.assertEqual(coordinator.aging_seconds, 5)
             self.assertEqual(provider.max_running, 2)
+
+    def test_loads_audit_limits(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = self.write_config(
+                directory,
+                {
+                    "audit": {
+                        "max_log_bytes": 1024,
+                        "max_retained_log_sets": 10,
+                        "max_retained_exports": 2,
+                        "default_log_page_bytes": 128,
+                        "max_log_page_bytes": 512,
+                    },
+                    "providers": [],
+                },
+            )
+
+            audit = load_audit_config(path)
+
+            self.assertEqual(audit.max_log_bytes, 1024)
+            self.assertEqual(audit.max_retained_log_sets, 10)
+            self.assertEqual(audit.max_retained_exports, 2)
+            self.assertEqual(audit.default_log_page_bytes, 128)
+            self.assertEqual(audit.max_log_page_bytes, 512)
+
+    def test_rejects_audit_default_page_above_maximum(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = self.write_config(
+                directory,
+                {
+                    "audit": {
+                        "default_log_page_bytes": 513,
+                        "max_log_page_bytes": 512,
+                    },
+                    "providers": [],
+                },
+            )
+
+            with self.assertRaisesRegex(ConfigError, "cannot exceed"):
+                load_audit_config(path)
 
     def test_rejects_invalid_coordinator_limit_relationships(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

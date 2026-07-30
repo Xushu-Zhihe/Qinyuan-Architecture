@@ -9,6 +9,7 @@ from pathlib import Path
 
 from worker.executor import _terminate_process_tree
 from worker.models import ProviderConfig, WorkerResult
+from worker.redaction import redact_error
 
 
 HEALTH_STATUSES = frozenset(
@@ -30,6 +31,7 @@ TERMINAL_HEALTH_STATUSES = frozenset(
 class ProbeResult:
     status: str
     detail: str = ""
+    cli_version: str = "unknown"
 
 
 HealthProbe = Callable[[ProviderConfig], Awaitable[ProbeResult]]
@@ -48,21 +50,6 @@ _TEMPORARY_PATTERN = re.compile(
     r"(?:reset|refused|aborted)|network|dns|service unavailable|rate limit|"
     r"网络|连接.*(?:重置|拒绝|中断)|服务不可用)"
 )
-_SECRET_PATTERN = re.compile(
-    r"(?i)\b(api[ _-]?key|access[ _-]?token|refresh[ _-]?token|token|"
-    r"authorization|bearer|secret|password)\b\s*[:=]?\s*"
-    r"(?:bearer\s+)?[^\s,;]+"
-)
-
-
-def redact_error(value: str, limit: int = 400) -> str:
-    normalized = " ".join(value.replace("\x00", "").split())
-    redacted = _SECRET_PATTERN.sub(lambda match: f"{match.group(1)}=[redacted]", normalized)
-    if len(redacted) > limit:
-        return redacted[: limit - 3] + "..."
-    return redacted
-
-
 def classify_probe_failure(result: ProbeResult) -> str:
     if result.status == "missing":
         return "missing"
@@ -162,5 +149,6 @@ async def probe_provider(provider: ProviderConfig) -> ProbeResult:
     stdout, stderr = communicate.result()
     detail = (stdout + stderr).decode("utf-8", errors="replace")[-4096:]
     if process.returncode == 0:
-        return ProbeResult("success")
+        version = redact_error(detail, limit=200) or "unknown"
+        return ProbeResult("success", cli_version=version)
     return ProbeResult("failed", detail)

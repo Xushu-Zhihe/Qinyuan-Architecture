@@ -1,8 +1,11 @@
 import type {
   ExecutionLogs,
+  IntentExecution,
   LayoutSnapshot,
+  PlanningAttempt,
   ProjectSnapshot,
   ProjectSummary,
+  RuntimeSnapshot,
 } from '../types'
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -23,6 +26,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 
 export const api = {
   listProjects: () => request<ProjectSummary[]>('/api/projects'),
+  getRuntime: () => request<RuntimeSnapshot>('/api/runtime'),
   createProject: (payload: object) =>
     request<ProjectSummary>('/api/projects', { method: 'POST', body: JSON.stringify(payload) }),
   getGraph: (projectId: string) =>
@@ -43,6 +47,15 @@ export const api = {
     request(`/api/projects/${projectId}/start`, { method: 'POST' }),
   stopProject: (projectId: string) =>
     request<ProjectSummary>(`/api/projects/${projectId}/stop`, { method: 'POST' }),
+  reopenProject: (projectId: string) =>
+    request<ProjectSummary>(`/api/projects/${projectId}/reopen`, { method: 'POST' }),
+  retryExecution: (projectId: string, executionId: string) =>
+    request<IntentExecution>(`/api/projects/${projectId}/executions/${executionId}/retry`, { method: 'POST' }),
   executionLogs: (projectId: string, executionId: string) =>
     request<ExecutionLogs>(`/api/projects/${projectId}/executions/${executionId}/logs`),
+  planningLogs: (projectId: string, attemptId: string) =>
+    request<ExecutionLogs>(`/api/projects/${projectId}/planning-attempts/${attemptId}/logs`),
+  planningAttempts: (projectId: string) =>
+    request<PlanningAttempt[]>(`/api/projects/${projectId}/planning-attempts`),
+  auditExportUrl: (projectId: string) => `/api/projects/${projectId}/audit/export`,
 }

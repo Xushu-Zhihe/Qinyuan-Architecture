@@ -24,6 +24,17 @@ function providerLabel(provider: string) {
   return provider.charAt(0).toUpperCase() + provider.slice(1)
 }
 
+const executionStatusLabel: Record<string, string> = {
+  planned: '排队中',
+  running: '运行中',
+  completed: '已完成',
+  failed: '失败',
+  protocol_error: '协议错误',
+  interrupted: '服务重启中断',
+  cancelled: '已取消',
+  timeout: '超时',
+}
+
 function nodeLabel(snapshot: ProjectSnapshot, nodeId: string) {
   const node = snapshot.nodes.find(item => item.id === nodeId)
   return node ? `${node.type.toUpperCase()} · ${node.content}` : nodeId
@@ -153,7 +164,7 @@ export function InspectorPanel({
               {executions.find(execution => execution.id === activeExecutionId) && (
                 <dl className="execution-summary">
                   <div><dt>执行</dt><dd>{activeExecutionId}</dd></div>
-                  <div><dt>状态</dt><dd>{executions.find(execution => execution.id === activeExecutionId)?.status}</dd></div>
+                  <div><dt>状态</dt><dd>{executionStatusLabel[executions.find(execution => execution.id === activeExecutionId)?.status ?? ''] ?? executions.find(execution => execution.id === activeExecutionId)?.status}</dd></div>
                 </dl>
               )}
             </section>

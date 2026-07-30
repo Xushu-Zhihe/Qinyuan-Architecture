@@ -3,15 +3,15 @@ import { useEffect, useRef, useState } from 'react'
 
 import { api } from '../api/client'
 import { capLogText } from '../state/projectStore'
-import type { ExecutionLogs, IntentExecution } from '../types'
+import type { ExecutionLogs, IntentExecution, PlanningAttempt } from '../types'
 
 type LogStream = keyof ExecutionLogs
 type LoadLogs = (projectId: string, executionId: string) => Promise<ExecutionLogs>
 
-function durationLabel(execution: IntentExecution) {
-  if (!execution.started_at) return '—'
-  const start = Date.parse(execution.started_at)
-  const finish = execution.finished_at ? Date.parse(execution.finished_at) : Date.now()
+function durationLabel(record: IntentExecution | PlanningAttempt) {
+  if (!record.started_at) return '—'
+  const start = Date.parse(record.started_at)
+  const finish = record.finished_at ? Date.parse(record.finished_at) : Date.now()
   if (!Number.isFinite(start) || !Number.isFinite(finish)) return '—'
   return `${Math.max(0, (finish - start) / 1000).toFixed(1)}s`
 }
@@ -19,11 +19,13 @@ function durationLabel(execution: IntentExecution) {
 export function LogConsole({
   projectId,
   execution,
+  planningAttempt = null,
   liveLogs,
   loadLogs = api.executionLogs,
 }: {
   projectId: string
   execution: IntentExecution | null
+  planningAttempt?: PlanningAttempt | null
   liveLogs: ExecutionLogs
   loadLogs?: LoadLogs
 }) {
@@ -35,6 +37,7 @@ export function LogConsole({
   const [collapsed, setCollapsed] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const viewportRef = useRef<HTMLPreElement>(null)
+  const record = planningAttempt ?? execution
 
   useEffect(() => {
     setStoredLogs({ stdout: '', stderr: '' })
@@ -44,9 +47,10 @@ export function LogConsole({
     })
     setCleared(false)
     setError(null)
-    if (!execution) return
+    if (!record) return
     let active = true
-    void loadLogs(projectId, execution.id)
+    const loader = planningAttempt ? api.planningLogs : loadLogs
+    void loader(projectId, record.id)
       .then(logs => {
         if (!active) return
         setStoredLogs(logs)
@@ -57,7 +61,7 @@ export function LogConsole({
       })
       .catch(reason => { if (active) setError(reason instanceof Error ? reason.message : String(reason)) })
     return () => { active = false }
-  }, [execution?.id, loadLogs, projectId])
+  }, [execution?.id, loadLogs, planningAttempt?.id, projectId])
 
   const visibleText = cleared
     ? ''
@@ -73,14 +77,14 @@ export function LogConsole({
     <section className={collapsed ? 'log-console is-collapsed' : 'log-console'} aria-label="Agent 实时日志">
       <header className="log-header">
         <div className="log-identity">
-          <strong>{execution ? `${execution.provider} · ${execution.id}` : 'Agent logs'}</strong>
-          {execution && <span className={`log-status log-status--${execution.status}`}>{execution.status}</span>}
+          <strong>{record ? `${record.provider} · ${record.id}` : 'Audit logs'}</strong>
+          {record && <span className={`log-status log-status--${record.status}`}>{record.status}</span>}
         </div>
-        {execution && (
+        {record && (
           <div className="log-metrics">
-            <span>exit {execution.exit_code ?? '—'}</span>
-            <span>{durationLabel(execution)}</span>
-            <span className="work-dir" title={execution.work_dir}>{execution.work_dir}</span>
+            <span>{planningAttempt ? 'planning' : `exit ${execution?.exit_code ?? '—'}`}</span>
+            <span>{durationLabel(record)}</span>
+            <span className="work-dir" title={record.work_dir}>{record.work_dir}</span>
           </div>
         )}
         <div className="log-actions">
@@ -88,7 +92,7 @@ export function LogConsole({
             <input type="checkbox" checked={follow} onChange={event => setFollow(event.target.checked)} />
             <span>跟随</span>
           </label>
-          <button className="icon-button" aria-label="清空当前视图" title="清空当前视图" disabled={!execution} onClick={() => setCleared(true)}><Trash2 size={16} /></button>
+          <button className="icon-button" aria-label="清空当前视图" title="清空当前视图" disabled={!record} onClick={() => setCleared(true)}><Trash2 size={16} /></button>
           <button className="icon-button" aria-label={collapsed ? '展开日志' : '折叠日志'} title={collapsed ? '展开日志' : '折叠日志'} onClick={() => setCollapsed(value => !value)}>
             {collapsed ? <ChevronUp size={17} /> : <ChevronDown size={17} />}
           </button>

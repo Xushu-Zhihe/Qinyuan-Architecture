@@ -6,6 +6,13 @@
     "max_project_planning": 2,
     "aging_seconds": 30
   },
+  "audit": {
+    "max_log_bytes": 8388608,
+    "max_retained_log_sets": 500,
+    "max_retained_exports": 5,
+    "default_log_page_bytes": 262144,
+    "max_log_page_bytes": 1048576
+  },
   "providers": [
     {
       "name": "codex",

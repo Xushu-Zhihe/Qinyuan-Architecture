@@ -55,8 +55,28 @@ async function createRunningProject(page: Page, name: string, provider: string) 
 test('project overview stays inside desktop and narrow viewports', async ({ page }, testInfo) => {
   await page.goto('/')
   await expect(page.getByText('BLACKBOARD', { exact: true })).toBeVisible()
+  await expect(page.getByRole('heading', { name: '运行总览' })).toBeVisible()
   await expectViewportContained(page)
   await page.screenshot({ path: testInfo.outputPath(`overview-${testInfo.project.name}.png`), fullPage: true })
+})
+
+test('runtime diagnostics expose planning, execution and audit controls', async ({ page }, testInfo) => {
+  await createRunningProject(page, `Diagnostics ${testInfo.project.name}`, 'codex')
+  await page.getByRole('button', { name: '诊断' }).click()
+  await expect(page.getByRole('heading', { name: '运行诊断' })).toBeVisible()
+  await expect(page.getByText(/^execution-/).first()).toBeVisible()
+
+  await page.getByRole('tab', { name: /Planning/ }).click()
+  await expect(page.getByText(/^planning-/).first()).toBeVisible()
+  await page.getByText(/^planning-/).first().click()
+  await expect(page.getByLabel('Agent 实时日志').getByText('codex planning', { exact: false })).toBeVisible()
+
+  await page.getByRole('button', { name: /^定位 intent-/ }).first().click()
+  await expect(page.getByText(/^Intent intent-/).first()).toBeVisible()
+  await expect(page.getByRole('link', { name: '导出审计包' })).toBeVisible()
+  await expectViewportContained(page)
+  await page.getByRole('button', { name: '诊断' }).click()
+  await page.screenshot({ path: testInfo.outputPath(`diagnostics-${testInfo.project.name}.png`), fullPage: true })
 })
 
 test('two running projects keep graph and logs isolated', async ({ browser }, testInfo: TestInfo) => {

@@ -4,7 +4,11 @@ from pathlib import Path
 import uvicorn
 
 from web.app import DEFAULT_DATA_ROOT, create_app
-from worker.config import load_coordinator_config, load_provider_configs
+from worker.config import (
+    load_audit_config,
+    load_coordinator_config,
+    load_provider_configs,
+)
 
 
 ROOT = Path(__file__).resolve().parent
@@ -25,6 +29,7 @@ def create_server_app(
         data_root=resolved_data_root,
         provider_configs=load_provider_configs(resolved_config),
         coordinator_config=load_coordinator_config(resolved_config),
+        audit_config=load_audit_config(resolved_config),
     )
 
 

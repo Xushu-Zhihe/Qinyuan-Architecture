@@ -2,7 +2,8 @@ import { render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { describe, expect, it, vi } from 'vitest'
 
-import type { IntentExecution } from '../types'
+import { api } from '../api/client'
+import type { IntentExecution, PlanningAttempt } from '../types'
 import { LogConsole } from './LogConsole'
 
 const execution: IntentExecution = {
@@ -17,6 +18,15 @@ const execution: IntentExecution = {
   stderr_path: 'executions/exec-a/stderr.txt',
   work_dir: 'executions/exec-a/work',
   error_message: null,
+}
+
+const planning: PlanningAttempt = {
+  id: 'planning-a', project_id: 'project-1', provider: 'codex', status: 'valid',
+  snapshot_sequence: 4, queued_at: '2026-07-12T00:00:00Z', started_at: '2026-07-12T00:00:00Z',
+  finished_at: '2026-07-12T00:00:02Z', queue_seconds: 0, duration_seconds: 2,
+  stdout_path: 'stdout', stderr_path: 'stderr', work_dir: 'work', decision_reason: 'valid',
+  intent_edge_id: 'intent-1', retry_count: 0, wait_reasons: [], model: 'unknown',
+  cli_version: 'unknown', token_usage: 'unknown', logs_retained: true,
 }
 
 describe('LogConsole', () => {
@@ -89,5 +99,23 @@ describe('LogConsole', () => {
     await screen.findByText('single copy', { exact: false })
     const text = container.querySelector('.log-output')?.textContent ?? ''
     expect(text.match(/single copy/g)).toHaveLength(1)
+  })
+
+  it('loads planning attempt logs through the planning endpoint', async () => {
+    const loadLogs = vi.fn()
+    vi.spyOn(api, 'planningLogs').mockResolvedValue({ stdout: 'planning output\n', stderr: '' })
+    render(
+      <LogConsole
+        projectId="project-1"
+        execution={null}
+        planningAttempt={planning}
+        liveLogs={{ stdout: '', stderr: '' }}
+        loadLogs={loadLogs}
+      />,
+    )
+
+    expect(await screen.findByText('planning output', { exact: false })).toBeInTheDocument()
+    expect(api.planningLogs).toHaveBeenCalledWith('project-1', 'planning-a')
+    expect(loadLogs).not.toHaveBeenCalled()
   })
 })

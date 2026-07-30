@@ -13,6 +13,7 @@ from fastapi import (
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
+from orchestrator.audit import export_audit_bundle, read_log_page
 from orchestrator.layout import LayoutConflict
 from orchestrator.models import IntentProposal
 from orchestrator.projects import ProjectService, project_record_dict
@@ -23,7 +24,7 @@ from web.schemas import (
     NodeCreate,
     ProjectCreate,
 )
-from worker.models import CoordinatorConfig, ProviderConfig
+from worker.models import AuditConfig, CoordinatorConfig, ProviderConfig
 
 
 DEFAULT_DATA_ROOT = Path(__file__).resolve().parents[1] / "web-data"
@@ -36,6 +37,7 @@ def create_app(
     execute=None,
     health_probe=None,
     coordinator_config: CoordinatorConfig | None = None,
+    audit_config: AuditConfig | None = None,
     frontend_dist: Path | None = None,
 ) -> FastAPI:
     service = ProjectService(
@@ -44,6 +46,7 @@ def create_app(
         execute=execute,
         health_probe=health_probe,
         coordinator_config=coordinator_config,
+        audit_config=audit_config,
     )
 
     @asynccontextmanager
@@ -69,9 +72,64 @@ def create_app(
         for event in project.store.events_after(sequence):
             await project.hub.publish(event)
 
+    def log_page_limit(value: int | None) -> int:
+        limit = value or service.audit_config.default_log_page_bytes
+        if limit <= 0 or limit > service.audit_config.max_log_page_bytes:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "log limit must be between 1 and "
+                    f"{service.audit_config.max_log_page_bytes} bytes"
+                ),
+            )
+        return limit
+
+    def paged_logs(
+        project,
+        record: dict[str, object],
+        *,
+        stdout_offset: int,
+        stderr_offset: int,
+        limit: int | None,
+    ) -> dict[str, object]:
+        if stdout_offset < 0 or stderr_offset < 0:
+            raise HTTPException(
+                status_code=400,
+                detail="log offsets must be non-negative",
+            )
+        page_limit = log_page_limit(limit)
+        retained = bool(record.get("logs_retained", True))
+        stdout = read_log_page(
+            project.record.path,
+            record["stdout_path"],
+            offset=stdout_offset,
+            limit=page_limit,
+            retained=retained,
+        )
+        stderr = read_log_page(
+            project.record.path,
+            record["stderr_path"],
+            offset=stderr_offset,
+            limit=page_limit,
+            retained=retained,
+        )
+        return {
+            "stdout": stdout.pop("text"),
+            "stderr": stderr.pop("text"),
+            "pagination": {
+                "limit_bytes": page_limit,
+                "stdout": stdout,
+                "stderr": stderr,
+            },
+        }
+
     @app.get("/api/projects")
     def list_projects():
         return service.list_projects()
+
+    @app.get("/api/runtime")
+    async def get_runtime():
+        return await service.runtime_snapshot()
 
     @app.post("/api/projects", status_code=status.HTTP_201_CREATED)
     def create_project(payload: ProjectCreate):
@@ -96,9 +154,13 @@ def create_app(
     @app.get("/api/projects/{project_id}")
     def get_project(project_id: str):
         project = handle(project_id)
+        snapshot = project.store.snapshot()
         return {
             **project_record_dict(project.record),
+            "goal_version": snapshot["project"]["goal_version"],
+            "final_answer": snapshot["project"]["final_answer"],
             "provider_health": list(project.store.provider_health()),
+            "recovery": project.store.recovery_summary(),
         }
 
     @app.get("/api/projects/{project_id}/providers")
@@ -114,8 +176,13 @@ def create_app(
             **project_record_dict(project.record),
             "status": graph_project["status"],
             "final_answer": graph_project.get("final_answer"),
+            "goal_version": graph_project["goal_version"],
         }
-        return {**snapshot, "layout": project.layout.load()}
+        return {
+            **snapshot,
+            "layout": project.layout.load(),
+            "recovery": project.store.recovery_summary(),
+        }
 
     @app.post(
         "/api/projects/{project_id}/nodes",
@@ -261,21 +328,115 @@ def create_app(
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="execution not found") from exc
 
+    @app.get("/api/projects/{project_id}/executions")
+    def get_executions(project_id: str):
+        return list(handle(project_id).store.executions())
+
+    @app.post(
+        "/api/projects/{project_id}/executions/{execution_id}/retry",
+        status_code=status.HTTP_202_ACCEPTED,
+    )
+    async def retry_execution(project_id: str, execution_id: str):
+        try:
+            return await service.retry_execution(project_id, execution_id)
+        except KeyError as exc:
+            raise HTTPException(
+                status_code=404,
+                detail="execution not found",
+            ) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
     @app.get("/api/projects/{project_id}/executions/{execution_id}/logs")
-    def get_execution_logs(project_id: str, execution_id: str):
+    def get_execution_logs(
+        project_id: str,
+        execution_id: str,
+        stdout_offset: int = 0,
+        stderr_offset: int = 0,
+        limit: int | None = None,
+    ):
         project = handle(project_id)
         try:
             execution = project.store.execution(execution_id)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="execution not found") from exc
-        return {
-            "stdout": Path(str(execution["stdout_path"])).read_text(
-                encoding="utf-8", errors="replace"
-            ) if Path(str(execution["stdout_path"])).is_file() else "",
-            "stderr": Path(str(execution["stderr_path"])).read_text(
-                encoding="utf-8", errors="replace"
-            ) if Path(str(execution["stderr_path"])).is_file() else "",
-        }
+        return paged_logs(
+            project,
+            execution,
+            stdout_offset=stdout_offset,
+            stderr_offset=stderr_offset,
+            limit=limit,
+        )
+
+    @app.get("/api/projects/{project_id}/planning-attempts")
+    def get_planning_attempts(project_id: str):
+        return list(handle(project_id).store.planning_attempts())
+
+    @app.get(
+        "/api/projects/{project_id}/planning-attempts/{planning_attempt_id}"
+    )
+    def get_planning_attempt(project_id: str, planning_attempt_id: str):
+        project = handle(project_id)
+        try:
+            return project.store.planning_attempt(planning_attempt_id)
+        except KeyError as exc:
+            raise HTTPException(
+                status_code=404,
+                detail="planning attempt not found",
+            ) from exc
+
+    @app.get(
+        "/api/projects/{project_id}/planning-attempts/"
+        "{planning_attempt_id}/logs"
+    )
+    def get_planning_attempt_logs(
+        project_id: str,
+        planning_attempt_id: str,
+        stdout_offset: int = 0,
+        stderr_offset: int = 0,
+        limit: int | None = None,
+    ):
+        project = handle(project_id)
+        try:
+            attempt = project.store.planning_attempt(planning_attempt_id)
+        except KeyError as exc:
+            raise HTTPException(
+                status_code=404,
+                detail="planning attempt not found",
+            ) from exc
+        return paged_logs(
+            project,
+            attempt,
+            stdout_offset=stdout_offset,
+            stderr_offset=stderr_offset,
+            limit=limit,
+        )
+
+    @app.get("/api/projects/{project_id}/audit/export")
+    def export_project_audit(project_id: str):
+        project = handle(project_id)
+        path = export_audit_bundle(
+            project.store,
+            project.record.path,
+            service.audit_config.max_retained_exports,
+        )
+        return FileResponse(
+            path,
+            media_type="application/zip",
+            filename=path.name,
+        )
+
+    @app.post(
+        "/api/projects/{project_id}/reopen",
+        status_code=status.HTTP_202_ACCEPTED,
+    )
+    async def reopen_project(project_id: str):
+        try:
+            return await service.reopen_project(project_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="project not found") from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @app.post(
         "/api/projects/{project_id}/start",

@@ -80,16 +80,26 @@ async def _terminate_process_tree(process: asyncio.subprocess.Process) -> None:
     if process.returncode is not None:
         return
     if os.name == "nt":
-        killer = await asyncio.create_subprocess_exec(
-            "taskkill",
-            "/PID",
-            str(process.pid),
-            "/T",
-            "/F",
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
-        )
-        await killer.communicate()
+        try:
+            killer = await asyncio.create_subprocess_exec(
+                "taskkill",
+                "/PID",
+                str(process.pid),
+                "/T",
+                "/F",
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            try:
+                await asyncio.wait_for(killer.communicate(), timeout=0.75)
+            except asyncio.TimeoutError:
+                try:
+                    killer.kill()
+                except ProcessLookupError:
+                    pass
+                await killer.wait()
+        except OSError:
+            pass
         if process.returncode is None:
             try:
                 process.kill()
@@ -101,8 +111,8 @@ async def _terminate_process_tree(process: asyncio.subprocess.Process) -> None:
         except ProcessLookupError:
             pass
     try:
-        await process.wait()
-    except ProcessLookupError:
+        await asyncio.wait_for(process.wait(), timeout=1.0)
+    except (asyncio.TimeoutError, ProcessLookupError):
         pass
 
 

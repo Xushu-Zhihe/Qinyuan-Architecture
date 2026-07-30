@@ -78,6 +78,9 @@ web-data/
 
 - 每个项目使用独立 SQLite 和目录。
 - 每个项目使用独立 Supervisor、取消令牌和 WebSocket 频道。
+- 项目 Blackboard 中的 `projects.status` 是运行状态的权威来源；全局
+  `projects.db` 只保存列表索引缓存，并由 `ProjectService` 在生命周期变更和
+  读取时同步。
 - execution 查询同时校验 `project_id` 与 `execution_id`。
 - 停止一个项目不会终止其他项目的 CLI 进程。
 - `challenge_path` 是用户显式选择的外部只读上下文路径。
@@ -161,6 +164,13 @@ Vite 默认地址为 `http://127.0.0.1:5173`，并将 `/api` 和 `/ws` 代理到
         "{work_dir}",
         "-"
       ],
+      "health_check": {
+        "command": ["codex", "--version"],
+        "timeout_seconds": 10,
+        "cooldown_seconds": 15,
+        "max_cooldown_seconds": 300,
+        "failure_threshold": 3
+      },
       "planning_timeout_seconds": 120,
       "timeout_seconds": 900
     }
@@ -176,10 +186,36 @@ Vite 默认地址为 `http://127.0.0.1:5173`，并将 `/api` 和 `/ws` 代理到
 | `enabled` | 是否可被项目选择 |
 | `priority` | 保留的配置元数据，不参与事实可信度判断 |
 | `command` | 参数数组；不经过 shell 解释 |
+| `health_check.command` | 可选启动前探测命令；不接收 prompt 或路径占位符 |
+| `health_check.timeout_seconds` | 单次健康探测超时 |
+| `health_check.cooldown_seconds` | 临时故障的首次冷却时间 |
+| `health_check.max_cooldown_seconds` | 指数退避的冷却上限 |
+| `health_check.failure_threshold` | 连续失败达到该值后将项目标记为 `degraded` |
 | `planning_timeout_seconds` | 规划调用超时；省略时取 `timeout_seconds` 与 120 秒中的较小值 |
 | `timeout_seconds` | Intent 执行调用超时 |
 
 支持 `{work_dir}` 和 `{challenge_dir}` 占位符。prompt 通过 stdin 发送，CLI 认证由各 provider 自己管理，平台不读取或保存 API Key。
+
+### Provider 健康状态
+
+项目启动前会执行已配置的健康探测，并将结果保存到项目 Blackboard 的
+`provider_health` 表。状态包括 `healthy`、`unhealthy`、`auth_failed`、
+`missing`、`cooldown` 和 `unknown`：
+
+- `missing`、`auth_failed` 和 `unhealthy` 会停止当前 provider 循环，但不阻塞
+  其他 provider。
+- 超时、网络错误、5xx 和进程异常进入有上限的指数冷却；冷却到期后先执行
+  半开健康探测，再允许一次实际调用。图更新不能绕过 `cooldown_until`。
+- 401、403 或明确未登录会进入 `auth_failed`，只有用户再次启动项目才会重新
+  探测，不会自动消耗调用额度。
+- 协议错误仍只执行一次同 Intent 纠错，不计入 provider 连续健康失败。
+- 健康错误写入数据库和事件前会截断并脱敏；确认认证失败后，该次 stdout 和
+  stderr 文件会替换为固定摘要，不保留 Token 或完整认证响应。
+
+`GET /api/projects/{project_id}/providers` 返回持久化健康状态；项目详情和图快照
+也包含 `provider_health`。状态变化以 `provider.health_changed` 事件写入项目
+事件流，可通过 WebSocket 的 `after` 参数回放。未配置 `health_check` 的自定义
+provider 保持兼容，启动时显示 `unknown`，首次完整调用成功后变为 `healthy`。
 
 ## Agent 协议
 
@@ -249,7 +285,10 @@ E2E 使用本地 fake providers，不调用真实模型，不消耗模型额度�
 
 - 这是本机单进程调度平台，不是分布式任务系统。
 - 第一版没有登录、组织、共享或多用户并发编辑。
-- 服务重启会把未完成 execution 标记为 interrupted，不自动恢复外部 CLI。
+- 服务重启后首次打开项目时，会把遗留的 `planned`/`running` execution
+  幂等标记为 `interrupted`，记录 `server restarted` 事件，并把遗留的
+  `running` 项目恢复为 `idle`。恢复事件可通过 WebSocket `after` 参数重放；
+  外部 CLI 不会自动重启，必须由用户再次启动项目。
 - 最终答案共识使用规范化后的精确文本，不自动向 CTF 平台提交答案。
 - 相似 Fact 不自动合并，只保守地保留独立命题和关系。
 

@@ -3,7 +3,7 @@ import re
 from pathlib import Path
 from string import Formatter
 
-from worker.models import ProviderConfig
+from worker.models import HealthCheckConfig, ProviderConfig
 
 
 ALLOWED_PLACEHOLDERS = {"challenge_dir", "work_dir"}
@@ -28,6 +28,80 @@ def _validate_placeholders(provider_name: str, command: list[str]) -> None:
                     f"provider {provider_name!r} uses unsupported placeholder "
                     f"{field_name!r}"
                 )
+
+
+def _positive_number(value: object, field: str) -> float:
+    if (
+        not isinstance(value, (int, float))
+        or isinstance(value, bool)
+        or value <= 0
+    ):
+        raise ConfigError(f"{field} must be positive")
+    return float(value)
+
+
+def _parse_health_check(
+    raw: object,
+    provider_name: str,
+) -> HealthCheckConfig | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ConfigError(
+            f"provider {provider_name!r}.health_check must be an object"
+        )
+    command = raw.get("command")
+    if (
+        not isinstance(command, list)
+        or not command
+        or any(not isinstance(argument, str) or not argument for argument in command)
+    ):
+        raise ConfigError(
+            f"provider {provider_name!r}.health_check.command must be a "
+            "non-empty list of strings"
+        )
+    formatter = Formatter()
+    for argument in command:
+        try:
+            parsed = tuple(formatter.parse(argument))
+        except ValueError as exc:
+            raise ConfigError(
+                f"provider {provider_name!r}.health_check.command is invalid"
+            ) from exc
+        if any(field_name for _, field_name, _, _ in parsed):
+            raise ConfigError(
+                f"provider {provider_name!r}.health_check.command cannot use "
+                "placeholders"
+            )
+
+    prefix = f"provider {provider_name!r}.health_check"
+    timeout = _positive_number(raw.get("timeout_seconds"), f"{prefix}.timeout_seconds")
+    cooldown = _positive_number(
+        raw.get("cooldown_seconds"),
+        f"{prefix}.cooldown_seconds",
+    )
+    max_cooldown = _positive_number(
+        raw.get("max_cooldown_seconds", max(cooldown, 300.0)),
+        f"{prefix}.max_cooldown_seconds",
+    )
+    if max_cooldown < cooldown:
+        raise ConfigError(
+            f"{prefix}.max_cooldown_seconds must be at least cooldown_seconds"
+        )
+    failure_threshold = raw.get("failure_threshold", 3)
+    if (
+        not isinstance(failure_threshold, int)
+        or isinstance(failure_threshold, bool)
+        or failure_threshold <= 0
+    ):
+        raise ConfigError(f"{prefix}.failure_threshold must be a positive integer")
+    return HealthCheckConfig(
+        command=tuple(command),
+        timeout_seconds=timeout,
+        cooldown_seconds=cooldown,
+        max_cooldown_seconds=max_cooldown,
+        failure_threshold=failure_threshold,
+    )
 
 
 def _parse_provider(raw: object, index: int) -> ProviderConfig:
@@ -59,15 +133,10 @@ def _parse_provider(raw: object, index: int) -> ProviderConfig:
         raise ConfigError(
             f"provider {name!r}.command must be a non-empty list of strings"
         )
-    if (
-        not isinstance(timeout, (int, float))
-        or isinstance(timeout, bool)
-        or timeout <= 0
-    ):
-        raise ConfigError(f"provider {name!r}.timeout_seconds must be positive")
+    timeout = _positive_number(timeout, f"provider {name!r}.timeout_seconds")
     planning_timeout = raw.get(
         "planning_timeout_seconds",
-        min(float(timeout), 120.0),
+        min(timeout, 120.0),
     )
     if (
         not isinstance(planning_timeout, (int, float))
@@ -79,13 +148,15 @@ def _parse_provider(raw: object, index: int) -> ProviderConfig:
         )
 
     _validate_placeholders(name, command)
+    health_check = _parse_health_check(raw.get("health_check"), name)
     return ProviderConfig(
         name=name,
         enabled=enabled,
         priority=priority,
         command=tuple(command),
-        timeout_seconds=float(timeout),
+        timeout_seconds=timeout,
         planning_timeout_seconds=float(planning_timeout),
+        health_check=health_check,
     )
 
 

@@ -34,12 +34,14 @@ def create_app(
     data_root: Path | None = None,
     provider_configs: tuple[ProviderConfig, ...] = (),
     execute=None,
+    health_probe=None,
     frontend_dist: Path | None = None,
 ) -> FastAPI:
     service = ProjectService(
         (data_root or DEFAULT_DATA_ROOT).resolve(),
         provider_configs,
         execute=execute,
+        health_probe=health_probe,
     )
 
     @asynccontextmanager
@@ -91,7 +93,15 @@ def create_app(
 
     @app.get("/api/projects/{project_id}")
     def get_project(project_id: str):
-        return project_record_dict(handle(project_id).record)
+        project = handle(project_id)
+        return {
+            **project_record_dict(project.record),
+            "provider_health": list(project.store.provider_health()),
+        }
+
+    @app.get("/api/projects/{project_id}/providers")
+    def get_provider_health(project_id: str):
+        return list(handle(project_id).store.provider_health())
 
     @app.get("/api/projects/{project_id}/graph")
     def get_graph(project_id: str):
@@ -277,8 +287,9 @@ def create_app(
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return {
-            "status": "running",
+            "status": handle(project_id).record.status,
             "agents": supervisor.agent_statuses(),
+            "providers": list(supervisor.provider_health().values()),
         }
 
     @app.post("/api/projects/{project_id}/stop")

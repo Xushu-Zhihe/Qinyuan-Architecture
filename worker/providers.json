@@ -14,6 +14,13 @@
         "{work_dir}",
         "-"
       ],
+      "health_check": {
+        "command": ["codex", "--version"],
+        "timeout_seconds": 10,
+        "cooldown_seconds": 15,
+        "max_cooldown_seconds": 300,
+        "failure_threshold": 3
+      },
       "planning_timeout_seconds": 120,
       "timeout_seconds": 900
     },
@@ -28,6 +35,13 @@
         "text",
         "--dangerously-skip-permissions"
       ],
+      "health_check": {
+        "command": ["claude", "--version"],
+        "timeout_seconds": 10,
+        "cooldown_seconds": 15,
+        "max_cooldown_seconds": 300,
+        "failure_threshold": 3
+      },
       "planning_timeout_seconds": 120,
       "timeout_seconds": 900
     },
@@ -36,6 +50,13 @@
       "enabled": true,
       "priority": 80,
       "command": ["kimi", "--print"],
+      "health_check": {
+        "command": ["kimi", "--version"],
+        "timeout_seconds": 10,
+        "cooldown_seconds": 15,
+        "max_cooldown_seconds": 300,
+        "failure_threshold": 3
+      },
       "timeout_seconds": 900
     }
   ]

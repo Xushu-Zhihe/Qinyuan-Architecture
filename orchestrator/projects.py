@@ -8,6 +8,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from orchestrator.events import ProjectEventHub
+from orchestrator.health import HealthProbe
 from orchestrator.layout import LayoutStore
 from orchestrator.store import BlackboardStore
 from orchestrator.supervisor import ProjectSupervisor
@@ -198,6 +199,7 @@ class ProjectService:
         data_root: Path,
         provider_configs: tuple[ProviderConfig, ...] = (),
         execute: Callable[..., Awaitable[WorkerResult]] | None = None,
+        health_probe: HealthProbe | None = None,
     ) -> None:
         self.registry = ProjectRegistry(data_root)
         self.provider_configs = {
@@ -205,8 +207,35 @@ class ProjectService:
         }
         self.global_semaphore = asyncio.Semaphore(16)
         self.execute = execute
+        self.health_probe = health_probe
         self._handles: dict[str, ProjectHandle] = {}
         self._supervisors: dict[str, ProjectSupervisor] = {}
+
+    def _sync_project_status(self, handle: ProjectHandle) -> ProjectRecord:
+        status = str(handle.store.snapshot()["project"]["status"])
+        registry_record = self.registry.get(handle.id)
+        if registry_record.status != status:
+            registry_record = self.registry.update_status(handle.id, status)
+        handle.record = registry_record
+        return handle.record
+
+    def _set_project_status(
+        self,
+        handle: ProjectHandle,
+        status: str,
+        final_answer: str | None = None,
+    ) -> ProjectRecord:
+        handle.store.set_project_status(status, final_answer)
+        handle.record = self.registry.update_status(handle.id, status)
+        return handle.record
+
+    def _recover_project(self, handle: ProjectHandle) -> None:
+        handle.store.mark_interrupted()
+        self._sync_project_status(handle)
+        if handle.store.active_execution_count() != 0:
+            raise RuntimeError(
+                f"project {handle.id} still has active execution records"
+            )
 
     def close(self) -> None:
         for handle in self._handles.values():
@@ -255,12 +284,14 @@ class ProjectService:
             LayoutStore(record.path),
             ProjectEventHub(),
         )
+        handle.store.ensure_provider_health(record.providers)
         self._handles[record.id] = handle
         return handle
 
     def get_handle(self, project_id: str) -> ProjectHandle:
         handle = self._handles.get(project_id)
         if handle is not None:
+            self._sync_project_status(handle)
             return handle
         record = self.registry.get(project_id)
         handle = ProjectHandle(
@@ -269,16 +300,19 @@ class ProjectService:
             LayoutStore(record.path),
             ProjectEventHub(),
         )
+        handle.store.ensure_provider_health(record.providers)
         self._handles[record.id] = handle
+        self._recover_project(handle)
         return handle
 
     def list_projects(self) -> tuple[dict[str, object], ...]:
         result = []
         for record in self.registry.list():
-            snapshot = self.get_handle(record.id).store.snapshot()
+            handle = self.get_handle(record.id)
+            snapshot = handle.store.snapshot()
             result.append(
                 {
-                    **project_record_dict(record),
+                    **project_record_dict(handle.record),
                     "fact_count": sum(
                         node["type"] == "fact" for node in snapshot["nodes"]
                     ),
@@ -297,6 +331,8 @@ class ProjectService:
         ):
             return existing
         handle = self.get_handle(project_id)
+        if handle.store.active_execution_count() != 0:
+            self._recover_project(handle)
         configs = tuple(
             self.provider_configs[name]
             for name in handle.record.providers
@@ -307,6 +343,8 @@ class ProjectService:
         kwargs = {}
         if self.execute is not None:
             kwargs["execute"] = self.execute
+        if self.health_probe is not None:
+            kwargs["health_probe"] = self.health_probe
         supervisor = ProjectSupervisor(
             store=handle.store,
             providers=configs,
@@ -314,11 +352,13 @@ class ProjectService:
             project_dir=handle.record.path,
             hub=handle.hub,
             global_semaphore=self.global_semaphore,
+            project_status_writer=lambda status, final_answer: (
+                self._set_project_status(handle, status, final_answer)
+            ),
             **kwargs,
         )
         self._supervisors[project_id] = supervisor
         await supervisor.start()
-        handle.record = self.registry.update_status(project_id, "running")
         return supervisor
 
     async def stop_project(self, project_id: str) -> ProjectRecord:
@@ -326,8 +366,9 @@ class ProjectService:
         supervisor = self._supervisors.get(project_id)
         if supervisor is not None:
             await supervisor.stop()
-        handle.record = self.registry.update_status(project_id, "stopped")
-        return handle.record
+        elif handle.store.snapshot()["project"]["status"] != "achieved":
+            self._set_project_status(handle, "stopped")
+        return self._sync_project_status(handle)
 
 
 def project_record_dict(record: ProjectRecord) -> dict[str, object]:

@@ -38,6 +38,38 @@ class ProviderConfigTests(unittest.TestCase):
             self.assertEqual(providers[0].name, "codex")
             self.assertEqual(providers[0].command[-1], "-")
             self.assertEqual(providers[0].planning_timeout_seconds, 30)
+            self.assertIsNone(providers[0].health_check)
+
+    def test_loads_optional_health_check(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = self.write_config(
+                directory,
+                {
+                    "providers": [
+                        {
+                            "name": "codex",
+                            "enabled": True,
+                            "priority": 100,
+                            "command": ["codex"],
+                            "timeout_seconds": 30,
+                            "health_check": {
+                                "command": ["codex", "--version"],
+                                "timeout_seconds": 5,
+                                "cooldown_seconds": 2,
+                                "max_cooldown_seconds": 20,
+                                "failure_threshold": 4,
+                            },
+                        }
+                    ]
+                },
+            )
+
+            provider = load_provider_configs(path)[0]
+
+            self.assertIsNotNone(provider.health_check)
+            assert provider.health_check is not None
+            self.assertEqual(provider.health_check.command, ("codex", "--version"))
+            self.assertEqual(provider.health_check.failure_threshold, 4)
 
     def test_default_agents_run_with_full_vm_permissions(self) -> None:
         providers = {
@@ -59,6 +91,33 @@ class ProviderConfigTests(unittest.TestCase):
         self.assertNotIn("dontAsk", claude.command)
         self.assertEqual(codex.planning_timeout_seconds, 120)
         self.assertEqual(claude.planning_timeout_seconds, 120)
+        self.assertTrue(all(provider.health_check for provider in providers.values()))
+
+    def test_rejects_invalid_health_check_cooldown_range(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = self.write_config(
+                directory,
+                {
+                    "providers": [
+                        {
+                            "name": "codex",
+                            "enabled": True,
+                            "priority": 100,
+                            "command": ["codex"],
+                            "timeout_seconds": 30,
+                            "health_check": {
+                                "command": ["codex", "--version"],
+                                "timeout_seconds": 5,
+                                "cooldown_seconds": 10,
+                                "max_cooldown_seconds": 5,
+                            },
+                        }
+                    ]
+                },
+            )
+
+            with self.assertRaisesRegex(ConfigError, "at least cooldown_seconds"):
+                load_provider_configs(path)
 
     def test_rejects_duplicate_names(self) -> None:
         provider = {

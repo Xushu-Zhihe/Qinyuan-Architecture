@@ -189,6 +189,106 @@ class BlackboardStoreTests(StoreTestCase):
 
 
 class BlackboardExecutionTests(StoreTestCase):
+    def test_provider_health_is_persisted_redacted_and_evented(self) -> None:
+        store = self.make_store()
+        store.ensure_provider_health(("codex",))
+        sequence = int(store.snapshot()["sequence"])
+
+        record = store.set_provider_health(
+            "codex",
+            "auth_failed",
+            consecutive_failures=1,
+            last_error="token=sk-secret 403 Forbidden",
+        )
+
+        self.assertEqual(record["status"], "auth_failed")
+        self.assertNotIn("sk-secret", str(record["last_error"]))
+        self.assertEqual(
+            store.snapshot()["provider_health"][0]["status"],
+            "auth_failed",
+        )
+        events = store.events_after(sequence)
+        self.assertEqual(events[-1]["type"], "provider.health_changed")
+        self.assertNotIn("sk-secret", str(events[-1]["payload"]))
+
+    def test_open_adds_provider_health_table_to_existing_database(self) -> None:
+        store = self.make_store()
+        path = store.path
+        with store.connection:
+            store.connection.execute("DROP TABLE provider_health")
+        store.close()
+
+        reopened = BlackboardStore.open(path, store.project_id)
+        self.addCleanup(reopened.close)
+        reopened.ensure_provider_health(("codex",))
+
+        self.assertEqual(
+            reopened.provider_health_for("codex")["status"],
+            "unknown",
+        )
+
+    def test_restart_recovery_is_transactional_and_idempotent(self) -> None:
+        store, intent = self.make_store_and_intent()
+        running = store.start_execution(
+            intent.id,
+            "codex",
+            *self.execution_paths("running"),
+        )
+        planned = store.start_execution(
+            intent.id,
+            "claude",
+            *self.execution_paths("planned"),
+        )
+        completed = store.start_execution(
+            intent.id,
+            "kimi",
+            *self.execution_paths("completed"),
+        )
+        with store.connection:
+            store.connection.execute(
+                """
+                UPDATE intent_executions SET status = 'planned'
+                WHERE id = ?
+                """,
+                (planned.id,),
+            )
+        store.fail_execution(completed.id, "failed", "provider failed")
+        store.set_project_status("running")
+        sequence = int(store.snapshot()["sequence"])
+
+        recovered = store.mark_interrupted()
+
+        self.assertEqual(recovered, 2)
+        self.assertEqual(store.active_execution_count(), 0)
+        self.assertEqual(store.snapshot()["project"]["status"], "idle")
+        for execution_id in (running.id, planned.id):
+            execution = store.execution(execution_id)
+            self.assertEqual(execution["status"], "interrupted")
+            self.assertEqual(execution["error_message"], "server restarted")
+            self.assertIsNotNone(execution["finished_at"])
+        self.assertEqual(store.execution(completed.id)["status"], "failed")
+
+        events = store.events_after(sequence)
+        interrupted_events = [
+            event
+            for event in events
+            if event["type"] == "intent.execution_finished"
+        ]
+        self.assertEqual(len(interrupted_events), 2)
+        self.assertTrue(
+            all(
+                event["payload"]["error_message"] == "server restarted"
+                for event in interrupted_events
+            )
+        )
+        self.assertEqual(events[-1]["type"], "project.status_changed")
+        self.assertEqual(events[-1]["payload"]["status"], "idle")
+        self.assertEqual(events[-1]["payload"]["reason"], "server restarted")
+
+        recovered_sequence = int(store.snapshot()["sequence"])
+        self.assertEqual(store.mark_interrupted(), 0)
+        self.assertEqual(store.snapshot()["sequence"], recovered_sequence)
+
     def test_execution_output_links_fact_to_intent(self) -> None:
         store, intent = self.make_store_and_intent()
         stdout, stderr, work = self.execution_paths()

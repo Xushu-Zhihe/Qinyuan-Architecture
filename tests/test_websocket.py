@@ -5,8 +5,10 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
+from orchestrator.health import ProbeResult
+from orchestrator.models import IntentProposal
 from web.app import create_app
-from worker.models import ProviderConfig, WorkerResult
+from worker.models import HealthCheckConfig, ProviderConfig, WorkerResult
 
 
 class WebSocketTests(unittest.TestCase):
@@ -81,6 +83,73 @@ class WebSocketTests(unittest.TestCase):
             self.assertEqual(event["project_id"], alpha["id"])
             self.assertEqual(event["payload"]["type"], "fact")
 
+    def test_restart_recovery_events_are_replayed_after_sequence(self) -> None:
+        data_root = Path(self.temporary.name)
+        with TestClient(create_app(data_root)) as client:
+            project = client.post(
+                "/api/projects",
+                json=self.project_payload("Recovery"),
+            ).json()
+            project_id = str(project["id"])
+            service = client.app.state.projects
+            handle = service.get_handle(project_id)
+            fact_id = handle.store.add_human_node("fact", "Known evidence")
+            intent = handle.store.create_or_merge_intent(
+                "human",
+                IntentProposal(
+                    fact_id,
+                    handle.store.node_id("goal"),
+                    "Continue investigation",
+                ),
+            )
+            execution = handle.store.start_execution(
+                intent.id,
+                "codex",
+                "stdout.txt",
+                "stderr.txt",
+                "work",
+            )
+            handle.store.set_project_status("running")
+            service.registry.update_status(project_id, "running")
+            sequence = int(handle.store.snapshot()["sequence"])
+
+        with TestClient(create_app(data_root)) as client:
+            with client.websocket_connect(
+                f"/ws/projects/{project_id}?after={sequence}"
+            ) as socket:
+                execution_event = socket.receive_json()
+                project_event = socket.receive_json()
+
+            self.assertEqual(execution_event["project_id"], project_id)
+            self.assertEqual(
+                execution_event["type"],
+                "intent.execution_finished",
+            )
+            self.assertEqual(
+                execution_event["payload"]["execution_id"],
+                execution.id,
+            )
+            self.assertEqual(
+                execution_event["payload"]["status"],
+                "interrupted",
+            )
+            self.assertEqual(
+                execution_event["payload"]["error_message"],
+                "server restarted",
+            )
+            self.assertEqual(project_event["type"], "project.status_changed")
+            self.assertEqual(project_event["payload"]["status"], "idle")
+
+            detail = client.get(f"/api/projects/{project_id}").json()
+            graph = client.get(f"/api/projects/{project_id}/graph").json()
+            recovered = client.get(
+                f"/api/projects/{project_id}/executions/{execution.id}"
+            ).json()
+            self.assertEqual(detail["status"], "idle")
+            self.assertEqual(graph["project"]["status"], "idle")
+            self.assertEqual(recovered["status"], "interrupted")
+            self.assertEqual(recovered["error_message"], "server restarted")
+
     def test_start_and_stop_control_project_supervisor(self) -> None:
         provider = ProviderConfig("fake", True, 10, ("unused",), 5)
 
@@ -145,6 +214,63 @@ class WebSocketTests(unittest.TestCase):
             self.assertEqual(started.status_code, 202)
             self.assertEqual(stopped.status_code, 200)
             self.assertEqual(stopped.json()["status"], "stopped")
+
+    def test_provider_health_is_visible_via_api_and_websocket(self) -> None:
+        provider = ProviderConfig(
+            "missing",
+            True,
+            10,
+            ("unused",),
+            5,
+            health_check=HealthCheckConfig(
+                ("unused", "--version"),
+                1,
+                1,
+            ),
+        )
+
+        async def health_probe(config):
+            return ProbeResult("missing", "not found")
+
+        async def execute(*args, **kwargs):
+            raise AssertionError("missing provider must not execute")
+
+        app = create_app(
+            Path(self.temporary.name),
+            provider_configs=(provider,),
+            execute=execute,
+            health_probe=health_probe,
+        )
+        with TestClient(app) as client:
+            project = client.post(
+                "/api/projects",
+                json=self.project_payload("Health", ["missing"]),
+            ).json()
+            project_id = project["id"]
+            sequence = client.get(
+                f"/api/projects/{project_id}/graph"
+            ).json()["sequence"]
+
+            with client.websocket_connect(
+                f"/ws/projects/{project_id}?after={sequence}"
+            ) as socket:
+                started = client.post(f"/api/projects/{project_id}/start")
+                event = socket.receive_json()
+
+            providers = client.get(
+                f"/api/projects/{project_id}/providers"
+            ).json()
+            detail = client.get(f"/api/projects/{project_id}").json()
+            graph = client.get(f"/api/projects/{project_id}/graph").json()
+
+            self.assertEqual(started.status_code, 202)
+            self.assertEqual(started.json()["status"], "degraded")
+            self.assertEqual(started.json()["providers"][0]["status"], "missing")
+            self.assertEqual(event["type"], "provider.health_changed")
+            self.assertEqual(event["payload"]["status"], "missing")
+            self.assertEqual(providers[0]["status"], "missing")
+            self.assertEqual(detail["provider_health"][0]["status"], "missing")
+            self.assertEqual(graph["provider_health"][0]["status"], "missing")
 
 
 if __name__ == "__main__":

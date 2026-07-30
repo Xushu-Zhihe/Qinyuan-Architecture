@@ -2,6 +2,15 @@ from dataclasses import asdict, dataclass
 
 
 @dataclass(frozen=True, slots=True)
+class HealthCheckConfig:
+    command: tuple[str, ...]
+    timeout_seconds: float
+    cooldown_seconds: float
+    max_cooldown_seconds: float = 300.0
+    failure_threshold: int = 3
+
+
+@dataclass(frozen=True, slots=True)
 class ProviderConfig:
     name: str
     enabled: bool
@@ -9,6 +18,7 @@ class ProviderConfig:
     command: tuple[str, ...]
     timeout_seconds: float
     planning_timeout_seconds: float = 120.0
+    health_check: HealthCheckConfig | None = None
 
 
 @dataclass(frozen=True, slots=True)

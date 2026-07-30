@@ -65,6 +65,29 @@ class WebApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["project"]["id"], project["id"])
 
+    def test_project_status_is_consistent_across_all_read_apis(self) -> None:
+        project = self.create_project("Status")
+        project_id = str(project["id"])
+        service = self.client.app.state.projects
+        handle = service.get_handle(project_id)
+
+        for expected in ("achieved", "degraded", "idle", "stopped"):
+            answer = "flag{done}" if expected == "achieved" else None
+            handle.store.set_project_status(expected, answer)
+            service.registry.update_status(project_id, "stale-cache")
+
+            projects = self.client.get("/api/projects").json()
+            detail = self.client.get(f"/api/projects/{project_id}").json()
+            graph = self.client.get(
+                f"/api/projects/{project_id}/graph"
+            ).json()
+
+            listed = next(item for item in projects if item["id"] == project_id)
+            self.assertEqual(listed["status"], expected)
+            self.assertEqual(detail["status"], expected)
+            self.assertEqual(graph["project"]["status"], expected)
+            self.assertEqual(service.registry.get(project_id).status, expected)
+
     def test_adds_human_fact_and_intent_edge(self) -> None:
         project = self.create_project()
         project_id = project["id"]

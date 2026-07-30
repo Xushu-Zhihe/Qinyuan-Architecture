@@ -1,17 +1,46 @@
 import json
 import asyncio
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
 from orchestrator.events import ProjectEventHub
+from orchestrator.health import ProbeResult
 from orchestrator.store import BlackboardStore
 from orchestrator.supervisor import ProjectSupervisor
-from worker.models import LogChunk, ProviderConfig, WorkerResult
+from worker.models import (
+    HealthCheckConfig,
+    LogChunk,
+    ProviderConfig,
+    WorkerResult,
+)
 
 
 def provider(name: str) -> ProviderConfig:
     return ProviderConfig(name, True, 10, ("unused",), 5)
+
+
+def health_provider(
+    name: str,
+    *,
+    cooldown: float = 0.01,
+    threshold: int = 3,
+) -> ProviderConfig:
+    return ProviderConfig(
+        name,
+        True,
+        10,
+        ("unused",),
+        5,
+        health_check=HealthCheckConfig(
+            ("unused", "--version"),
+            1,
+            cooldown,
+            max(cooldown, 0.05),
+            threshold,
+        ),
+    )
 
 
 class SupervisorTests(unittest.IsolatedAsyncioTestCase):
@@ -382,6 +411,179 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(supervisor.agent_statuses()["broken"], "failed")
         self.assertEqual(supervisor.agent_statuses()["working"], "idle")
 
+    async def test_missing_provider_is_skipped_while_healthy_provider_runs(
+        self,
+    ) -> None:
+        store, root = self.make_store()
+        execution_calls: list[str] = []
+
+        async def health_probe(config):
+            if config.name == "missing":
+                return ProbeResult("missing", "not found")
+            return ProbeResult("success")
+
+        async def execute(config, request, challenge_dir, work_dir, **kwargs):
+            execution_calls.append(config.name)
+            return self.result(
+                config.name,
+                work_dir,
+                "BLACKBOARD_INTENT: "
+                + json.dumps({"action": "idle", "reason": "No work"}),
+            )
+
+        supervisor = ProjectSupervisor(
+            store=store,
+            providers=(health_provider("missing"), health_provider("healthy")),
+            challenge_dir=None,
+            project_dir=root,
+            execute=execute,
+            health_probe=health_probe,
+            max_iterations=1,
+        )
+
+        await supervisor.start()
+        await supervisor.wait_until_idle(timeout=1)
+
+        self.assertEqual(execution_calls, ["healthy"])
+        self.assertEqual(
+            store.provider_health_for("missing")["status"],
+            "missing",
+        )
+        self.assertEqual(
+            store.provider_health_for("healthy")["status"],
+            "healthy",
+        )
+        self.assertEqual(store.snapshot()["project"]["status"], "degraded")
+
+    async def test_auth_failure_stops_without_retry_and_redacts_state(self) -> None:
+        store, root = self.make_store()
+        calls = 0
+        results: list[WorkerResult] = []
+
+        async def health_probe(config):
+            return ProbeResult("success")
+
+        async def execute(config, request, challenge_dir, work_dir, **kwargs):
+            nonlocal calls
+            calls += 1
+            result = self.result(
+                config.name,
+                work_dir,
+                "403 Forbidden token=sk-secret-value",
+                status="failed",
+            )
+            results.append(result)
+            return result
+
+        supervisor = ProjectSupervisor(
+            store=store,
+            providers=(health_provider("codex"),),
+            challenge_dir=None,
+            project_dir=root,
+            execute=execute,
+            health_probe=health_probe,
+            max_iterations=5,
+        )
+
+        await supervisor.start()
+        await supervisor.wait_until_idle(timeout=1)
+
+        health = store.provider_health_for("codex")
+        self.assertEqual(calls, 1)
+        self.assertEqual(health["status"], "auth_failed")
+        self.assertNotIn("sk-secret-value", str(health["last_error"]))
+        self.assertEqual(Path(results[0].stdout_path).read_text(encoding="utf-8"), "")
+        self.assertNotIn(
+            "sk-secret-value",
+            Path(results[0].stderr_path).read_text(encoding="utf-8"),
+        )
+        self.assertEqual(store.snapshot()["project"]["status"], "degraded")
+
+    async def test_temporary_failure_cools_down_then_recovers(self) -> None:
+        store, root = self.make_store()
+        planning_times: list[float] = []
+        probes = 0
+
+        async def health_probe(config):
+            nonlocal probes
+            probes += 1
+            return ProbeResult("success")
+
+        async def execute(config, request, challenge_dir, work_dir, **kwargs):
+            planning_times.append(time.monotonic())
+            if len(planning_times) == 1:
+                return self.result(
+                    config.name,
+                    work_dir,
+                    "503 Service Unavailable",
+                    status="failed",
+                )
+            return self.result(
+                config.name,
+                work_dir,
+                "BLACKBOARD_INTENT: "
+                + json.dumps({"action": "idle", "reason": "Recovered"}),
+            )
+
+        supervisor = ProjectSupervisor(
+            store=store,
+            providers=(health_provider("codex", cooldown=0.02),),
+            challenge_dir=None,
+            project_dir=root,
+            execute=execute,
+            health_probe=health_probe,
+            max_iterations=2,
+        )
+
+        await supervisor.start()
+        await supervisor.wait_until_idle(timeout=1)
+
+        self.assertEqual(len(planning_times), 2)
+        self.assertGreaterEqual(planning_times[1] - planning_times[0], 0.015)
+        self.assertEqual(probes, 2)
+        health = store.provider_health_for("codex")
+        self.assertEqual(health["status"], "healthy")
+        self.assertEqual(health["consecutive_failures"], 0)
+        self.assertEqual(store.snapshot()["project"]["status"], "idle")
+
+    async def test_repeated_temporary_failure_reaches_circuit_threshold(
+        self,
+    ) -> None:
+        store, root = self.make_store()
+        calls = 0
+
+        async def health_probe(config):
+            return ProbeResult("success")
+
+        async def execute(config, request, challenge_dir, work_dir, **kwargs):
+            nonlocal calls
+            calls += 1
+            return self.result(
+                config.name,
+                work_dir,
+                "503 Service Unavailable",
+                status="failed",
+            )
+
+        supervisor = ProjectSupervisor(
+            store=store,
+            providers=(health_provider("codex", threshold=2),),
+            challenge_dir=None,
+            project_dir=root,
+            execute=execute,
+            health_probe=health_probe,
+            max_iterations=2,
+        )
+
+        await supervisor.start()
+        await supervisor.wait_until_idle(timeout=1)
+
+        health = store.provider_health_for("codex")
+        self.assertEqual(calls, 2)
+        self.assertEqual(health["status"], "cooldown")
+        self.assertEqual(health["consecutive_failures"], 2)
+        self.assertEqual(store.snapshot()["project"]["status"], "degraded")
+
     async def test_matching_answers_reach_consensus(self) -> None:
         store, root = self.make_store()
 
@@ -617,6 +819,9 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             [item["status"] for item in intent["executions"]],
             ["protocol_error", "protocol_error"],
         )
+        health = store.provider_health_for("codex")
+        self.assertEqual(health["status"], "unknown")
+        self.assertEqual(health["consecutive_failures"], 0)
 
     async def test_stop_cancels_active_execution_and_marks_project_stopped(self) -> None:
         store, root = self.make_store()

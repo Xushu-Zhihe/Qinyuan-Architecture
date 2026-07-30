@@ -8,7 +8,27 @@ from difflib import SequenceMatcher
 from pathlib import Path
 from uuid import uuid4
 
+from orchestrator.health import HEALTH_STATUSES, redact_error
 from orchestrator.models import IntentProposal, RELATION_EDGE_TYPES
+
+
+PROVIDER_HEALTH_SCHEMA = """
+CREATE TABLE IF NOT EXISTS provider_health (
+    provider TEXT PRIMARY KEY,
+    status TEXT NOT NULL CHECK(
+        status IN (
+            'healthy', 'unhealthy', 'auth_failed',
+            'missing', 'cooldown', 'unknown'
+        )
+    ),
+    consecutive_failures INTEGER NOT NULL DEFAULT 0
+        CHECK(consecutive_failures >= 0),
+    last_error TEXT,
+    checked_at TEXT NOT NULL,
+    cooldown_until TEXT,
+    updated_at TEXT NOT NULL
+);
+"""
 
 
 SCHEMA = """
@@ -129,7 +149,7 @@ CREATE TABLE events (
     payload_json TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
-"""
+""" + PROVIDER_HEALTH_SCHEMA
 
 
 @dataclass(frozen=True, slots=True)
@@ -194,6 +214,7 @@ class BlackboardStore:
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute("PRAGMA busy_timeout = 5000")
+        connection.executescript(PROVIDER_HEALTH_SCHEMA)
         exists = connection.execute(
             "SELECT 1 FROM projects WHERE id = ?",
             (project_id,),
@@ -1019,18 +1040,163 @@ class BlackboardStore:
             sequence = self._event(event_type, source, payload)
         return self.events_after(sequence - 1)[0]
 
-    def mark_interrupted(self) -> int:
+    def ensure_provider_health(self, providers: tuple[str, ...]) -> None:
+        now = _now()
         with self.connection:
-            cursor = self.connection.execute(
+            self.connection.executemany(
                 """
-                UPDATE intent_executions
-                SET status = 'interrupted', finished_at = ?,
-                    error_message = 'server restarted'
-                WHERE status IN ('planned', 'running')
+                INSERT OR IGNORE INTO provider_health(
+                    provider, status, consecutive_failures,
+                    checked_at, updated_at
+                ) VALUES (?, 'unknown', 0, ?, ?)
                 """,
-                (_now(),),
+                ((provider, now, now) for provider in providers),
             )
-            return int(cursor.rowcount)
+
+    def set_provider_health(
+        self,
+        provider: str,
+        status: str,
+        *,
+        consecutive_failures: int,
+        last_error: str | None = None,
+        cooldown_until: str | None = None,
+        checked_at: str | None = None,
+    ) -> dict[str, object]:
+        if status not in HEALTH_STATUSES:
+            raise ValueError(f"invalid provider health status: {status}")
+        if consecutive_failures < 0:
+            raise ValueError("consecutive_failures must be non-negative")
+        safe_error = redact_error(last_error) if last_error else None
+        checked = checked_at or _now()
+        updated = _now()
+        payload: dict[str, object] = {
+            "provider": provider,
+            "status": status,
+            "consecutive_failures": consecutive_failures,
+            "last_error": safe_error,
+            "checked_at": checked,
+            "cooldown_until": cooldown_until,
+        }
+        with self.connection:
+            self.connection.execute(
+                """
+                INSERT INTO provider_health(
+                    provider, status, consecutive_failures, last_error,
+                    checked_at, cooldown_until, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(provider) DO UPDATE SET
+                    status = excluded.status,
+                    consecutive_failures = excluded.consecutive_failures,
+                    last_error = excluded.last_error,
+                    checked_at = excluded.checked_at,
+                    cooldown_until = excluded.cooldown_until,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    provider,
+                    status,
+                    consecutive_failures,
+                    safe_error,
+                    checked,
+                    cooldown_until,
+                    updated,
+                ),
+            )
+            self._event("provider.health_changed", provider, payload)
+        return self.provider_health_for(provider)
+
+    def provider_health_for(self, provider: str) -> dict[str, object]:
+        row = self.connection.execute(
+            "SELECT * FROM provider_health WHERE provider = ?",
+            (provider,),
+        ).fetchone()
+        if row is None:
+            raise KeyError(provider)
+        return dict(row)
+
+    def provider_health(self) -> tuple[dict[str, object], ...]:
+        return tuple(
+            dict(row)
+            for row in self.connection.execute(
+                "SELECT * FROM provider_health ORDER BY provider"
+            ).fetchall()
+        )
+
+    def active_execution_count(self) -> int:
+        row = self.connection.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM intent_executions
+            WHERE status IN ('planned', 'running')
+            """
+        ).fetchone()
+        return int(row["count"])
+
+    def mark_interrupted(self) -> int:
+        now = _now()
+        recovered = 0
+        with self.connection:
+            executions = self.connection.execute(
+                """
+                SELECT id, intent_edge_id, provider
+                FROM intent_executions
+                WHERE status IN ('planned', 'running')
+                ORDER BY started_at, id
+                """
+            ).fetchall()
+            for execution in executions:
+                cursor = self.connection.execute(
+                    """
+                    UPDATE intent_executions
+                    SET status = 'interrupted', finished_at = ?,
+                        error_message = 'server restarted'
+                    WHERE id = ? AND status IN ('planned', 'running')
+                    """,
+                    (now, execution["id"]),
+                )
+                if cursor.rowcount != 1:
+                    continue
+                recovered += 1
+                self._event(
+                    "intent.execution_finished",
+                    str(execution["provider"]),
+                    {
+                        "intent_id": execution["intent_edge_id"],
+                        "execution_id": execution["id"],
+                        "status": "interrupted",
+                        "error_message": "server restarted",
+                    },
+                )
+
+            project = self.connection.execute(
+                """
+                SELECT status, final_answer FROM projects
+                WHERE id = ?
+                """,
+                (self.project_id,),
+            ).fetchone()
+            if project is None:
+                raise KeyError(self.project_id)
+            if project["status"] == "running":
+                self.connection.execute(
+                    """
+                    UPDATE projects
+                    SET status = 'idle', updated_at = ?
+                    WHERE id = ? AND status = 'running'
+                    """,
+                    (now, self.project_id),
+                )
+                self._event(
+                    "project.status_changed",
+                    "orchestrator",
+                    {
+                        "status": "idle",
+                        "final_answer": project["final_answer"],
+                        "reason": "server restarted",
+                    },
+                )
+        return recovered
 
     def set_project_status(
         self,
@@ -1182,6 +1348,7 @@ class BlackboardStore:
             "project": dict(project_row),
             "nodes": nodes,
             "edges": edges,
+            "provider_health": list(self.provider_health()),
             "candidates": list(self.candidates()),
             "highest_generation": highest_generation,
             "sequence": int(sequence_row["sequence"]),

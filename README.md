@@ -151,11 +151,19 @@ Vite 默认地址为 `http://127.0.0.1:5173`，并将 `/api` 和 `/ws` 代理到
 
 ```json
 {
+  "coordinator": {
+    "max_global_running": 16,
+    "max_project_running": 4,
+    "max_global_planning": 4,
+    "max_project_planning": 2,
+    "aging_seconds": 30
+  },
   "providers": [
     {
       "name": "codex",
       "enabled": true,
       "priority": 100,
+      "max_running": 4,
       "command": [
         "codex",
         "exec",
@@ -184,7 +192,8 @@ Vite 默认地址为 `http://127.0.0.1:5173`，并将 `/api` 和 `/ws` 代理到
 | --- | --- |
 | `name` | provider 名称和执行目录标识 |
 | `enabled` | 是否可被项目选择 |
-| `priority` | 保留的配置元数据，不参与事实可信度判断 |
+| `priority` | 同一项目许可队列中的基础优先级；不参与事实可信度判断 |
+| `max_running` | 该 provider 跨项目同时占用的最大许可数；默认 4 |
 | `command` | 参数数组；不经过 shell 解释 |
 | `health_check.command` | 可选启动前探测命令；不接收 prompt 或路径占位符 |
 | `health_check.timeout_seconds` | 单次健康探测超时 |
@@ -195,6 +204,28 @@ Vite 默认地址为 `http://127.0.0.1:5173`，并将 `/api` 和 `/ws` 代理到
 | `timeout_seconds` | Intent 执行调用超时 |
 
 支持 `{work_dir}` 和 `{challenge_dir}` 占位符。prompt 通过 stdin 发送，CLI 认证由各 provider 自己管理，平台不读取或保存 API Key。
+
+### 执行配额与公平调度
+
+Web 服务中的项目共享一个 `ExecutionCoordinator`。它只决定外部 CLI 调用何时
+获得运行许可，不读取图内容、不生成 Intent，也不改变各 provider 的独立规划：
+
+| 字段 | 说明 |
+| --- | --- |
+| `coordinator.max_global_running` | 全部项目合计的规划和执行调用上限；默认 16 |
+| `coordinator.max_project_running` | 单项目规划和执行调用上限；默认 4 |
+| `coordinator.max_global_planning` | 全部项目合计的规划调用上限；默认 4 |
+| `coordinator.max_project_planning` | 单项目规划调用上限；默认 2 |
+| `coordinator.aging_seconds` | 排队每经过该秒数增加一个有效优先级；默认 30 |
+
+- 规划和 Intent execution 分别计数；规划上限为 execution 保留可用容量。
+- 项目之间按轮转顺序获得许可，同一项目达到上限后会让出全局容量。
+- 同一项目内先比较 provider `priority`，再叠加等待 aging；低优先级请求不会
+  因持续到达的高优先级请求而永久饥饿。
+- `missing`、`auth_failed`、`unhealthy` 或仍在 cooldown 的 provider 不进入
+  许可队列。项目停止或任务取消时，排队请求会移除，已获得的许可会在退出路径释放。
+- 省略 `coordinator` 或 `max_running` 时使用上述兼容默认值；所有配额必须为
+  正整数，项目配额不能高于全局配额。
 
 ### Provider 健康状态
 

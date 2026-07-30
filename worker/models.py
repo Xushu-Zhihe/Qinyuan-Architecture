@@ -2,6 +2,15 @@ from dataclasses import asdict, dataclass
 
 
 @dataclass(frozen=True, slots=True)
+class CoordinatorConfig:
+    max_global_running: int = 16
+    max_project_running: int = 4
+    max_global_planning: int = 4
+    max_project_planning: int = 2
+    aging_seconds: float = 30.0
+
+
+@dataclass(frozen=True, slots=True)
 class HealthCheckConfig:
     command: tuple[str, ...]
     timeout_seconds: float
@@ -19,6 +28,7 @@ class ProviderConfig:
     timeout_seconds: float
     planning_timeout_seconds: float = 120.0
     health_check: HealthCheckConfig | None = None
+    max_running: int = 4
 
 
 @dataclass(frozen=True, slots=True)

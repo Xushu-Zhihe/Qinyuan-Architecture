@@ -5,7 +5,11 @@ from pathlib import Path
 from typing import Callable, Sequence
 
 from orchestrator.scheduler import run_orchestration
-from worker.config import ConfigError, load_provider_configs
+from worker.config import (
+    ConfigError,
+    load_coordinator_config,
+    load_provider_configs,
+)
 
 
 DEFAULT_CONFIG = Path(__file__).resolve().parent / "worker" / "providers.json"
@@ -70,6 +74,7 @@ def run_cli(
 
     try:
         providers = load_provider_configs(args.config.resolve())
+        coordinator_config = load_coordinator_config(args.config.resolve())
         result = asyncio.run(
             run_orchestration(
                 providers=providers,
@@ -81,6 +86,7 @@ def run_cli(
                 challenge_dir=challenge_dir,
                 runs_root=DEFAULT_RUNS_ROOT,
                 max_iterations=args.max_iterations,
+                coordinator_config=coordinator_config,
             )
         )
     except ConfigError as exc:

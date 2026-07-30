@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from uuid import uuid4
 
+from orchestrator.coordinator import ExecutionCoordinator, PermitCancelled
 from orchestrator.events import ProjectEventHub
 from orchestrator.health import (
     TERMINAL_HEALTH_STATUSES,
@@ -49,6 +50,7 @@ class ProjectSupervisor:
         project_dir: Path,
         hub: ProjectEventHub | None = None,
         execute: Executor = execute_provider,
+        coordinator: ExecutionCoordinator | None = None,
         global_semaphore: asyncio.Semaphore | None = None,
         max_iterations: int | None = None,
         failure_threshold: int = 3,
@@ -66,7 +68,10 @@ class ProjectSupervisor:
         self.project_dir = project_dir
         self.hub = hub or ProjectEventHub()
         self.execute = execute
-        self.global_semaphore = global_semaphore or asyncio.Semaphore(1024)
+        self.coordinator = coordinator
+        self.global_semaphore = global_semaphore
+        if self.coordinator is None and self.global_semaphore is None:
+            self.coordinator = ExecutionCoordinator()
         self.max_iterations = max_iterations
         self.failure_threshold = failure_threshold
         self.idle_poll_interval = idle_poll_interval
@@ -306,9 +311,11 @@ class ProjectSupervisor:
         provider: ProviderConfig,
         request: str,
         work_dir: Path,
+        *,
+        kind: str,
         on_chunk=None,
     ) -> WorkerResult:
-        async with self.global_semaphore:
+        async def run() -> WorkerResult:
             return await self.execute(
                 provider,
                 request,
@@ -317,6 +324,42 @@ class ProjectSupervisor:
                 on_chunk=on_chunk,
                 cancel_event=self.cancel_event,
             )
+
+        try:
+            if self.coordinator is not None:
+                async with self.coordinator.permit(
+                    project_id=self.store.project_id,
+                    provider=provider.name,
+                    kind=kind,
+                    priority=provider.priority,
+                    provider_limit=provider.max_running,
+                    cancel_event=self.cancel_event,
+                ):
+                    if self.cancel_event.is_set():
+                        return self._cancelled_result(provider, work_dir)
+                    return await run()
+            assert self.global_semaphore is not None
+            async with self.global_semaphore:
+                return await run()
+        except PermitCancelled:
+            return self._cancelled_result(provider, work_dir)
+
+    @staticmethod
+    def _cancelled_result(
+        provider: ProviderConfig,
+        work_dir: Path,
+    ) -> WorkerResult:
+        return WorkerResult(
+            provider=provider.name,
+            priority=provider.priority,
+            status="cancelled",
+            exit_code=None,
+            duration_seconds=0.0,
+            output="",
+            stdout_path=str((work_dir / "stdout.txt").resolve()),
+            stderr_path=str((work_dir / "stderr.txt").resolve()),
+            work_dir=str(work_dir.resolve()),
+        )
 
     async def _mark_protocol_failure(self, provider: str) -> None:
         self._failures[provider] += 1
@@ -349,6 +392,7 @@ class ProjectSupervisor:
             ),
             render_intent_request(snapshot, self.challenge_dir),
             planning_dir,
+            kind="planning",
         )
         if planning.status != "success":
             if planning.status == "cancelled":
@@ -487,6 +531,7 @@ class ProjectSupervisor:
                 rejected_result_line=rejected_result_line,
             ),
             execution_dir,
+            kind="execution",
             on_chunk=on_chunk,
         )
         if result.status != "success":

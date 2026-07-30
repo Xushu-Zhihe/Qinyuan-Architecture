@@ -3,7 +3,7 @@ import re
 from pathlib import Path
 from string import Formatter
 
-from worker.models import HealthCheckConfig, ProviderConfig
+from worker.models import CoordinatorConfig, HealthCheckConfig, ProviderConfig
 
 
 ALLOWED_PLACEHOLDERS = {"challenge_dir", "work_dir"}
@@ -38,6 +38,16 @@ def _positive_number(value: object, field: str) -> float:
     ):
         raise ConfigError(f"{field} must be positive")
     return float(value)
+
+
+def _positive_integer(value: object, field: str) -> int:
+    if (
+        not isinstance(value, int)
+        or isinstance(value, bool)
+        or value <= 0
+    ):
+        raise ConfigError(f"{field} must be a positive integer")
+    return value
 
 
 def _parse_health_check(
@@ -149,6 +159,10 @@ def _parse_provider(raw: object, index: int) -> ProviderConfig:
 
     _validate_placeholders(name, command)
     health_check = _parse_health_check(raw.get("health_check"), name)
+    max_running = _positive_integer(
+        raw.get("max_running", 4),
+        f"provider {name!r}.max_running",
+    )
     return ProviderConfig(
         name=name,
         enabled=enabled,
@@ -157,10 +171,11 @@ def _parse_provider(raw: object, index: int) -> ProviderConfig:
         timeout_seconds=timeout,
         planning_timeout_seconds=float(planning_timeout),
         health_check=health_check,
+        max_running=max_running,
     )
 
 
-def load_provider_configs(path: Path) -> tuple[ProviderConfig, ...]:
+def _load_payload(path: Path) -> dict[str, object]:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except OSError as exc:
@@ -170,6 +185,66 @@ def load_provider_configs(path: Path) -> tuple[ProviderConfig, ...]:
 
     if not isinstance(payload, dict) or not isinstance(payload.get("providers"), list):
         raise ConfigError("provider config must contain a providers list")
+    return payload
+
+
+def load_coordinator_config(path: Path) -> CoordinatorConfig:
+    payload = _load_payload(path)
+    raw = payload.get("coordinator", {})
+    if not isinstance(raw, dict):
+        raise ConfigError("coordinator must be an object")
+    defaults = CoordinatorConfig()
+    max_global_running = _positive_integer(
+        raw.get("max_global_running", defaults.max_global_running),
+        "coordinator.max_global_running",
+    )
+    max_project_running = _positive_integer(
+        raw.get(
+            "max_project_running",
+            min(defaults.max_project_running, max_global_running),
+        ),
+        "coordinator.max_project_running",
+    )
+    max_global_planning = _positive_integer(
+        raw.get(
+            "max_global_planning",
+            min(defaults.max_global_planning, max_global_running),
+        ),
+        "coordinator.max_global_planning",
+    )
+    config = CoordinatorConfig(
+        max_global_running=max_global_running,
+        max_project_running=max_project_running,
+        max_global_planning=max_global_planning,
+        max_project_planning=_positive_integer(
+            raw.get(
+                "max_project_planning",
+                min(defaults.max_project_planning, max_project_running),
+            ),
+            "coordinator.max_project_planning",
+        ),
+        aging_seconds=_positive_number(
+            raw.get("aging_seconds", defaults.aging_seconds),
+            "coordinator.aging_seconds",
+        ),
+    )
+    if config.max_project_running > config.max_global_running:
+        raise ConfigError(
+            "coordinator.max_project_running cannot exceed max_global_running"
+        )
+    if config.max_global_planning > config.max_global_running:
+        raise ConfigError(
+            "coordinator.max_global_planning cannot exceed max_global_running"
+        )
+    if config.max_project_planning > config.max_project_running:
+        raise ConfigError(
+            "coordinator.max_project_planning cannot exceed max_project_running"
+        )
+    return config
+
+
+def load_provider_configs(path: Path) -> tuple[ProviderConfig, ...]:
+    payload = _load_payload(path)
 
     providers = tuple(
         _parse_provider(raw, index)

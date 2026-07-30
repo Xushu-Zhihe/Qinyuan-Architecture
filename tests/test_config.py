@@ -3,7 +3,11 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from worker.config import ConfigError, load_provider_configs
+from worker.config import (
+    ConfigError,
+    load_coordinator_config,
+    load_provider_configs,
+)
 
 
 DEFAULT_PROVIDERS = Path(__file__).resolve().parents[1] / "worker" / "providers.json"
@@ -70,6 +74,95 @@ class ProviderConfigTests(unittest.TestCase):
             assert provider.health_check is not None
             self.assertEqual(provider.health_check.command, ("codex", "--version"))
             self.assertEqual(provider.health_check.failure_threshold, 4)
+
+    def test_loads_coordinator_and_provider_limits(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = self.write_config(
+                directory,
+                {
+                    "coordinator": {
+                        "max_global_running": 8,
+                        "max_project_running": 3,
+                        "max_global_planning": 2,
+                        "max_project_planning": 1,
+                        "aging_seconds": 5,
+                    },
+                    "providers": [
+                        {
+                            "name": "codex",
+                            "enabled": True,
+                            "priority": 100,
+                            "max_running": 2,
+                            "command": ["codex"],
+                            "timeout_seconds": 30,
+                        }
+                    ],
+                },
+            )
+
+            coordinator = load_coordinator_config(path)
+            provider = load_provider_configs(path)[0]
+
+            self.assertEqual(coordinator.max_global_running, 8)
+            self.assertEqual(coordinator.max_project_running, 3)
+            self.assertEqual(coordinator.max_global_planning, 2)
+            self.assertEqual(coordinator.max_project_planning, 1)
+            self.assertEqual(coordinator.aging_seconds, 5)
+            self.assertEqual(provider.max_running, 2)
+
+    def test_rejects_invalid_coordinator_limit_relationships(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = self.write_config(
+                directory,
+                {
+                    "coordinator": {
+                        "max_global_running": 2,
+                        "max_project_running": 3,
+                    },
+                    "providers": [],
+                },
+            )
+
+            with self.assertRaisesRegex(ConfigError, "cannot exceed"):
+                load_coordinator_config(path)
+
+    def test_smaller_global_limit_bounds_omitted_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = self.write_config(
+                directory,
+                {
+                    "coordinator": {"max_global_running": 2},
+                    "providers": [],
+                },
+            )
+
+            coordinator = load_coordinator_config(path)
+
+            self.assertEqual(coordinator.max_global_running, 2)
+            self.assertEqual(coordinator.max_project_running, 2)
+            self.assertEqual(coordinator.max_global_planning, 2)
+            self.assertEqual(coordinator.max_project_planning, 2)
+
+    def test_rejects_non_positive_provider_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = self.write_config(
+                directory,
+                {
+                    "providers": [
+                        {
+                            "name": "codex",
+                            "enabled": True,
+                            "priority": 100,
+                            "max_running": 0,
+                            "command": ["codex"],
+                            "timeout_seconds": 30,
+                        }
+                    ]
+                },
+            )
+
+            with self.assertRaisesRegex(ConfigError, "max_running"):
+                load_provider_configs(path)
 
     def test_default_agents_run_with_full_vm_permissions(self) -> None:
         providers = {

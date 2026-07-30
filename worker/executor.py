@@ -76,6 +76,23 @@ async def _read_stream(
     return "".join(parts)
 
 
+async def _write_stdin(
+    stream: asyncio.StreamWriter,
+    request: str,
+) -> None:
+    try:
+        stream.write(request.encode("utf-8"))
+        await stream.drain()
+    except (BrokenPipeError, ConnectionResetError):
+        pass
+    finally:
+        stream.close()
+        try:
+            await stream.wait_closed()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+
 async def _terminate_process_tree(process: asyncio.subprocess.Process) -> None:
     if process.returncode is not None:
         return
@@ -166,10 +183,7 @@ async def execute_provider(
         assert process.stdin is not None
         assert process.stdout is not None
         assert process.stderr is not None
-        process.stdin.write(request.encode("utf-8"))
-        await process.stdin.drain()
-        process.stdin.close()
-
+        stdin_task = asyncio.create_task(_write_stdin(process.stdin, request))
         stdout_task = asyncio.create_task(
             _read_stream(process.stdout, "stdout", stdout_path, on_chunk)
         )
@@ -209,6 +223,7 @@ async def execute_provider(
 
         if not wait_task.done():
             await wait_task
+        await asyncio.gather(stdin_task, return_exceptions=True)
         if cancel_task is not None and not cancel_task.done():
             cancel_task.cancel()
             await asyncio.gather(cancel_task, return_exceptions=True)

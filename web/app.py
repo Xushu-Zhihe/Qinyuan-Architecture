@@ -23,7 +23,7 @@ from web.schemas import (
     NodeCreate,
     ProjectCreate,
 )
-from worker.models import ProviderConfig
+from worker.models import CoordinatorConfig, ProviderConfig
 
 
 DEFAULT_DATA_ROOT = Path(__file__).resolve().parents[1] / "web-data"
@@ -35,6 +35,7 @@ def create_app(
     provider_configs: tuple[ProviderConfig, ...] = (),
     execute=None,
     health_probe=None,
+    coordinator_config: CoordinatorConfig | None = None,
     frontend_dist: Path | None = None,
 ) -> FastAPI:
     service = ProjectService(
@@ -42,6 +43,7 @@ def create_app(
         provider_configs,
         execute=execute,
         health_probe=health_probe,
+        coordinator_config=coordinator_config,
     )
 
     @asynccontextmanager

@@ -1,9 +1,17 @@
 {
+  "coordinator": {
+    "max_global_running": 16,
+    "max_project_running": 4,
+    "max_global_planning": 4,
+    "max_project_planning": 2,
+    "aging_seconds": 30
+  },
   "providers": [
     {
       "name": "codex",
       "enabled": true,
       "priority": 100,
+      "max_running": 4,
       "command": [
         "codex",
         "exec",
@@ -28,6 +36,7 @@
       "name": "claude",
       "enabled": true,
       "priority": 90,
+      "max_running": 4,
       "command": [
         "claude",
         "-p",
@@ -49,6 +58,7 @@
       "name": "kimi",
       "enabled": true,
       "priority": 80,
+      "max_running": 4,
       "command": ["kimi", "--print"],
       "health_check": {
         "command": ["kimi", "--version"],

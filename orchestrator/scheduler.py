@@ -3,11 +3,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 
+from orchestrator.coordinator import ExecutionCoordinator
 from orchestrator.models import OrchestrationResult
 from orchestrator.store import BlackboardStore
 from orchestrator.supervisor import ProjectSupervisor
 from worker.executor import execute_provider
-from worker.models import ProviderConfig, WorkerResult
+from worker.models import CoordinatorConfig, ProviderConfig, WorkerResult
 
 
 Executor = Callable[..., Awaitable[WorkerResult]]
@@ -27,6 +28,7 @@ async def run_orchestration(
     runs_root: Path,
     max_iterations: int = 5,
     execute: Executor = execute_provider,
+    coordinator_config: CoordinatorConfig | None = None,
 ) -> OrchestrationResult:
     project_id = _new_project_id()
     run_dir = runs_root / project_id
@@ -51,6 +53,7 @@ async def run_orchestration(
         challenge_dir=challenge_dir,
         project_dir=run_dir,
         execute=execute,
+        coordinator=ExecutionCoordinator(coordinator_config),
         max_iterations=max_iterations,
     )
     try:

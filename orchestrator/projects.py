@@ -1,19 +1,18 @@
 import json
 import sqlite3
-import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 
+from orchestrator.coordinator import ExecutionCoordinator
 from orchestrator.events import ProjectEventHub
 from orchestrator.health import HealthProbe
 from orchestrator.layout import LayoutStore
 from orchestrator.store import BlackboardStore
 from orchestrator.supervisor import ProjectSupervisor
-from worker.models import ProviderConfig
-from worker.models import WorkerResult
+from worker.models import CoordinatorConfig, ProviderConfig, WorkerResult
 
 
 REGISTRY_SCHEMA = """
@@ -200,12 +199,13 @@ class ProjectService:
         provider_configs: tuple[ProviderConfig, ...] = (),
         execute: Callable[..., Awaitable[WorkerResult]] | None = None,
         health_probe: HealthProbe | None = None,
+        coordinator_config: CoordinatorConfig | None = None,
     ) -> None:
         self.registry = ProjectRegistry(data_root)
         self.provider_configs = {
             provider.name: provider for provider in provider_configs
         }
-        self.global_semaphore = asyncio.Semaphore(16)
+        self.coordinator = ExecutionCoordinator(coordinator_config)
         self.execute = execute
         self.health_probe = health_probe
         self._handles: dict[str, ProjectHandle] = {}
@@ -351,7 +351,7 @@ class ProjectService:
             challenge_dir=handle.record.challenge_path,
             project_dir=handle.record.path,
             hub=handle.hub,
-            global_semaphore=self.global_semaphore,
+            coordinator=self.coordinator,
             project_status_writer=lambda status, final_answer: (
                 self._set_project_status(handle, status, final_answer)
             ),

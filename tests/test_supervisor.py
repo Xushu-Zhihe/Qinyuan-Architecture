@@ -5,11 +5,13 @@ import time
 import unittest
 from pathlib import Path
 
+from orchestrator.coordinator import ExecutionCoordinator
 from orchestrator.events import ProjectEventHub
 from orchestrator.health import ProbeResult
 from orchestrator.store import BlackboardStore
 from orchestrator.supervisor import ProjectSupervisor
 from worker.models import (
+    CoordinatorConfig,
     HealthCheckConfig,
     LogChunk,
     ProviderConfig,
@@ -870,6 +872,65 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             if edge["type"] == "intent"
         )
         self.assertEqual(intent["executions"][0]["status"], "cancelled")
+
+    async def test_stop_removes_planning_waiter_without_calling_provider(self) -> None:
+        store, root = self.make_store()
+        coordinator = ExecutionCoordinator(
+            CoordinatorConfig(
+                max_global_running=1,
+                max_project_running=1,
+                max_global_planning=1,
+                max_project_planning=1,
+                aging_seconds=1,
+            )
+        )
+        blocker_started = asyncio.Event()
+        blocker_release = asyncio.Event()
+        execute_called = False
+
+        async def hold_capacity() -> None:
+            async with coordinator.permit(
+                project_id="other-project",
+                provider="other-provider",
+                kind="execution",
+                priority=1,
+                provider_limit=1,
+            ):
+                blocker_started.set()
+                await blocker_release.wait()
+
+        async def execute(config, request, challenge_dir, work_dir, **kwargs):
+            nonlocal execute_called
+            execute_called = True
+            raise AssertionError("cancelled planning waiter called provider")
+
+        blocker = asyncio.create_task(hold_capacity())
+        await blocker_started.wait()
+        supervisor = ProjectSupervisor(
+            store=store,
+            providers=(provider("codex"),),
+            challenge_dir=None,
+            project_dir=root,
+            execute=execute,
+            coordinator=coordinator,
+        )
+        await supervisor.start()
+        for _ in range(100):
+            if (await coordinator.snapshot())["pending"]["total"] == 1:
+                break
+            await asyncio.sleep(0)
+        else:
+            self.fail("planning call did not enter the coordinator queue")
+
+        await asyncio.wait_for(supervisor.stop(), timeout=1)
+        snapshot = await coordinator.snapshot()
+        self.assertFalse(execute_called)
+        self.assertEqual(store.snapshot()["project"]["status"], "stopped")
+        self.assertEqual(snapshot["pending"]["total"], 0)
+        self.assertEqual(snapshot["running"]["global"], 1)
+
+        blocker_release.set()
+        await blocker
 
 
 if __name__ == "__main__":

@@ -97,7 +97,7 @@ class StreamingExecutorTests(unittest.IsolatedAsyncioTestCase):
                 "import time;print('before timeout',flush=True);time.sleep(10)",
                 timeout=0.1,
             ),
-            "request",
+            "request" * 100_000,
             None,
             self.make_work_dir(),
         )
@@ -112,7 +112,7 @@ class StreamingExecutorTests(unittest.IsolatedAsyncioTestCase):
     async def test_records_non_zero_exit(self) -> None:
         result = await execute_provider(
             provider_for("import sys;print('bad',file=sys.stderr);sys.exit(7)"),
-            "request",
+            "request" * 100_000,
             None,
             self.make_work_dir(),
         )

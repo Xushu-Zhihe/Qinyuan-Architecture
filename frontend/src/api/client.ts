@@ -8,6 +8,7 @@ import type {
   ProjectSummary,
   RuntimeSnapshot,
   SyncedExecutionLogs,
+  AutopilotSnapshot,
 } from '../types'
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -95,4 +96,11 @@ export const api = {
   planningAttempts: (projectId: string) =>
     request<PlanningAttempt[]>(`/api/projects/${projectId}/planning-attempts`),
   auditExportUrl: (projectId: string) => `/api/projects/${projectId}/audit/export`,
+  getAutopilot: () => request<AutopilotSnapshot>('/api/autopilot'),
+  startAutopilot: (payload: object) =>
+    request<AutopilotSnapshot>('/api/autopilot/start', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+  stopAutopilot: () => request<AutopilotSnapshot>('/api/autopilot/stop', { method: 'POST' }),
 }

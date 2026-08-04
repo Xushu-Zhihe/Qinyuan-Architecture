@@ -239,3 +239,34 @@ export interface RuntimeSnapshot {
   projects: RuntimeProject[]
   active_tasks: RuntimeTask[]
 }
+
+export interface AutoHistoryEntry {
+  external_id: string
+  name: string
+  project_id: string
+  answer: string
+  status: string
+  message: string | null
+}
+
+export interface AutoSession {
+  id: string
+  status: string
+  controller_provider: string
+  solver_providers: string[]
+  available_providers: string[]
+  agent_limit: number
+  max_tasks: number
+  completed_tasks: number
+  current_external_id: string | null
+  current_task_name: string | null
+  current_project_id: string | null
+  last_message: string | null
+  last_error: string | null
+  history: AutoHistoryEntry[]
+}
+
+export interface AutopilotSnapshot {
+  session: AutoSession | null
+  providers: string[]
+}

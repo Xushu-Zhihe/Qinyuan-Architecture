@@ -14,6 +14,16 @@ class ProjectCreate(BaseModel):
     challenge_path: str | None = None
 
 
+class AutoStart(BaseModel):
+    platform_prompt: str = Field(min_length=1)
+    controller_provider: str = Field(min_length=1)
+    solver_providers: list[str] = Field(min_length=1)
+    agent_limit: int = Field(default=2, ge=1, le=16)
+    max_tasks: int = Field(default=10, ge=1, le=1000)
+    task_timeout_minutes: float = Field(default=60, gt=0, le=1440)
+    controller_timeout_seconds: float = Field(default=300, gt=0, le=3600)
+
+
 class NodeCreate(BaseModel):
     type: Literal["fact", "hint"]
     content: str = Field(min_length=1)

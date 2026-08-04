@@ -14,6 +14,8 @@ from fastapi import (
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
+from autopilot.manager import AutoManager, AutoManagerError
+from autopilot.models import AutoStartConfig
 from orchestrator.audit import export_audit_bundle, read_log_page
 from orchestrator.layout import LayoutConflict
 from orchestrator.models import IntentProposal
@@ -28,6 +30,7 @@ from web.schemas import (
     LayoutUpdate,
     NodeCreate,
     ProjectCreate,
+    AutoStart as AutoStartConfigPayload,
 )
 from worker.models import AuditConfig, CoordinatorConfig, ProviderConfig
 
@@ -53,14 +56,22 @@ def create_app(
         coordinator_config=coordinator_config,
         audit_config=audit_config,
     )
+    autopilot = AutoManager(
+        service=service,
+        provider_configs=provider_configs,
+        execute=execute,
+        audit_config=audit_config,
+    )
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         yield
+        await autopilot.aclose()
         await service.aclose()
 
     app = FastAPI(title="Blackboard", lifespan=lifespan)
     app.state.projects = service
+    app.state.autopilot = autopilot
     dist_root = (frontend_dist or DEFAULT_FRONTEND_DIST).resolve()
     index_file = dist_root / "index.html"
     assets_root = dist_root / "assets"
@@ -147,6 +158,33 @@ def create_app(
     @app.get("/api/runtime")
     async def get_runtime():
         return await service.runtime_snapshot()
+
+    @app.get("/api/autopilot")
+    async def get_autopilot():
+        return await autopilot.snapshot()
+
+    @app.post("/api/autopilot/start", status_code=status.HTTP_202_ACCEPTED)
+    async def start_autopilot(payload: AutoStartConfigPayload):
+        try:
+            config = AutoStartConfig(
+                platform_prompt=payload.platform_prompt,
+                controller_provider=payload.controller_provider,
+                solver_providers=tuple(payload.solver_providers),
+                agent_limit=payload.agent_limit,
+                max_tasks=payload.max_tasks,
+                task_timeout_seconds=payload.task_timeout_minutes * 60,
+                controller_timeout_seconds=payload.controller_timeout_seconds,
+            )
+            return await autopilot.start(config)
+        except AutoManagerError as exc:
+            code = 409 if "already running" in str(exc) else 400
+            raise HTTPException(status_code=code, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/api/autopilot/stop")
+    async def stop_autopilot():
+        return await autopilot.stop()
 
     @app.delete(
         "/api/projects/{project_id}",

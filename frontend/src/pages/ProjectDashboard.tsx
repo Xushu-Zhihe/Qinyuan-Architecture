@@ -1,4 +1,4 @@
-import { Plus, Search, Trash2, X } from 'lucide-react'
+import { Bot, Plus, Search, Trash2, X } from 'lucide-react'
 import { useMemo, useState } from 'react'
 
 import { ProjectCard } from '../components/ProjectCard'
@@ -13,12 +13,14 @@ export function ProjectDashboard({
   onCreate,
   onDelete,
   runtime,
+  onOpenAutopilot,
 }: {
   projects: ProjectSummary[]
   onOpen: (id: string) => void
   onCreate: () => void
   onDelete: (projectId: string) => Promise<void>
   runtime: RuntimeSnapshot | null
+  onOpenAutopilot: () => void
 }) {
   const [filter, setFilter] = useState<Filter>('all')
   const [query, setQuery] = useState('')
@@ -59,9 +61,14 @@ export function ProjectDashboard({
           <div className="brand">BLACKBOARD</div>
           <p>{projects.filter(project => project.status === 'running').length} 个项目运行中</p>
         </div>
-        <button className="primary-button" onClick={onCreate}>
-          <Plus size={18} /> 新建项目
-        </button>
+        <div className="dashboard-header__actions">
+          <button className="secondary-button" onClick={onOpenAutopilot}>
+            <Bot size={18} /> 全自动模式
+          </button>
+          <button className="primary-button" onClick={onCreate}>
+            <Plus size={18} /> 新建项目
+          </button>
+        </div>
       </header>
       <RuntimeOverview runtime={runtime} />
       <section className="dashboard-controls" aria-label="项目筛选">

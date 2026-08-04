@@ -45,6 +45,7 @@ describe('ProjectDashboard', () => {
         onOpen={onOpen}
         onCreate={() => {}}
         onDelete={async () => {}}
+        onOpenAutopilot={() => {}}
       />,
     )
 
@@ -64,6 +65,7 @@ describe('ProjectDashboard', () => {
         onOpen={onOpen}
         onCreate={() => {}}
         onDelete={onDelete}
+        onOpenAutopilot={() => {}}
       />,
     )
 
@@ -83,6 +85,7 @@ describe('ProjectDashboard', () => {
         onOpen={() => {}}
         onCreate={() => {}}
         onDelete={async () => { throw new Error('project still has active work') }}
+        onOpenAutopilot={() => {}}
       />,
     )
 

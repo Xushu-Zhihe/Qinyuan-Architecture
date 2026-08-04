@@ -20,6 +20,7 @@ Web 工作区使用节点表示 `Goal`、`Origin`、`Fact` 和 `Hint`，使用�
 - 从全局运行面板查看配额、排队任务、活动任务和 provider 健康状态。
 - 在项目诊断侧栏筛选规划/执行记录、查看日志、人工重试和受控重新打开项目。
 - 同时运行多个相互隔离的项目。
+- 在“全自动答题”页面粘贴平台 API prompt，由控制器 LLM 逐题取题和提交；每题自动创建独立黑板项目，只有平台确认接受后才进入下一题。
 - 项目可安全移入 `web-data/.trash/`，不会触碰外部 `challenge_path` 或 workspace。
 - 编辑模式可归档/恢复人工 Fact、Hint，并删除没有执行历史的边；浏览模式为只读。
 - 通过 FastAPI 提供 REST、WebSocket 和生产前端静态资源。
@@ -178,6 +179,12 @@ Vite 默认地址为 `http://127.0.0.1:5173`，并将 `/api` 和 `/ws` 代理到
 ### 立即启动 Agent
 
 创建项目后立即启动所选 provider。每个 provider 异步规划和执行，页面实时显示项目状态、Intent execution 和日志。
+
+### 全自动答题
+
+打开首页的“全自动模式”进入 `/auto`。在平台 API prompt 中提供题目接口、提交接口和认证信息，选择一个控制器 provider 与解题 provider，设置题数和超时后启动。控制器只返回严格的 `AUTOPILOT_RESULT` JSON：先取下一题，再等待对应黑板项目达到 `achieved`，提交 `final_answer`，平台返回 `accepted` 后继续下一题；`rejected`、超时、协议错误或项目 `degraded` 会暂停并显示失败状态。
+
+控制器 prompt、认证信息和临时控制器日志只在活动会话内存中使用，不写入项目数据库、会话快照或浏览器存储。控制器下载的附件会被移动到该题的受管 challenge 目录，随后每题项目仍可独立打开和审计。对应接口为 `GET /api/autopilot`、`POST /api/autopilot/start` 和 `POST /api/autopilot/stop`，服务端同时只允许一个自动会话。
 
 ### 删除项目
 
@@ -517,7 +524,7 @@ python main.py --goal "Recover the flag" --origin "Challenge statement" --challe
 
 ```powershell
 python -m unittest discover -s tests -v
-python -m compileall main.py web_main.py orchestrator worker web tests
+python -m compileall main.py web_main.py autopilot orchestrator worker web tests
 ```
 
 前端单元测试和构建：

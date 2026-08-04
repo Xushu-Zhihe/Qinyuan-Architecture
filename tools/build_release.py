@@ -31,6 +31,7 @@ ROOT_FILES = (
 ROOT_DIRECTORIES = (
     ".agents",
     ".github",
+    "autopilot",
     "experiments",
     "frontend",
     "orchestrator",

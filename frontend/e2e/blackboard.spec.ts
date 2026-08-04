@@ -33,16 +33,23 @@ async function expectCanvasHasVisibleNodes(page: Page) {
   const nodes = page.locator('.react-flow__node')
   await expect(canvas).toBeVisible()
   await expect(nodes.first()).toBeVisible()
-  const canvasBox = await canvas.boundingBox()
-  expect(canvasBox).not.toBeNull()
-  for (let index = 0; index < await nodes.count(); index += 1) {
-    const nodeBox = await nodes.nth(index).boundingBox()
-    expect(nodeBox).not.toBeNull()
-    expect(nodeBox!.x).toBeGreaterThanOrEqual(canvasBox!.x)
-    expect(nodeBox!.x + nodeBox!.width).toBeLessThanOrEqual(canvasBox!.x + canvasBox!.width)
-    expect(nodeBox!.y).toBeGreaterThanOrEqual(canvasBox!.y)
-    expect(nodeBox!.y + nodeBox!.height).toBeLessThanOrEqual(canvasBox!.y + canvasBox!.height)
-  }
+  await expect.poll(async () => {
+    const canvasBox = await canvas.boundingBox()
+    if (!canvasBox) return false
+    const count = await nodes.count()
+    if (count === 0) return false
+    for (let index = 0; index < count; index += 1) {
+      const nodeBox = await nodes.nth(index).boundingBox()
+      if (!nodeBox) return false
+      if (
+        nodeBox.x < canvasBox.x
+        || nodeBox.x + nodeBox.width > canvasBox.x + canvasBox.width
+        || nodeBox.y < canvasBox.y
+        || nodeBox.y + nodeBox.height > canvasBox.y + canvasBox.height
+      ) return false
+    }
+    return true
+  }).toBe(true)
 }
 
 async function createRunningProject(page: Page, name: string, provider: string) {

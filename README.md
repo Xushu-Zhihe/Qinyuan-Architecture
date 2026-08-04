@@ -182,7 +182,7 @@ Vite 默认地址为 `http://127.0.0.1:5173`，并将 `/api` 和 `/ws` 代理到
 
 ### 全自动答题
 
-打开首页的“全自动模式”进入 `/auto`。在平台 API prompt 中提供题目接口、提交接口和认证信息，选择一个控制器 provider 与解题 provider，设置题数和超时后启动。控制器只返回严格的 `AUTOPILOT_RESULT` JSON：先取下一题，再等待对应黑板项目达到 `achieved`，提交 `final_answer`，平台返回 `accepted` 后继续下一题；`rejected`、超时、协议错误或项目 `degraded` 会暂停并显示失败状态。
+打开首页的“全自动模式”进入 `/auto`。这是现有 Web 服务下的独立页面，不会新增后端服务或端口；例如后端运行在 `127.0.0.1:8000` 时，页面就是 `http://127.0.0.1:8000/auto`。在平台 API prompt 中提供题目接口、提交接口和认证信息，选择一个控制器 provider 与解题 provider，设置题数和超时后启动。控制器只返回严格的 `AUTOPILOT_RESULT` JSON：先取下一题，再等待对应黑板项目达到 `achieved`，提交 `final_answer`，平台返回 `accepted` 后继续下一题；`rejected`、超时、协议错误或项目 `degraded` 会暂停并显示失败状态。
 
 控制器 prompt、认证信息和临时控制器日志只在活动会话内存中使用，不写入项目数据库、会话快照或浏览器存储。控制器下载的附件会被移动到该题的受管 challenge 目录，随后每题项目仍可独立打开和审计。对应接口为 `GET /api/autopilot`、`POST /api/autopilot/start` 和 `POST /api/autopilot/stop`，服务端同时只允许一个自动会话。
 

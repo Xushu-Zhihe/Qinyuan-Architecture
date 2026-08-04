@@ -7,6 +7,7 @@ import signal
 import subprocess
 import time
 from collections.abc import Awaitable, Callable
+from contextlib import nullcontext
 from pathlib import Path
 
 from worker.backend import (
@@ -17,6 +18,7 @@ from worker.backend import (
 )
 from worker.commands import local_command
 from worker.models import LogChunk, ProviderConfig, WorkerResult
+from worker.output_adapters import OutputAdapter, build_output_adapter
 from worker.redaction import redact_text
 
 
@@ -53,11 +55,28 @@ async def _read_stream(
     path: Path,
     on_chunk: ChunkCallback | None,
     max_log_bytes: int,
+    adapter: OutputAdapter | None = None,
+    raw_path: Path | None = None,
 ) -> str:
     decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
     parts: list[str] = []
     pending = ""
     written_bytes = 0
+    raw_written_bytes = 0
+    transform = adapter or build_output_adapter("text")
+
+    def write_raw(text: str, handle) -> None:
+        nonlocal raw_written_bytes
+        if handle is None or not text or raw_written_bytes >= max_log_bytes:
+            return
+        safe = redact_text(text)
+        encoded = safe.encode("utf-8")[: max_log_bytes - raw_written_bytes]
+        safe = encoded.decode("utf-8", errors="ignore")
+        if not safe:
+            return
+        raw_written_bytes += len(safe.encode("utf-8"))
+        handle.write(safe)
+        handle.flush()
 
     async def write_safe(text: str, handle) -> None:
         nonlocal written_bytes
@@ -77,12 +96,32 @@ async def _read_stream(
         parts.append(safe)
         await _emit(on_chunk, LogChunk(stream_name, safe))
 
-    with path.open("w", encoding="utf-8", newline="") as handle:
+    raw_context = (
+        raw_path.open("w", encoding="utf-8", newline="")
+        if raw_path is not None
+        else nullcontext(None)
+    )
+    with path.open("w", encoding="utf-8", newline="") as handle, raw_context as raw_handle:
+        read_task: asyncio.Task[bytes] | None = None
         while True:
-            raw = await stream.read(4096)
+            if read_task is None:
+                read_task = asyncio.create_task(stream.read(4096))
+            try:
+                raw = await asyncio.wait_for(
+                    asyncio.shield(read_task),
+                    timeout=0.1,
+                )
+            except TimeoutError:
+                if pending:
+                    for visible in transform.feed(pending):
+                        await write_safe(visible, handle)
+                    pending = ""
+                continue
+            read_task = None
             if not raw:
                 break
             text = decoder.decode(raw)
+            write_raw(text, raw_handle)
             pending += text
             if written_bytes >= max_log_bytes:
                 pending = ""
@@ -93,12 +132,20 @@ async def _read_stream(
             else:
                 pending = ""
             for line in lines:
-                await write_safe(line, handle)
-            if len(pending.encode("utf-8")) >= max_log_bytes:
-                await write_safe(pending, handle)
+                for visible in transform.feed(line):
+                    await write_safe(visible, handle)
+            if len(pending.encode("utf-8")) >= 16 * 1024:
+                for visible in transform.feed(pending):
+                    await write_safe(visible, handle)
                 pending = ""
-        pending += decoder.decode(b"", final=True)
-        await write_safe(pending, handle)
+        final_text = decoder.decode(b"", final=True)
+        write_raw(final_text, raw_handle)
+        pending += final_text
+        if pending:
+            for visible in transform.feed(pending):
+                await write_safe(visible, handle)
+        for visible in transform.finish():
+            await write_safe(visible, handle)
     return "".join(parts)
 
 
@@ -230,6 +277,14 @@ class LocalExecutionBackend(ExecutionBackend):
                     stdout_path,
                     on_chunk,
                     max_log_bytes,
+                    build_output_adapter(
+                        str(handle.metadata.get("stream_format", "text"))
+                    ),
+                    raw_path=(
+                        stdout_path.with_name("stdout.raw.jsonl")
+                        if handle.metadata.get("stream_format") == "claude-stream-json"
+                        else None
+                    ),
                 )
             ),
             asyncio.create_task(
@@ -334,6 +389,7 @@ class LocalExecutionBackend(ExecutionBackend):
                 challenge_dir,
                 work_dir,
             )
+            handle.metadata["stream_format"] = provider.stream_format
             stdin_task, stdout_task, stderr_task = await self.stream(
                 handle,
                 request,
@@ -387,7 +443,14 @@ class LocalExecutionBackend(ExecutionBackend):
             cleanup_policy=cleanup.policy,
             cleanup_status=cleanup.status,
             cleanup_detail=cleanup.detail,
-            backend_metadata={"challenge_enforcement": "prompt_only"},
+            backend_metadata={
+                "challenge_enforcement": "prompt_only",
+                **(
+                    {"raw_stdout_path": str(stdout_path.with_name("stdout.raw.jsonl").resolve())}
+                    if provider.stream_format == "claude-stream-json"
+                    else {}
+                ),
+            },
         )
 
 

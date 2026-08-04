@@ -1,4 +1,4 @@
-import { Archive, CircleDot, GitBranch, History } from 'lucide-react'
+import { Archive, CircleDot, GitBranch, History, RotateCcw, Trash2 } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
 
 import type {
@@ -6,6 +6,7 @@ import type {
   BlackboardNode,
   IntentExecution,
   ProjectSnapshot,
+  WorkspaceMode,
 } from '../types'
 
 export type InspectorSelection =
@@ -18,6 +19,9 @@ interface InspectorPanelProps {
   snapshot: ProjectSnapshot
   onSelectExecution: (execution: IntentExecution | null) => void
   onArchiveNode?: (nodeId: string) => void
+  onRestoreNode?: (nodeId: string) => void
+  onDeleteEdge?: (edgeId: string) => void
+  mode?: WorkspaceMode
 }
 
 function providerLabel(provider: string) {
@@ -45,6 +49,9 @@ export function InspectorPanel({
   snapshot,
   onSelectExecution,
   onArchiveNode,
+  onRestoreNode,
+  onDeleteEdge,
+  mode = 'browse',
 }: InspectorPanelProps) {
   const selectedNode = selection?.kind === 'node'
     ? snapshot.nodes.find(node => node.id === selection.value.id) ?? selection.value
@@ -86,6 +93,9 @@ export function InspectorPanel({
     && selectedNode.sources.includes('human')
     && (selectedNode.type === 'fact' || selectedNode.type === 'hint')
     && selectedNode.state !== 'archived'
+  const canRestore = selectedNode?.state === 'archived'
+    && (selectedNode.type === 'fact' || selectedNode.type === 'hint')
+  const canDeleteEdge = selectedEdge && (selectedEdge.executions?.length ?? 0) === 0
 
   return (
     <aside className="inspector" aria-label="详情">
@@ -96,7 +106,7 @@ export function InspectorPanel({
               <span className="inspector-kicker">{selectedNode.type}</span>
               <h2>{selectedNode.id}</h2>
             </div>
-            {canArchive && onArchiveNode && (
+            {mode === 'edit' && canArchive && onArchiveNode && (
               <button
                 className="icon-button"
                 aria-label="归档节点"
@@ -104,6 +114,16 @@ export function InspectorPanel({
                 onClick={() => onArchiveNode(selectedNode.id)}
               >
                 <Archive size={17} />
+              </button>
+            )}
+            {mode === 'edit' && canRestore && onRestoreNode && (
+              <button
+                className="icon-button"
+                aria-label="恢复节点"
+                title="恢复节点"
+                onClick={() => onRestoreNode(selectedNode.id)}
+              >
+                <RotateCcw size={17} />
               </button>
             )}
           </div>
@@ -136,7 +156,17 @@ export function InspectorPanel({
               <span className="inspector-kicker">{selectedEdge.status ?? selectedEdge.type}</span>
               <h2>Intent {selectedEdge.id}</h2>
             </div>
-            <CircleDot size={18} />
+            {mode === 'edit' && onDeleteEdge ? (
+              <button
+                className="icon-button"
+                aria-label="删除边"
+                title={canDeleteEdge ? '删除边' : '有执行历史的 Intent 不能删除'}
+                disabled={!canDeleteEdge}
+                onClick={() => canDeleteEdge && onDeleteEdge(selectedEdge.id)}
+              >
+                <Trash2 size={17} />
+              </button>
+            ) : <CircleDot size={18} />}
           </div>
           <p className="inspector-content">{selectedEdge.content}</p>
           <dl className="inspector-facts">

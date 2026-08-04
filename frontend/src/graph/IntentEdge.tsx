@@ -10,6 +10,7 @@ import type { BlackboardEdge } from '../types'
 
 export interface IntentEdgeData extends Record<string, unknown> {
   edge: BlackboardEdge
+  onSelect?: (edge: BlackboardEdge) => void
 }
 
 export type IntentFlowEdge = Edge<IntentEdgeData, 'intent'>
@@ -21,12 +22,18 @@ export function IntentEdge(props: EdgeProps<IntentFlowEdge>) {
     <>
       <BaseEdge id={props.id} path={path} className={`intent-edge intent-edge--${status}`} markerEnd={props.markerEnd} />
       <EdgeLabelRenderer>
-        <div
+        <button
+          type="button"
+          aria-label={`选择 Intent ${props.data?.edge.content ?? props.id}`}
           className={`intent-label intent-label--${status}`}
           style={{ transform: `translate(-50%, -50%) translate(${labelX}px, ${labelY}px)` }}
+          onClick={event => {
+            event.stopPropagation()
+            if (props.data?.edge) props.data.onSelect?.(props.data.edge)
+          }}
         >
           {props.data?.edge.content ?? 'Intent'}
-        </div>
+        </button>
       </EdgeLabelRenderer>
     </>
   )

@@ -23,6 +23,7 @@ from worker.executor import (
     _terminate_process_tree,
     _write_stdin,
 )
+from worker.output_adapters import build_output_adapter
 from worker.models import ContainerBackendConfig, ProviderConfig, WorkerResult
 from worker.redaction import redact_text
 
@@ -193,6 +194,7 @@ class ContainerExecutionBackend(ExecutionBackend):
             process=process,
             run_id=container_id,
             metadata={
+                "stream_format": provider.stream_format,
                 "container_name": name,
                 "image": image or "",
                 "network": self.config.network,
@@ -231,6 +233,14 @@ class ContainerExecutionBackend(ExecutionBackend):
                     stdout_path,
                     on_chunk,
                     max_log_bytes,
+                    build_output_adapter(
+                        str(handle.metadata.get("stream_format", "text"))
+                    ),
+                    raw_path=(
+                        stdout_path.with_name("stdout.raw.jsonl")
+                        if handle.metadata.get("stream_format") == "claude-stream-json"
+                        else None
+                    ),
                 )
             ),
             asyncio.create_task(
@@ -451,6 +461,10 @@ class ContainerExecutionBackend(ExecutionBackend):
             "challenge_read_only": challenge_dir is not None,
             "work_mount": self.config.work_mount_path,
         }
+        if provider.stream_format == "claude-stream-json":
+            metadata["raw_stdout_path"] = str(
+                stdout_path.with_name("stdout.raw.jsonl").resolve()
+            )
         return WorkerResult(
             provider=provider.name,
             priority=provider.priority,

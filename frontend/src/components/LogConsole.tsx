@@ -4,8 +4,9 @@ import { useEffect, useRef, useState } from 'react'
 import { api } from '../api/client'
 import { capLogText } from '../state/projectStore'
 import type { ExecutionLogs, IntentExecution, PlanningAttempt } from '../types'
+import type { ProjectSocketStatus } from '../api/projectSocket'
 
-type LogStream = keyof ExecutionLogs
+type LogStream = keyof ExecutionLogs | 'all'
 type LoadLogs = (projectId: string, executionId: string) => Promise<ExecutionLogs>
 
 function durationLabel(record: IntentExecution | PlanningAttempt) {
@@ -22,16 +23,20 @@ export function LogConsole({
   planningAttempt = null,
   liveLogs,
   loadLogs = api.executionLogs,
+  socketStatus = 'open',
+  streamingSupported,
 }: {
   projectId: string
   execution: IntentExecution | null
   planningAttempt?: PlanningAttempt | null
   liveLogs: ExecutionLogs
   loadLogs?: LoadLogs
+  socketStatus?: ProjectSocketStatus
+  streamingSupported?: boolean | null
 }) {
   const [stream, setStream] = useState<LogStream>('stdout')
   const [storedLogs, setStoredLogs] = useState<ExecutionLogs>({ stdout: '', stderr: '' })
-  const [liveBaseline, setLiveBaseline] = useState({ stdout: 0, stderr: 0 })
+  const [liveBaseline, setLiveBaseline] = useState({ stdout: 0, stderr: 0, all: 0 })
   const [cleared, setCleared] = useState(false)
   const [follow, setFollow] = useState(true)
   const [collapsed, setCollapsed] = useState(false)
@@ -44,6 +49,7 @@ export function LogConsole({
     setLiveBaseline({
       stdout: liveLogs.stdout.length,
       stderr: liveLogs.stderr.length,
+      all: (liveLogs.all ?? '').length,
     })
     setCleared(false)
     setError(null)
@@ -57,15 +63,29 @@ export function LogConsole({
         setLiveBaseline(current => ({
           stdout: logs.stdout ? current.stdout : 0,
           stderr: logs.stderr ? current.stderr : 0,
+          all: logs.all ? current.all : 0,
         }))
       })
       .catch(reason => { if (active) setError(reason instanceof Error ? reason.message : String(reason)) })
     return () => { active = false }
   }, [execution?.id, loadLogs, planningAttempt?.id, projectId])
 
+  const currentLogs = {
+    stdout: storedLogs.stdout + liveLogs.stdout.slice(liveBaseline.stdout),
+    stderr: storedLogs.stderr + liveLogs.stderr.slice(liveBaseline.stderr),
+    all: (storedLogs.all ?? `[stdout]\n${storedLogs.stdout}\n[stderr]\n${storedLogs.stderr}`)
+      + (liveLogs.all ?? '').slice(liveBaseline.all),
+  }
   const visibleText = cleared
     ? ''
-    : capLogText(storedLogs[stream] + liveLogs[stream].slice(liveBaseline[stream]))
+    : stream === 'all'
+      ? capLogText(currentLogs.all)
+      : capLogText(currentLogs[stream])
+  const displayText = error ?? (
+    record && streamingSupported === false && record.status === 'running' && !currentLogs.stdout && !currentLogs.stderr
+      ? '该 provider 仅支持任务完成后输出。'
+      : visibleText
+  )
 
   useEffect(() => {
     if (follow && viewportRef.current) {
@@ -79,6 +99,8 @@ export function LogConsole({
         <div className="log-identity">
           <strong>{record ? `${record.provider} · ${record.id}` : 'Audit logs'}</strong>
           {record && <span className={`log-status log-status--${record.status}`}>{record.status}</span>}
+          {record && socketStatus !== 'open' && <span className="log-status">{socketStatus === 'reconnecting' ? '重连中' : '连接中'}</span>}
+          {record && streamingSupported === false && <span className="log-status">完成后输出</span>}
         </div>
         {record && (
           <div className="log-metrics">
@@ -101,7 +123,7 @@ export function LogConsole({
       {!collapsed && (
         <>
           <div className="log-tabs" role="tablist" aria-label="日志流">
-            {(['stdout', 'stderr'] as const).map(value => (
+            {(['all', 'stdout', 'stderr'] as const).map(value => (
               <button
                 key={value}
                 role="tab"
@@ -113,7 +135,7 @@ export function LogConsole({
               </button>
             ))}
           </div>
-          <pre ref={viewportRef} className="log-output">{error ?? visibleText}</pre>
+          <pre ref={viewportRef} className="log-output">{displayText}</pre>
         </>
       )}
     </section>

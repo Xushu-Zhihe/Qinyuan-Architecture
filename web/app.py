@@ -1,3 +1,4 @@
+import asyncio
 from contextlib import asynccontextmanager
 import sqlite3
 from pathlib import Path
@@ -16,7 +17,11 @@ from fastapi.staticfiles import StaticFiles
 from orchestrator.audit import export_audit_bundle, read_log_page
 from orchestrator.layout import LayoutConflict
 from orchestrator.models import IntentProposal
-from orchestrator.projects import ProjectService, project_record_dict
+from orchestrator.projects import (
+    ProjectConflictError,
+    ProjectService,
+    project_record_dict,
+)
 from web.schemas import (
     EdgeCreate,
     EdgeUpdate,
@@ -67,6 +72,8 @@ def create_app(
             return service.get_handle(project_id)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="project not found") from exc
+        except ProjectConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     async def publish_since(project, sequence: int) -> None:
         for event in project.store.events_after(sequence):
@@ -90,9 +97,10 @@ def create_app(
         *,
         stdout_offset: int,
         stderr_offset: int,
+        all_offset: int,
         limit: int | None,
     ) -> dict[str, object]:
-        if stdout_offset < 0 or stderr_offset < 0:
+        if stdout_offset < 0 or stderr_offset < 0 or all_offset < 0:
             raise HTTPException(
                 status_code=400,
                 detail="log offsets must be non-negative",
@@ -113,13 +121,22 @@ def create_app(
             limit=page_limit,
             retained=retained,
         )
+        combined = read_log_page(
+            project.record.path,
+            Path(str(record["stdout_path"])).with_name("combined.txt"),
+            offset=all_offset,
+            limit=page_limit,
+            retained=retained,
+        )
         return {
             "stdout": stdout.pop("text"),
             "stderr": stderr.pop("text"),
+            "all": combined.pop("text"),
             "pagination": {
                 "limit_bytes": page_limit,
                 "stdout": stdout,
                 "stderr": stderr,
+                "all": combined,
             },
         }
 
@@ -130,6 +147,19 @@ def create_app(
     @app.get("/api/runtime")
     async def get_runtime():
         return await service.runtime_snapshot()
+
+    @app.delete(
+        "/api/projects/{project_id}",
+        status_code=status.HTTP_204_NO_CONTENT,
+    )
+    async def delete_project(project_id: str):
+        try:
+            await service.delete_project(project_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="project not found") from exc
+        except ProjectConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
 
     @app.post("/api/projects", status_code=status.HTTP_201_CREATED)
     def create_project(payload: ProjectCreate):
@@ -159,18 +189,34 @@ def create_app(
             **project_record_dict(project.record),
             "goal_version": snapshot["project"]["goal_version"],
             "final_answer": snapshot["project"]["final_answer"],
-            "provider_health": list(project.store.provider_health()),
+            "provider_health": list(service.provider_health(project)),
             "recovery": project.store.recovery_summary(),
         }
 
     @app.get("/api/projects/{project_id}/providers")
     def get_provider_health(project_id: str):
-        return list(handle(project_id).store.provider_health())
+        return list(service.provider_health(handle(project_id)))
 
     @app.get("/api/projects/{project_id}/graph")
-    def get_graph(project_id: str):
+    def get_graph(project_id: str, include_archived: bool = False):
         project = handle(project_id)
         snapshot = project.store.snapshot()
+        snapshot["provider_health"] = list(service.provider_health(project))
+        if not include_archived:
+            active_nodes = {
+                str(node["id"])
+                for node in snapshot["nodes"]
+                if node["state"] != "archived"
+            }
+            snapshot["nodes"] = [
+                node for node in snapshot["nodes"]
+                if str(node["id"]) in active_nodes
+            ]
+            snapshot["edges"] = [
+                edge for edge in snapshot["edges"]
+                if str(edge["from_node"]) in active_nodes
+                and str(edge["to_node"]) in active_nodes
+            ]
         graph_project = dict(snapshot["project"])
         snapshot["project"] = {
             **project_record_dict(project.record),
@@ -214,6 +260,24 @@ def create_app(
             project.store.archive_node(node_id)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="node not found") from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        await publish_since(project, sequence)
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+    @app.post(
+        "/api/projects/{project_id}/nodes/{node_id}/restore",
+        status_code=status.HTTP_204_NO_CONTENT,
+    )
+    async def restore_node(project_id: str, node_id: str):
+        project = handle(project_id)
+        sequence = int(project.store.snapshot()["sequence"])
+        try:
+            project.store.restore_node(node_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="node not found") from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         await publish_since(project, sequence)
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
@@ -353,6 +417,7 @@ def create_app(
         execution_id: str,
         stdout_offset: int = 0,
         stderr_offset: int = 0,
+        all_offset: int = 0,
         limit: int | None = None,
     ):
         project = handle(project_id)
@@ -365,6 +430,7 @@ def create_app(
             execution,
             stdout_offset=stdout_offset,
             stderr_offset=stderr_offset,
+            all_offset=all_offset,
             limit=limit,
         )
 
@@ -394,6 +460,7 @@ def create_app(
         planning_attempt_id: str,
         stdout_offset: int = 0,
         stderr_offset: int = 0,
+        all_offset: int = 0,
         limit: int | None = None,
     ):
         project = handle(project_id)
@@ -409,6 +476,7 @@ def create_app(
             attempt,
             stdout_offset=stdout_offset,
             stderr_offset=stderr_offset,
+            all_offset=all_offset,
             limit=limit,
         )
 
@@ -461,6 +529,8 @@ def create_app(
             record = await service.stop_project(project_id)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="project not found") from exc
+        except ProjectConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         return project_record_dict(record)
 
     @app.websocket("/ws/projects/{project_id}")
@@ -476,16 +546,61 @@ def create_app(
             return
         await websocket.accept()
         try:
-            for event in project.store.events_after(after):
-                await websocket.send_json(
-                    {"project_id": project_id, **event}
-                )
             async with project.hub.subscribe() as queue:
+                replay = project.store.events_after(after)
+                queued: dict[int, dict[str, object]] = {}
                 while True:
-                    event = await queue.get()
+                    try:
+                        event = queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+                    queued[int(event["sequence"])] = event
+
+                last_sequence = after
+                for persisted in replay:
+                    sequence = int(persisted["sequence"])
+                    event = queued.pop(sequence, persisted)
                     await websocket.send_json(
                         {"project_id": project_id, **event}
                     )
+                    last_sequence = sequence
+                project.hub.record_backfill(len(replay))
+                for sequence in sorted(queued):
+                    if sequence <= last_sequence:
+                        continue
+                    await websocket.send_json(
+                        {"project_id": project_id, **queued[sequence]}
+                    )
+                    last_sequence = sequence
+
+                while True:
+                    event = await queue.get()
+                    sequence = int(event["sequence"])
+                    if sequence <= last_sequence:
+                        continue
+                    if sequence > last_sequence + 1:
+                        recovered = 0
+                        for persisted in project.store.events_after(last_sequence):
+                            persisted_sequence = int(persisted["sequence"])
+                            if persisted_sequence > sequence:
+                                break
+                            selected = (
+                                event
+                                if persisted_sequence == sequence
+                                else persisted
+                            )
+                            if persisted_sequence != sequence:
+                                recovered += 1
+                            await websocket.send_json(
+                                {"project_id": project_id, **selected}
+                            )
+                            last_sequence = persisted_sequence
+                        project.hub.record_backfill(recovered)
+                        continue
+                    await websocket.send_json(
+                        {"project_id": project_id, **event}
+                    )
+                    last_sequence = sequence
         except WebSocketDisconnect:
             return
 

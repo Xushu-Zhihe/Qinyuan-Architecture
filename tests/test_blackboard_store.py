@@ -228,7 +228,7 @@ class BlackboardExecutionTests(StoreTestCase):
             reopened.provider_health_for("codex")["status"],
             "unknown",
         )
-        backups = tuple(path.parent.glob("blackboard.db.pre-v0-to-v3-*.bak"))
+        backups = tuple(path.parent.glob("blackboard.db.pre-v0-to-v4-*.bak"))
         self.assertEqual(len(backups), 1)
         backup = sqlite3.connect(backups[0])
         try:
@@ -288,7 +288,7 @@ class BlackboardExecutionTests(StoreTestCase):
                 )
             },
         )
-        backups = tuple(path.parent.glob("blackboard.db.pre-v1-to-v3-*.bak"))
+        backups = tuple(path.parent.glob("blackboard.db.pre-v1-to-v4-*.bak"))
         self.assertEqual(len(backups), 1)
 
     def test_open_migrates_v2_backend_audit_database(self) -> None:
@@ -325,7 +325,38 @@ class BlackboardExecutionTests(StoreTestCase):
                 )
             }
             self.assertTrue(set(backend_columns).issubset(columns))
-        backups = tuple(path.parent.glob("blackboard.db.pre-v2-to-v3-*.bak"))
+        backups = tuple(path.parent.glob("blackboard.db.pre-v2-to-v4-*.bak"))
+        self.assertEqual(len(backups), 1)
+
+    def test_open_migrates_v3_answers_to_canonical_schema(self) -> None:
+        store = self.make_store()
+        path = store.path
+        store.record_answer("codex", " flag{legacy} ")
+        with store.connection:
+            store.connection.execute(
+                "DROP INDEX IF EXISTS final_answers_by_consensus"
+            )
+            store.connection.execute(
+                "ALTER TABLE final_answers DROP COLUMN answer_key"
+            )
+            store.connection.execute(
+                "ALTER TABLE final_answers DROP COLUMN answer_fingerprint"
+            )
+            store.connection.execute("PRAGMA user_version = 3")
+            store.connection.execute(
+                "DELETE FROM schema_migrations WHERE version > 3"
+            )
+        store.close()
+
+        reopened = BlackboardStore.open(path, "project-1")
+        self.addCleanup(reopened.close)
+        row = reopened.connection.execute(
+            "SELECT answer_key, answer_fingerprint FROM final_answers"
+        ).fetchone()
+
+        self.assertEqual(row["answer_key"], "flag{legacy}")
+        self.assertTrue(row["answer_fingerprint"])
+        backups = tuple(path.parent.glob("blackboard.db.pre-v3-to-v4-*.bak"))
         self.assertEqual(len(backups), 1)
 
     def test_latest_version_schema_drift_is_rejected(self) -> None:
@@ -658,6 +689,31 @@ class BlackboardExecutionTests(StoreTestCase):
             "flag{same}",
         )
         self.assertEqual(store.candidates(), ("flag{same}",))
+
+    def test_consensus_uses_answer_key_and_preserves_display_answer(self) -> None:
+        store = self.make_store()
+
+        store.record_answer("codex", "flag{same}", "flag{same}")
+        store.record_answer(
+            "claude",
+            "The recovered value is flag{same} after verification.",
+            "flag{same}",
+        )
+
+        details = store.consensus_details(available_providers=2)
+        self.assertIsNotNone(details)
+        assert details is not None
+        self.assertEqual(details["answer_key"], "flag{same}")
+        self.assertEqual(details["supporters"], 2)
+        self.assertIn("verification", details["answer"])
+
+    def test_different_answer_keys_do_not_reach_consensus(self) -> None:
+        store = self.make_store()
+        store.record_answer("codex", "first", "flag{one}")
+        store.record_answer("claude", "second", "flag{two}")
+
+        self.assertIsNone(store.consensus_details(available_providers=2))
+        self.assertEqual(store.candidates(), ("first", "second"))
 
     def test_events_after_returns_monotonic_sequence(self) -> None:
         store, intent = self.make_store_and_intent()

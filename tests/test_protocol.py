@@ -9,6 +9,7 @@ from orchestrator.protocol import (
     parse_result,
     render_execution_request,
     render_intent_request,
+    render_timeout_summary_request,
 )
 
 
@@ -173,6 +174,44 @@ class ResultProtocolTests(unittest.TestCase):
         self.assertEqual(result.status, "protocol_error")
         self.assertIn("final_answer", result.error)
 
+    def test_parses_explicit_answer_key(self) -> None:
+        payload = {
+            "intent_id": "intent-1",
+            "facts": [],
+            "edges": [],
+            "goal_achieved": True,
+            "answer_key": "flag{same}",
+            "final_answer": "Verified answer: flag{same}",
+        }
+
+        result = parse_result(
+            "BLACKBOARD_RESULT: " + json.dumps(payload),
+            assigned_intent_id="intent-1",
+            existing_node_ids=set(),
+        )
+
+        self.assertEqual(result.status, "valid")
+        self.assertEqual(result.update.answer_key, "flag{same}")
+        self.assertEqual(result.update.final_answer, "Verified answer: flag{same}")
+
+    def test_legacy_result_falls_back_to_final_answer_key(self) -> None:
+        payload = {
+            "intent_id": "intent-1",
+            "facts": [],
+            "edges": [],
+            "goal_achieved": True,
+            "final_answer": "flag{legacy}",
+        }
+
+        result = parse_result(
+            "BLACKBOARD_RESULT: " + json.dumps(payload),
+            assigned_intent_id="intent-1",
+            existing_node_ids=set(),
+        )
+
+        self.assertEqual(result.status, "valid")
+        self.assertEqual(result.update.answer_key, "flag{legacy}")
+
     def test_render_execution_request_binds_intent(self) -> None:
         request = render_execution_request(
             snapshot={"nodes": []},
@@ -212,11 +251,27 @@ class ResultProtocolTests(unittest.TestCase):
             request,
         )
         self.assertIn('"goal_achieved":true', request)
+        self.assertIn('"answer_key":"verified-answer"', request)
         self.assertIn('"final_answer":"verified answer"', request)
         for edge_type in RELATION_EDGE_TYPES:
             self.assertIn(edge_type, request)
         self.assertIn("environment or provider limitations", request)
         self.assertIn("diagnostics, not challenge facts", request)
+
+    def test_render_timeout_summary_request_is_immediate_and_data_only(self) -> None:
+        request = render_timeout_summary_request(
+            snapshot={"nodes": [{"id": "goal-1", "type": "goal"}]},
+            intent={"id": "intent-1", "content": "Recover the flag"},
+            challenge_dir=None,
+            partial_output="verified prefix\nBLACKBOARD_RESULT: partial",
+        )
+
+        self.assertIn("immediate timeout-recovery pass", request)
+        self.assertIn("Do not continue investigating", request)
+        self.assertIn("<captured-output>", request)
+        self.assertIn("verified prefix", request)
+        self.assertIn("intent-1", request)
+        self.assertIn("BLACKBOARD_RESULT:", request)
 
     def test_render_execution_request_contains_correction_context(self) -> None:
         parameters = inspect.signature(render_execution_request).parameters

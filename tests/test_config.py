@@ -45,6 +45,7 @@ class ProviderConfigTests(unittest.TestCase):
             self.assertEqual(providers[0].command[-1], "-")
             self.assertEqual(providers[0].planning_timeout_seconds, 30)
             self.assertIsNone(providers[0].health_check)
+            self.assertTrue(providers[0].streaming_supported)
 
     def test_loads_provider_container_overrides(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -318,6 +319,9 @@ class ProviderConfigTests(unittest.TestCase):
         self.assertNotIn("dontAsk", claude.command)
         self.assertEqual(codex.planning_timeout_seconds, 120)
         self.assertEqual(claude.planning_timeout_seconds, 120)
+        self.assertTrue(codex.streaming_supported)
+        self.assertTrue(claude.streaming_supported)
+        self.assertFalse(providers["kimi"].streaming_supported)
         self.assertTrue(all(provider.health_check for provider in providers.values()))
 
     def test_rejects_invalid_health_check_cooldown_range(self) -> None:

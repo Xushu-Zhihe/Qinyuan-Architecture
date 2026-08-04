@@ -40,6 +40,8 @@ class ProviderConfig:
     max_running: int = 4
     container_image: str | None = None
     container_command: tuple[str, ...] | None = None
+    stream_format: str = "text"
+    streaming_supported: bool = True
 
 
 @dataclass(frozen=True, slots=True)

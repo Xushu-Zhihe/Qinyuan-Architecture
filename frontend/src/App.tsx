@@ -45,6 +45,18 @@ export default function App() {
     await refresh()
   }
 
+  async function deleteProject(projectId: string) {
+    try {
+      setError(null)
+      await api.deleteProject(projectId)
+      await refresh()
+    } catch (caught) {
+      const message = caught instanceof Error ? caught.message : String(caught)
+      setError(message)
+      throw caught
+    }
+  }
+
   function openProject(projectId: string) {
     window.history.pushState({}, '', `/projects/${projectId}`)
     window.dispatchEvent(new PopStateEvent('popstate'))
@@ -58,7 +70,7 @@ export default function App() {
   return (
     <>
       {error && <div className="error-banner">{error}</div>}
-      <ProjectDashboard projects={projects} runtime={runtime} onOpen={openProject} onCreate={() => setDialogOpen(true)} />
+      <ProjectDashboard projects={projects} runtime={runtime} onOpen={openProject} onCreate={() => setDialogOpen(true)} onDelete={deleteProject} />
       <NewProjectDialog
         open={dialogOpen}
         providers={['codex', 'claude', 'kimi']}

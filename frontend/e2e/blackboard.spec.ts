@@ -1,4 +1,4 @@
-import { expect, test, type Page, type TestInfo } from '@playwright/test'
+import { expect, test, type Page, type TestInfo, type WebSocketRoute } from '@playwright/test'
 
 async function createProject(
   page: Page,
@@ -14,7 +14,7 @@ async function createProject(
   if (mode === 'run') await page.getByLabel('立即启动 Agent').click()
   await page.getByLabel(provider).check()
   await page.getByRole('button', { name: mode === 'run' ? '创建并启动' : '创建项目' }).click()
-  const projectCard = page.getByRole('button', { name: new RegExp(name) })
+  const projectCard = page.locator('.project-card__open').filter({ hasText: name })
   await expect(projectCard).toBeVisible()
   await projectCard.click()
   await expect(page.locator('.workspace-title strong')).toHaveText(name)
@@ -101,6 +101,28 @@ test('two running projects keep graph and logs isolated', async ({ browser }, te
   await context.close()
 })
 
+test('live logs recover after the browser websocket reconnects', async ({ page }, testInfo) => {
+  const provider = 'codex'
+  const sockets: WebSocketRoute[] = []
+  let releaseReconnect = () => {}
+  const reconnectGate = new Promise<void>(resolve => { releaseReconnect = resolve })
+  await page.routeWebSocket(/\/ws\/projects\//, async socket => {
+    sockets.push(socket)
+    if (sockets.length > 1) await reconnectGate
+    socket.connectToServer()
+  })
+  await createRunningProject(page, `Reconnect ${testInfo.project.name}`, provider)
+  await expect.poll(() => sockets.length).toBe(1)
+
+  await sockets[0].close({ code: 1012, reason: 'E2E reconnect check' })
+  await expect(page.getByLabel('Agent 实时日志').getByText('重连中')).toBeVisible()
+  await expect.poll(() => sockets.length).toBe(2)
+  releaseReconnect()
+
+  await expect(page.getByLabel('Agent 实时日志').getByText('重连中')).toHaveCount(0, { timeout: 15_000 })
+  await expect(page.getByLabel('Agent 实时日志').getByText(`${provider} output`, { exact: false })).toBeVisible()
+})
+
 test('manual board can add fact and intent before agents start', async ({ page }, testInfo) => {
   const name = `Manual blackboard ${testInfo.project.name} with a deliberately long project name`
   const fact = 'JWT uses HS256 and this deliberately long fact remains readable inside the graph node'
@@ -127,4 +149,55 @@ test('manual board can add fact and intent before agents start', async ({ page }
     await expect(page.locator('.inspector--empty')).toBeHidden()
   }
   await page.screenshot({ path: testInfo.outputPath(`manual-workspace-${testInfo.project.name}.png`), fullPage: true })
+})
+
+test('project can be moved to the recoverable trash from its card', async ({ page }, testInfo) => {
+  const name = `Delete ${testInfo.project.name}`
+  await createProject(page, name, 'manual', 'codex')
+  await page.getByRole('button', { name: '返回项目总览' }).click()
+
+  await page.getByRole('button', { name: `删除项目 ${name}` }).click()
+  await expect(page.getByRole('dialog', { name: '删除项目' })).toContainText(name)
+  await page.getByRole('button', { name: '移入回收目录' }).click()
+
+  await expect(page.locator('.project-card__open').filter({ hasText: name })).toHaveCount(0)
+  await page.reload()
+  await expect(page.locator('.project-card__open').filter({ hasText: name })).toHaveCount(0)
+})
+
+test('edit mode archives, restores and deletes server-backed graph elements', async ({ page }, testInfo) => {
+  const name = `Graph edit ${testInfo.project.name}`
+  const fact = `Archivable fact ${testInfo.project.name}`
+  const intent = `Disposable intent ${testInfo.project.name}`
+  await createProject(page, name, 'manual', 'codex')
+  await page.getByRole('button', { name: '编辑' }).click()
+
+  page.once('dialog', dialog => dialog.accept(fact))
+  await page.getByRole('button', { name: '添加 Fact' }).click()
+  const factNode = page.locator('.blackboard-node--fact', { hasText: fact })
+  await expect(factNode).toBeVisible()
+
+  await page.getByRole('button', { name: '连接节点' }).click()
+  await factNode.click()
+  page.once('dialog', dialog => dialog.accept(intent))
+  await page.locator('.blackboard-node--goal').click()
+  await page.getByRole('button', { name: `选择 Intent ${intent}` }).click()
+  await expect(page.locator('.graph-toolbar').getByRole('button', { name: '删除边' })).toBeEnabled()
+  page.once('dialog', dialog => dialog.accept())
+  await page.locator('.graph-toolbar').getByRole('button', { name: '删除边' }).click()
+  await expect(page.getByText(intent, { exact: true })).toHaveCount(0)
+
+  await factNode.click()
+  page.once('dialog', dialog => dialog.accept())
+  await page.locator('.graph-toolbar').getByRole('button', { name: '归档节点' }).click()
+  await expect(factNode).toHaveCount(0)
+
+  await page.getByLabel('显示已归档').check()
+  const archivedFact = page.locator('.blackboard-node.is-archived', { hasText: fact })
+  await expect(archivedFact).toBeVisible()
+  await archivedFact.click()
+  await page.locator('.graph-toolbar').getByRole('button', { name: '恢复节点' }).click()
+  await expect(page.locator('.blackboard-node--fact:not(.is-archived)', { hasText: fact })).toBeVisible()
+  await page.reload()
+  await expect(page.locator('.blackboard-node--fact:not(.is-archived)', { hasText: fact })).toBeVisible()
 })

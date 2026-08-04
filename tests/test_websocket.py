@@ -49,9 +49,15 @@ class WebSocketTests(unittest.TestCase):
             ) as socket:
                 event = socket.receive_json()
 
+            runtime = client.get("/api/runtime").json()
+
             self.assertEqual(event["project_id"], project["id"])
             self.assertEqual(event["type"], "graph.node_added")
             self.assertGreater(event["sequence"], sequence)
+            self.assertEqual(
+                runtime["projects"][0]["event_metrics"]["backfilled_events"],
+                1,
+            )
 
     def test_live_websocket_is_project_scoped(self) -> None:
         with TestClient(create_app(Path(self.temporary.name))) as client:
@@ -271,6 +277,8 @@ class WebSocketTests(unittest.TestCase):
             self.assertEqual(providers[0]["status"], "missing")
             self.assertEqual(detail["provider_health"][0]["status"], "missing")
             self.assertEqual(graph["provider_health"][0]["status"], "missing")
+            self.assertTrue(providers[0]["streaming_supported"])
+            self.assertEqual(providers[0]["stream_format"], "text")
 
 
 if __name__ == "__main__":

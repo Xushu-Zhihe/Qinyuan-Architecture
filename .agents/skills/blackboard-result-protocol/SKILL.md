@@ -17,7 +17,12 @@ The JSON object must contain exactly:
 - `facts`: objects shaped `{"ref":"unique-temp-ref","content":"non-empty fact"}`.
 - `edges`: objects shaped `{"type":"supports","from":"node-or-ref","to":"node-or-ref"}`.
 - `goal_achieved`: JSON boolean.
+- `answer_key`: minimal canonical answer when achieved, otherwise string or null.
 - `final_answer`: non-empty string when achieved, otherwise string or null.
+
+`answer_key` is compared exactly across providers. Do not put explanation, Markdown,
+labels such as `Flag:`, or surrounding prose in it. Put those details in facts or
+`final_answer`.
 
 Allowed edge types: `supports`, `contradicts`, `derived_from`, `addresses`, `similar_to`, `equivalent_to`.
 
@@ -37,7 +42,7 @@ Edges may reference existing graph node IDs or temporary fact refs declared in t
 ## Valid Example
 
 ```text
-BLACKBOARD_RESULT: {"intent_id":"intent-1","facts":[{"ref":"flag-fact","content":"flag = flag{example}"}],"edges":[{"type":"supports","from":"flag-fact","to":"goal-1"}],"goal_achieved":true,"final_answer":"flag{example}"}
+BLACKBOARD_RESULT: {"intent_id":"intent-1","facts":[{"ref":"flag-fact","content":"flag = flag{example}"}],"edges":[{"type":"supports","from":"flag-fact","to":"goal-1"}],"goal_achieved":true,"answer_key":"flag{example}","final_answer":"Flag: flag{example}"}
 ```
 
 ## Invalid Forms

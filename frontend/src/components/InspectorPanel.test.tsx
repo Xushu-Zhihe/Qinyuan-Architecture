@@ -122,4 +122,22 @@ describe('InspectorPanel', () => {
     expect(screen.getByRole('tab', { name: 'Claude' })).toHaveAttribute('aria-selected', 'true')
     expect(onSelectExecution).toHaveBeenLastCalledWith(snapshot.edges[0].executions?.[1])
   })
+
+  it('shows why an executed intent cannot be deleted in edit mode', () => {
+    render(
+      <InspectorPanel
+        mode="edit"
+        selection={{ kind: 'edge', value: snapshot.edges[0] }}
+        snapshot={snapshot}
+        onSelectExecution={() => {}}
+        onDeleteEdge={() => {}}
+      />,
+    )
+
+    expect(screen.getByRole('button', { name: '删除边' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: '删除边' })).toHaveAttribute(
+      'title',
+      '有执行历史的 Intent 不能删除',
+    )
+  })
 })

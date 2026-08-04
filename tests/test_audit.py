@@ -29,6 +29,14 @@ class AuditTests(unittest.TestCase):
         stderr = work_dir / "stderr.txt"
         stdout.write_text(content, encoding="utf-8")
         stderr.write_text("", encoding="utf-8")
+        (work_dir / "combined.txt").write_text(
+            f"[stdout]\n{content}",
+            encoding="utf-8",
+        )
+        (work_dir / "stdout.raw.jsonl").write_text(
+            content,
+            encoding="utf-8",
+        )
         attempt_id = self.store.start_planning_attempt(
             "codex",
             int(self.store.snapshot()["sequence"]),
@@ -52,6 +60,8 @@ class AuditTests(unittest.TestCase):
 
         self.assertEqual(pruned, (first_id,))
         self.assertFalse(first_path.exists())
+        self.assertFalse(first_path.with_name("combined.txt").exists())
+        self.assertFalse(first_path.with_name("stdout.raw.jsonl").exists())
         self.assertFalse(self.store.planning_attempt(first_id)["logs_retained"])
         self.assertTrue(second_path.exists())
         self.assertTrue(self.store.planning_attempt(second_id)["logs_retained"])
@@ -81,6 +91,8 @@ class AuditTests(unittest.TestCase):
             names = archive.namelist()
         self.assertIn("snapshot.json", names)
         self.assertIn("logs/index.json", names)
+        self.assertTrue(any(name.endswith("combined.txt") for name in names))
+        self.assertTrue(any(name.endswith("stdout.raw.jsonl") for name in names))
         self.assertNotIn(b"sk-export-secret-value", payload)
         self.assertNotIn(b"sk-fact-secret-value", payload)
         self.assertIn(b"[redacted]", payload)

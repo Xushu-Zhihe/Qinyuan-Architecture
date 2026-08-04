@@ -60,4 +60,25 @@ describe('project event reducer', () => {
     expect(next.logs['exec-a'].stdout).toContain(`line-${MAX_LOG_LINES + 4}`)
     expect(next.logs['exec-a'].stdout.split('\n')).toHaveLength(MAX_LOG_LINES)
   })
+
+  it('keeps the all stream in websocket event order', () => {
+    const first = reduceProjectEvent(createProjectState({ sequence: 1 }), {
+      project_id: 'project-1', sequence: 2, type: 'intent.log_chunk', source: 'codex',
+      payload: {
+        execution_id: 'exec-a', stream: 'stderr', text: 'first\n',
+        byte_offset: 0, byte_length: 6, combined_byte_offset: 0, combined_byte_length: 15,
+      },
+      created_at: '2026-07-12T00:00:00Z',
+    })
+    const second = reduceProjectEvent(first, {
+      project_id: 'project-1', sequence: 3, type: 'intent.log_chunk', source: 'codex',
+      payload: {
+        execution_id: 'exec-a', stream: 'stdout', text: 'second\n',
+        byte_offset: 0, byte_length: 7, combined_byte_offset: 15, combined_byte_length: 16,
+      },
+      created_at: '2026-07-12T00:00:01Z',
+    })
+
+    expect(second.logs['exec-a'].all).toBe('[stderr]\nfirst\n[stdout]\nsecond\n')
+  })
 })

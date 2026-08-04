@@ -71,7 +71,9 @@ export function RuntimeOverview({ runtime }: { runtime: RuntimeSnapshot | null }
         {runtime.projects.map(project => (
           <div className="runtime-provider-row" key={project.id}>
             <strong title={project.name}>{project.name}</strong>
-            <span>{project.active_task_count} 活动</span>
+            <span title={`WebSocket 队列 ${project.event_metrics.queue_depth}/${project.event_metrics.queue_capacity}，丢弃 ${project.event_metrics.dropped_events}，补读 ${project.event_metrics.backfilled_events}`}>
+              {project.active_task_count} 活动 · {project.event_metrics.log_events_last_minute}/min
+            </span>
             <div>
               {project.provider_health.map(health => (
                 <span

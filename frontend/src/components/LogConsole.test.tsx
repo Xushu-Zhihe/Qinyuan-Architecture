@@ -118,4 +118,58 @@ describe('LogConsole', () => {
     expect(api.planningLogs).toHaveBeenCalledWith('project-1', 'planning-a')
     expect(loadLogs).not.toHaveBeenCalled()
   })
+
+  it('merges stdout and stderr in the all view', async () => {
+    const loadLogs = vi.fn().mockResolvedValue({ stdout: 'normal output\n', stderr: 'error output\n' })
+    render(
+      <LogConsole
+        projectId="project-1"
+        execution={execution}
+        liveLogs={{ stdout: '', stderr: '' }}
+        loadLogs={loadLogs}
+      />,
+    )
+
+    await screen.findByText('normal output', { exact: false })
+    await userEvent.click(screen.getByRole('tab', { name: 'all' }))
+    expect(screen.getByText(/\[stdout\].*normal output.*\[stderr\].*error output/s)).toBeInTheDocument()
+  })
+
+  it('uses the recorded arrival order in the all view', async () => {
+    const loadLogs = vi.fn().mockResolvedValue({
+      stdout: 'second\n',
+      stderr: 'first\n',
+      all: '[stderr]\nfirst\n[stdout]\nsecond\n',
+    })
+    render(
+      <LogConsole
+        projectId="project-1"
+        execution={execution}
+        liveLogs={{ stdout: '', stderr: '', all: '' }}
+        loadLogs={loadLogs}
+      />,
+    )
+
+    await screen.findByText('second', { exact: false })
+    await userEvent.click(screen.getByRole('tab', { name: 'all' }))
+    const text = screen.getByText(/\[stderr\].*first.*\[stdout\].*second/s).textContent ?? ''
+    expect(text.indexOf('first')).toBeLessThan(text.indexOf('second'))
+  })
+
+  it('distinguishes a non-streaming provider from websocket reconnecting', () => {
+    render(
+      <LogConsole
+        projectId="project-1"
+        execution={{ ...execution, provider: 'kimi', status: 'running' }}
+        liveLogs={{ stdout: '', stderr: '' }}
+        loadLogs={vi.fn().mockResolvedValue({ stdout: '', stderr: '' })}
+        streamingSupported={false}
+        socketStatus="open"
+      />,
+    )
+
+    expect(screen.getByText('完成后输出')).toBeInTheDocument()
+    expect(screen.getByText('该 provider 仅支持任务完成后输出。')).toBeInTheDocument()
+    expect(screen.queryByText('重连中')).not.toBeInTheDocument()
+  })
 })

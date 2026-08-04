@@ -44,12 +44,52 @@ describe('ProjectDashboard', () => {
         runtime={null}
         onOpen={onOpen}
         onCreate={() => {}}
+        onDelete={async () => {}}
       />,
     )
 
     await userEvent.click(screen.getByRole('button', { name: '运行中' }))
     expect(screen.queryByText('Manual Board')).not.toBeInTheDocument()
-    await userEvent.click(screen.getByRole('button', { name: /Web Challenge 17/ }))
+    await userEvent.click(screen.getByRole('button', { name: 'Web Challenge 17，运行中' }))
     expect(onOpen).toHaveBeenCalledWith('project-web')
+  })
+
+  it('confirms project deletion without opening the project', async () => {
+    const onOpen = vi.fn()
+    const onDelete = vi.fn().mockResolvedValue(undefined)
+    render(
+      <ProjectDashboard
+        projects={projects}
+        runtime={null}
+        onOpen={onOpen}
+        onCreate={() => {}}
+        onDelete={onDelete}
+      />,
+    )
+
+    await userEvent.click(screen.getByRole('button', { name: '删除项目 Manual Board' }))
+    expect(screen.getByRole('dialog', { name: '删除项目' })).toHaveTextContent('Manual Board')
+    await userEvent.click(screen.getByRole('button', { name: '移入回收目录' }))
+
+    expect(onDelete).toHaveBeenCalledWith('project-manual')
+    expect(onOpen).not.toHaveBeenCalled()
+  })
+
+  it('keeps the delete dialog open when the server rejects deletion', async () => {
+    render(
+      <ProjectDashboard
+        projects={projects}
+        runtime={null}
+        onOpen={() => {}}
+        onCreate={() => {}}
+        onDelete={async () => { throw new Error('project still has active work') }}
+      />,
+    )
+
+    await userEvent.click(screen.getByRole('button', { name: '删除项目 Web Challenge 17' }))
+    await userEvent.click(screen.getByRole('button', { name: '移入回收目录' }))
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('project still has active work')
+    expect(screen.getByRole('dialog')).toBeInTheDocument()
   })
 })

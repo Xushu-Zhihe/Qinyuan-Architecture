@@ -11,9 +11,10 @@ import {
 
 describe('blackboard graph editing rules', () => {
   it('locks semantic editing in browse mode', () => {
-    render(<GraphToolbar mode="browse" activeTool="select" onSelect={() => {}} onAddFact={() => {}} onConnect={() => {}} onFit={() => {}} />)
+    render(<GraphToolbar mode="browse" activeTool="select" onSelect={() => {}} onAddFact={() => {}} onConnect={() => {}} removeKind="delete" onRemove={() => {}} onFit={() => {}} />)
     expect(screen.getByRole('button', { name: '添加 Fact' })).toBeDisabled()
     expect(screen.getByRole('button', { name: '连接节点' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: '删除边' })).toBeDisabled()
   })
 
   it('builds reconnect command only in edit mode', () => {

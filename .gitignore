@@ -1,18 +1,45 @@
 .env
 .venv/
+
+# Python caches and test artifacts
 __pycache__/
 *.py[cod]
+.pytest_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# Local runs and challenge workspaces
 worker/runs/
 web-data/
-.superpowers/
-.worktrees/
+workspace/
+experiments/results/
+
+# Browser and frontend test artifacts
 frontend/node_modules/
 frontend/dist/
 frontend/test-results/
 frontend/playwright-report/
+frontend/coverage/
+frontend/.vite/
 frontend/*.tsbuildinfo
-experiments/results/
+
+# Local logs, traces, profiles, and temporary output
+*.log
+*.trace
+*.prof
+*.tmp
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Build and tool worktrees
 dist/
 build/
 *.egg-info/
-.pytest_cache/
+.superpowers/
+.worktrees/

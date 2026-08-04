@@ -15,7 +15,7 @@ const typeLabel = { goal: 'GOAL', origin: 'ORIGIN', fact: 'FACT', hint: 'HINT' }
 export function BlackboardNode({ data, selected }: NodeProps<BlackboardFlowNode>) {
   const node = data.node
   return (
-    <article className={`blackboard-node blackboard-node--${node.type} ${data.isLatest ? 'is-latest' : ''} ${data.isConnecting ? 'is-connecting' : ''} ${selected ? 'is-selected' : ''}`}>
+    <article className={`blackboard-node blackboard-node--${node.type} ${node.state === 'archived' ? 'is-archived' : ''} ${data.isLatest ? 'is-latest' : ''} ${data.isConnecting ? 'is-connecting' : ''} ${selected ? 'is-selected' : ''}`}>
       <Handle type="target" position={Position.Left} />
       <div className="blackboard-node__meta">G{node.generation} · {typeLabel[node.type]}</div>
       <div className="blackboard-node__content">{node.content}</div>

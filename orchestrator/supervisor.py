@@ -30,6 +30,7 @@ from orchestrator.protocol import (
     parse_result,
     render_execution_request,
     render_intent_request,
+    render_timeout_summary_request,
 )
 from orchestrator.store import BlackboardStore, ExecutionRecord, IntentRecord
 from worker.executor import execute_provider
@@ -39,6 +40,9 @@ from worker.models import AuditConfig, LogChunk, ProviderConfig, WorkerResult
 Executor = Callable[..., Awaitable[WorkerResult]]
 ProjectStatusWriter = Callable[[str, str | None], None]
 PermitCallback = Callable[[PermitLease], Awaitable[None] | None]
+
+TIMEOUT_SUMMARY_SECONDS = 30.0
+TIMEOUT_SUMMARY_MAX_CHARS = 128 * 1024
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,6 +66,120 @@ class SupervisorPolicy:
             and self.max_executions_per_intent <= 0
         ):
             raise ValueError("max_executions_per_intent must be positive")
+
+
+class _BufferedLogPublisher:
+    def __init__(
+        self,
+        store: BlackboardStore,
+        hub: ProjectEventHub,
+        write_lock: asyncio.Lock,
+        event_type: str,
+        source: str,
+        metadata: dict[str, object],
+        merged_path: Path,
+        *,
+        flush_interval: float = 0.1,
+        max_batch_bytes: int = 16 * 1024,
+    ) -> None:
+        self.store = store
+        self.hub = hub
+        self.write_lock = write_lock
+        self.event_type = event_type
+        self.source = source
+        self.metadata = metadata
+        self.flush_interval = flush_interval
+        self.max_batch_bytes = max_batch_bytes
+        self.offsets = {"stdout": 0, "stderr": 0}
+        self.pending = {"stdout": "", "stderr": ""}
+        self._lock = asyncio.Lock()
+        self._publish_lock = asyncio.Lock()
+        self._timer: asyncio.Task[None] | None = None
+        self._merged_offset = 0
+        self._merged_path = merged_path
+        self._merged_path.parent.mkdir(parents=True, exist_ok=True)
+        self._merged_path.write_text("", encoding="utf-8")
+
+    def _take_locked(self, stream: str) -> tuple[str, int] | None:
+        text = self.pending[stream]
+        if not text:
+            return None
+        self.pending[stream] = ""
+        offset = self.offsets[stream]
+        self.offsets[stream] += len(text.encode("utf-8"))
+        return text, offset
+
+    async def _publish(self, stream: str, text: str, offset: int) -> None:
+        byte_length = len(text.encode("utf-8"))
+        merged_text = f"[{stream}]\n{text}"
+        merged_bytes = merged_text.encode("utf-8")
+        metadata = {
+            **self.metadata,
+            "stream": stream,
+            "byte_offset": offset,
+            "byte_length": byte_length,
+            "combined_byte_offset": self._merged_offset,
+            "combined_byte_length": len(merged_bytes),
+        }
+        try:
+            with self._merged_path.open("ab") as handle:
+                handle.write(merged_bytes)
+                handle.flush()
+        except OSError:
+            pass
+        self._merged_offset += len(merged_bytes)
+        async with self.write_lock:
+            event = self.store.append_event(
+                self.event_type,
+                self.source,
+                metadata,
+            )
+        await self.hub.publish(
+            {**event, "payload": {**metadata, "text": text}}
+        )
+
+    async def _flush_after_delay(self) -> None:
+        try:
+            await asyncio.sleep(self.flush_interval)
+            await self.flush()
+        except asyncio.CancelledError:
+            return
+
+    async def _drain(self, streams: tuple[str, ...]) -> None:
+        async with self._publish_lock:
+            batches: list[tuple[str, str, int]] = []
+            async with self._lock:
+                for stream in streams:
+                    batch = self._take_locked(stream)
+                    if batch is not None:
+                        batches.append((stream, *batch))
+            for stream, text, offset in batches:
+                await self._publish(stream, text, offset)
+
+    async def add(self, chunk: LogChunk) -> None:
+        should_flush = False
+        async with self._lock:
+            self.pending[chunk.stream] += chunk.text
+            if (
+                len(self.pending[chunk.stream].encode("utf-8"))
+                >= self.max_batch_bytes
+            ):
+                should_flush = True
+            if self._timer is None or self._timer.done():
+                self._timer = asyncio.create_task(self._flush_after_delay())
+        if should_flush:
+            await self._drain((chunk.stream,))
+
+    async def flush(self) -> None:
+        async with self._lock:
+            timer = self._timer
+            self._timer = None
+        if timer is not None and timer is not asyncio.current_task():
+            timer.cancel()
+        await self._drain(("stdout", "stderr"))
+
+    async def close(self) -> None:
+        await self.flush()
 
 
 class ProjectSupervisor:
@@ -661,19 +779,32 @@ class ProjectSupervisor:
             events = self.store.events_after(sequence)
         for event in events:
             await self.hub.publish(event)
-        planning = await self._run_provider(
-            replace(
-                provider,
-                timeout_seconds=provider.planning_timeout_seconds,
-            ),
-            render_intent_request(snapshot, self.challenge_dir),
-            planning_dir,
-            kind="planning",
-            on_permit=lambda lease: self._mark_planning_started(
-                planning_attempt_id,
-                lease,
-            ),
+        planning_logs = _BufferedLogPublisher(
+            self.store,
+            self.hub,
+            self.write_lock,
+            "planning.log_chunk",
+            provider.name,
+            {"planning_attempt_id": planning_attempt_id},
+            planning_dir / "combined.txt",
         )
+        try:
+            planning = await self._run_provider(
+                replace(
+                    provider,
+                    timeout_seconds=provider.planning_timeout_seconds,
+                ),
+                render_intent_request(snapshot, self.challenge_dir),
+                planning_dir,
+                kind="planning",
+                on_chunk=planning_logs.add,
+                on_permit=lambda lease: self._mark_planning_started(
+                    planning_attempt_id,
+                    lease,
+                ),
+            )
+        finally:
+            await planning_logs.close()
         if planning.status != "success":
             await self._finish_planning_attempt(
                 planning_attempt_id,
@@ -884,6 +1015,209 @@ class ProjectSupervisor:
             return None
         return execution, execution_dir
 
+    @staticmethod
+    def _bounded_timeout_output(output: str) -> str:
+        if len(output) <= TIMEOUT_SUMMARY_MAX_CHARS:
+            return output
+        head_size = TIMEOUT_SUMMARY_MAX_CHARS // 4
+        tail_size = TIMEOUT_SUMMARY_MAX_CHARS - head_size
+        return (
+            output[:head_size]
+            + "\n...[middle of captured output omitted]...\n"
+            + output[-tail_size:]
+        )
+
+    @staticmethod
+    def _recovered_timeout_result(
+        timed_out: WorkerResult,
+        summary: WorkerResult | None,
+        *,
+        mode: str,
+    ) -> WorkerResult:
+        summary_metadata: dict[str, object] = {"mode": mode}
+        if summary is not None:
+            summary_metadata.update(
+                {
+                    "status": summary.status,
+                    "duration_seconds": summary.duration_seconds,
+                    "queue_seconds": summary.queue_seconds,
+                    "stdout_path": summary.stdout_path,
+                    "stderr_path": summary.stderr_path,
+                    "work_dir": summary.work_dir,
+                    "execution_backend": summary.execution_backend,
+                    "isolation": summary.isolation,
+                    "backend_run_id": summary.backend_run_id,
+                    "cleanup_policy": summary.cleanup_policy,
+                    "cleanup_status": summary.cleanup_status,
+                    "cleanup_detail": summary.cleanup_detail,
+                    "backend_metadata": summary.backend_metadata,
+                }
+            )
+        metadata = {
+            **timed_out.backend_metadata,
+            "timeout_recovery": summary_metadata,
+        }
+        if summary is None:
+            return replace(
+                timed_out,
+                status="success",
+                backend_metadata=metadata,
+            )
+        return replace(
+            summary,
+            status="success",
+            duration_seconds=round(
+                timed_out.duration_seconds + summary.duration_seconds,
+                3,
+            ),
+            output=summary.output,
+            stdout_path=timed_out.stdout_path,
+            stderr_path=timed_out.stderr_path,
+            work_dir=timed_out.work_dir,
+            queue_seconds=timed_out.queue_seconds + summary.queue_seconds,
+            wait_reasons=tuple(
+                dict.fromkeys(timed_out.wait_reasons + summary.wait_reasons)
+            ),
+            model=(
+                summary.model
+                if summary.model != "unknown"
+                else timed_out.model
+            ),
+            cli_version=(
+                summary.cli_version
+                if summary.cli_version != "unknown"
+                else timed_out.cli_version
+            ),
+            token_usage={
+                "timed_out_run": timed_out.token_usage,
+                "timeout_summary": summary.token_usage,
+            },
+            execution_backend=timed_out.execution_backend,
+            isolation=timed_out.isolation,
+            backend_run_id=timed_out.backend_run_id,
+            cleanup_policy=timed_out.cleanup_policy,
+            cleanup_status=timed_out.cleanup_status,
+            cleanup_detail=timed_out.cleanup_detail,
+            backend_metadata=metadata,
+        )
+
+    async def _recover_timeout_result(
+        self,
+        provider: ProviderConfig,
+        intent: IntentRecord,
+        execution: ExecutionRecord,
+        execution_dir: Path,
+        execution_logs: _BufferedLogPublisher,
+        timed_out: WorkerResult,
+    ) -> WorkerResult | None:
+        existing_node_ids = set(self.store.node_types())
+        parsed = parse_result(
+            timed_out.output,
+            assigned_intent_id=intent.id,
+            existing_node_ids=existing_node_ids,
+        )
+        if (
+            parsed.status == "valid"
+            and parsed.update is not None
+            and (
+                parsed.update.facts
+                or parsed.update.edges
+                or parsed.update.goal_achieved
+            )
+        ):
+            await self._append_runtime_event(
+                "intent.timeout_result_recovered",
+                provider.name,
+                {
+                    "intent_id": intent.id,
+                    "execution_id": execution.id,
+                    "mode": "captured_result",
+                },
+            )
+            return self._recovered_timeout_result(
+                timed_out,
+                None,
+                mode="captured_result",
+            )
+
+        if self.cancel_event.is_set():
+            return None
+
+        await self._append_runtime_event(
+            "intent.timeout_summary_started",
+            provider.name,
+            {
+                "intent_id": intent.id,
+                "execution_id": execution.id,
+            },
+        )
+        summary_timeout = max(
+            0.1,
+            min(TIMEOUT_SUMMARY_SECONDS, provider.planning_timeout_seconds),
+        )
+        try:
+            summary = await self._run_provider(
+                replace(provider, timeout_seconds=summary_timeout),
+                render_timeout_summary_request(
+                    self.store.snapshot(),
+                    {
+                        "id": intent.id,
+                        "source_node_id": intent.source_node_id,
+                        "target_node_id": intent.target_node_id,
+                        "content": intent.content,
+                        "generation": intent.generation,
+                    },
+                    self.challenge_dir,
+                    self._bounded_timeout_output(timed_out.output),
+                ),
+                execution_dir / "timeout-summary",
+                kind="execution",
+                on_chunk=execution_logs.add,
+            )
+        except Exception as exc:
+            await self._append_runtime_event(
+                "intent.timeout_summary_finished",
+                provider.name,
+                {
+                    "intent_id": intent.id,
+                    "execution_id": execution.id,
+                    "status": "failed",
+                    "error_type": type(exc).__name__,
+                },
+            )
+            return None
+        parsed = parse_result(
+            summary.output,
+            assigned_intent_id=intent.id,
+            existing_node_ids=set(self.store.node_types()),
+        )
+        recovered = (
+            parsed.status == "valid"
+            and parsed.update is not None
+            and (
+                parsed.update.facts
+                or parsed.update.edges
+                or parsed.update.goal_achieved
+            )
+        )
+        await self._append_runtime_event(
+            "intent.timeout_summary_finished",
+            provider.name,
+            {
+                "intent_id": intent.id,
+                "execution_id": execution.id,
+                "status": "completed" if recovered else summary.status,
+                "result_protocol": parsed.status,
+            },
+        )
+        if not recovered:
+            return None
+        return self._recovered_timeout_result(
+            timed_out,
+            summary,
+            mode="summary_process",
+        )
+
     async def _execute_intent_attempt(
         self,
         provider: ProviderConfig,
@@ -895,54 +1229,55 @@ class ProjectSupervisor:
     ) -> IntentAttemptResult:
         execution, execution_dir = prepared
 
-        offsets = {"stdout": 0, "stderr": 0}
-
-        async def on_chunk(chunk: LogChunk) -> None:
-            offset = offsets[chunk.stream]
-            byte_length = len(chunk.text.encode("utf-8"))
-            offsets[chunk.stream] += byte_length
-            metadata = {
-                "intent_id": intent.id,
-                "execution_id": execution.id,
-                "stream": chunk.stream,
-                "byte_offset": offset,
-                "byte_length": byte_length,
-            }
-            async with self.write_lock:
-                event = self.store.append_event(
-                    "intent.log_chunk",
-                    provider.name,
-                    metadata,
-                )
-            await self.hub.publish(
-                {**event, "payload": {**metadata, "text": chunk.text}}
-            )
+        execution_logs = _BufferedLogPublisher(
+            self.store,
+            self.hub,
+            self.write_lock,
+            "intent.log_chunk",
+            provider.name,
+            {"intent_id": intent.id, "execution_id": execution.id},
+            execution_dir / "combined.txt",
+        )
 
         await self._set_agent_status(provider.name, "running")
         snapshot = self.store.snapshot()
-        result = await self._run_provider(
-            provider,
-            render_execution_request(
-                snapshot,
-                {
-                    "id": intent.id,
-                    "source_node_id": intent.source_node_id,
-                    "target_node_id": intent.target_node_id,
-                    "content": intent.content,
-                    "generation": intent.generation,
-                },
-                self.challenge_dir,
-                protocol_error=protocol_error,
-                rejected_result_line=rejected_result_line,
-            ),
-            execution_dir,
-            kind="execution",
-            on_chunk=on_chunk,
-            on_permit=lambda lease: self._mark_execution_started(
-                execution.id,
-                lease,
-            ),
-        )
+        try:
+            result = await self._run_provider(
+                provider,
+                render_execution_request(
+                    snapshot,
+                    {
+                        "id": intent.id,
+                        "source_node_id": intent.source_node_id,
+                        "target_node_id": intent.target_node_id,
+                        "content": intent.content,
+                        "generation": intent.generation,
+                    },
+                    self.challenge_dir,
+                    protocol_error=protocol_error,
+                    rejected_result_line=rejected_result_line,
+                ),
+                execution_dir,
+                kind="execution",
+                on_chunk=execution_logs.add,
+                on_permit=lambda lease: self._mark_execution_started(
+                    execution.id,
+                    lease,
+                ),
+            )
+            if result.status == "timeout":
+                recovered = await self._recover_timeout_result(
+                    provider,
+                    intent,
+                    execution,
+                    execution_dir,
+                    execution_logs,
+                    result,
+                )
+                if recovered is not None:
+                    result = recovered
+        finally:
+            await execution_logs.close()
         if result.status != "success":
             async with self.write_lock:
                 sequence = int(self.store.snapshot()["sequence"])
@@ -1034,9 +1369,19 @@ class ProjectSupervisor:
                     cleanup_detail=result.cleanup_detail,
                     backend_metadata=result.backend_metadata,
             )
-            answer = self.store.consensus(self.answer_quorum_provider_count)
-            if answer is not None:
-                self._write_project_status("achieved", answer)
+            consensus = self.store.consensus_details(
+                self.answer_quorum_provider_count
+            )
+            if consensus is not None:
+                self.store.append_event(
+                    "answer.consensus_reached",
+                    "orchestrator",
+                    consensus,
+                )
+                self._write_project_status(
+                    "achieved",
+                    str(consensus["answer"]),
+                )
                 self.cancel_event.set()
             events = self.store.events_after(sequence)
         for event in events:

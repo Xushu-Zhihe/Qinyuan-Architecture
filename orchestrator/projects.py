@@ -85,6 +85,10 @@ class ProjectPathError(ValueError):
     pass
 
 
+class ProjectConflictError(ValueError):
+    pass
+
+
 @dataclass(frozen=True, slots=True)
 class ProjectRecord:
     id: str
@@ -236,6 +240,15 @@ class ProjectRegistry:
                 raise KeyError(project_id)
         return self.get(project_id)
 
+    def delete(self, project_id: str) -> None:
+        with self.connection:
+            cursor = self.connection.execute(
+                "DELETE FROM projects WHERE id = ?",
+                (project_id,),
+            )
+            if cursor.rowcount != 1:
+                raise KeyError(project_id)
+
     def resolve_project_path(
         self,
         project_id: str,
@@ -268,6 +281,7 @@ class ProjectService:
         self.health_probe = health_probe
         self._handles: dict[str, ProjectHandle] = {}
         self._supervisors: dict[str, ProjectSupervisor] = {}
+        self._deleting: set[str] = set()
         # Registry rows and their Blackboard databases are created together.
         # Keep readers from observing the small initialization window between
         # those two writes (notably while /api/runtime polls during E2E).
@@ -280,6 +294,18 @@ class ProjectService:
             registry_record = self.registry.update_status(handle.id, status)
         handle.record = registry_record
         return handle.record
+
+    def provider_health(self, handle: ProjectHandle) -> tuple[dict[str, object], ...]:
+        result: list[dict[str, object]] = []
+        for record in handle.store.provider_health():
+            enriched = dict(record)
+            config = self.provider_configs.get(str(record["provider"]))
+            enriched["stream_format"] = config.stream_format if config else "unknown"
+            enriched["streaming_supported"] = (
+                config.streaming_supported if config else None
+            )
+            result.append(enriched)
+        return tuple(result)
 
     def _set_project_status(
         self,
@@ -354,6 +380,8 @@ class ProjectService:
 
     def get_handle(self, project_id: str) -> ProjectHandle:
         with self._lock:
+            if project_id in self._deleting:
+                raise ProjectConflictError("project deletion is in progress")
             handle = self._handles.get(project_id)
             if handle is not None:
                 self._sync_project_status(handle)
@@ -374,6 +402,8 @@ class ProjectService:
         with self._lock:
             result = []
             for record in self.registry.list():
+                if record.id in self._deleting:
+                    continue
                 handle = self.get_handle(record.id)
                 snapshot = handle.store.snapshot()
                 result.append(
@@ -507,7 +537,8 @@ class ProjectService:
             projects.append(
                 {
                     **summary,
-                    "provider_health": list(handle.store.provider_health()),
+                    "provider_health": list(self.provider_health(handle)),
+                    "event_metrics": handle.hub.metrics(),
                     "active_task_count": len(project_tasks),
                     "recovery": handle.store.recovery_summary(),
                 }
@@ -527,6 +558,87 @@ class ProjectService:
         elif handle.store.snapshot()["project"]["status"] != "achieved":
             self._set_project_status(handle, "stopped")
         return self._sync_project_status(handle)
+
+    def _restore_handle(
+        self,
+        record: ProjectRecord,
+        hub: ProjectEventHub,
+    ) -> ProjectHandle:
+        handle = ProjectHandle(
+            record,
+            BlackboardStore.open(record.path / "blackboard.db", record.id),
+            LayoutStore(record.path),
+            hub,
+        )
+        handle.store.ensure_provider_health(record.providers)
+        self._handles[record.id] = handle
+        return handle
+
+    async def delete_project(self, project_id: str) -> Path:
+        with self._lock:
+            if project_id in self._deleting:
+                raise ProjectConflictError("project deletion is already in progress")
+            handle = self.get_handle(project_id)
+            self._deleting.add(project_id)
+            supervisor = self._supervisors.get(project_id)
+
+        try:
+            if supervisor is not None:
+                await supervisor.stop()
+
+            with self._lock:
+                if handle.store.active_work_count() != 0:
+                    raise ProjectConflictError(
+                        "project still has active planning or execution records"
+                    )
+
+                projects_root = self.registry.projects_root.resolve()
+                project_path = handle.record.path.resolve()
+                if (
+                    project_path == projects_root
+                    or projects_root not in project_path.parents
+                ):
+                    raise ProjectConflictError(
+                        "project path is outside the managed projects directory"
+                    )
+                if not project_path.is_dir():
+                    raise ProjectConflictError("project directory does not exist")
+
+                trash_root = self.registry.data_root / ".trash"
+                trash_root.mkdir(parents=True, exist_ok=True)
+                timestamp = datetime.now(timezone.utc).strftime(
+                    "%Y%m%dT%H%M%S%fZ"
+                )
+                trash_path = trash_root / f"{project_id}-{timestamp}"
+                record = handle.record
+                hub = handle.hub
+
+                handle.store.close()
+                self._handles.pop(project_id, None)
+                self._supervisors.pop(project_id, None)
+                try:
+                    project_path.replace(trash_path)
+                except Exception:
+                    self._restore_handle(record, hub)
+                    raise
+
+                try:
+                    self.registry.delete(project_id)
+                except Exception:
+                    try:
+                        trash_path.replace(project_path)
+                    finally:
+                        if project_path.is_dir():
+                            self._restore_handle(record, hub)
+                    raise
+                return trash_path
+        except ProjectConflictError:
+            raise
+        except Exception as exc:
+            raise ProjectConflictError(f"project deletion failed: {exc}") from exc
+        finally:
+            with self._lock:
+                self._deleting.discard(project_id)
 
 
 def project_record_dict(record: ProjectRecord) -> dict[str, object]:

@@ -11,6 +11,7 @@ from worker.models import (
     HealthCheckConfig,
     ProviderConfig,
 )
+from worker.output_adapters import STREAM_FORMATS
 
 
 ALLOWED_PLACEHOLDERS = {"challenge_dir", "work_dir"}
@@ -155,6 +156,15 @@ def _parse_provider(raw: object, index: int) -> ProviderConfig:
         "planning_timeout_seconds",
         min(timeout, 120.0),
     )
+    stream_format = raw.get("stream_format", "text")
+    if stream_format not in STREAM_FORMATS:
+        raise ConfigError(
+            f"provider {name!r}.stream_format must be one of "
+            f"{sorted(STREAM_FORMATS)}"
+        )
+    streaming_supported = raw.get("streaming_supported", True)
+    if not isinstance(streaming_supported, bool):
+        raise ConfigError(f"provider {name!r}.streaming_supported must be a boolean")
     if (
         not isinstance(planning_timeout, (int, float))
         or isinstance(planning_timeout, bool)
@@ -211,6 +221,8 @@ def _parse_provider(raw: object, index: int) -> ProviderConfig:
             if isinstance(container_command, list)
             else None
         ),
+        stream_format=str(stream_format),
+        streaming_supported=streaming_supported,
     )
 
 

@@ -3,7 +3,6 @@ import {
   Controls,
   MiniMap,
   ReactFlow,
-  reconnectEdge,
   useEdgesState,
   useNodesState,
   type Connection,
@@ -63,14 +62,17 @@ export function buildReconnectCommand(
   return mode === 'edit' ? { edgeId, source, target } : null
 }
 
-export function buildFlowEdges(edges: BlackboardEdge[]): Edge[] {
+export function buildFlowEdges(
+  edges: BlackboardEdge[],
+  onSelect?: (edge: BlackboardEdge) => void,
+): Edge[] {
   return edges.map(edge => ({
     id: edge.id,
     type: edge.type === 'intent' ? 'intent' : 'default',
     source: edge.from_node,
     target: edge.to_node,
     label: edge.type === 'intent' ? undefined : edge.type,
-    data: { edge },
+    data: { edge, onSelect },
     reconnectable: edge.type === 'intent',
   }))
 }
@@ -86,8 +88,9 @@ export function buildFlowNodes(
   layout: LayoutSnapshot,
   highestGeneration: number,
   connectingNodeId: string | null = null,
+  showArchived = false,
 ): BlackboardFlowNode[] {
-  return nodes.filter(node => node.state !== 'archived').map((node, index) => ({
+  return nodes.filter(node => showArchived || node.state !== 'archived').map((node, index) => ({
     id: node.id,
     type: 'blackboard',
     position: layout.nodes[node.id] ?? autoPosition(node, index),
@@ -109,6 +112,7 @@ export function BlackboardGraph({
   highestGeneration,
   mode,
   connectingNodeId,
+  showArchived = false,
   onSelect,
   onLayoutChange,
   onReconnectIntent,
@@ -121,6 +125,7 @@ export function BlackboardGraph({
   highestGeneration: number
   mode: WorkspaceMode
   connectingNodeId?: string | null
+  showArchived?: boolean
   onSelect: (selection: { kind: 'node'; value: BlackboardNodeModel } | { kind: 'edge'; value: BlackboardEdge } | null) => void
   onLayoutChange: (nodeId: string, position: { x: number; y: number }) => void
   onReconnectIntent: (command: ReconnectCommand) => void
@@ -128,10 +133,15 @@ export function BlackboardGraph({
   onInstance?: (instance: BlackboardFlowInstance) => void
 }) {
   const initialNodes = useMemo(
-    () => buildFlowNodes(sourceNodes, layout, highestGeneration, connectingNodeId),
-    [sourceNodes, layout, highestGeneration, connectingNodeId],
+    () => buildFlowNodes(sourceNodes, layout, highestGeneration, connectingNodeId, showArchived),
+    [sourceNodes, layout, highestGeneration, connectingNodeId, showArchived],
   )
-  const initialEdges = useMemo(() => buildFlowEdges(sourceEdges), [sourceEdges])
+  const initialEdges = useMemo(() => {
+    const visibleNodes = new Set(initialNodes.map(node => node.id))
+    return buildFlowEdges(sourceEdges.filter(edge => (
+      visibleNodes.has(edge.from_node) && visibleNodes.has(edge.to_node)
+    )), edge => onSelect({ kind: 'edge', value: edge }))
+  }, [initialNodes, onSelect, sourceEdges])
   const [nodes, setNodes, onNodesChange] = useNodesState(initialNodes)
   const [edges, setEdges, onEdgesChange] = useEdgesState(initialEdges)
 
@@ -142,7 +152,6 @@ export function BlackboardGraph({
     if (!connection.source || !connection.target) return
     const command = buildReconnectCommand(mode, oldEdge.id, connection.source, connection.target)
     if (!command) return
-    setEdges(current => reconnectEdge(oldEdge, connection, current))
     onReconnectIntent(command)
   }
 
@@ -158,11 +167,13 @@ export function BlackboardGraph({
         onNodeClick={(_, node) => onSelect({ kind: 'node', value: node.data.node as BlackboardNodeModel })}
         onEdgeClick={(_, edge) => onSelect({ kind: 'edge', value: edge.data?.edge as BlackboardEdge })}
         onPaneClick={() => onSelect(null)}
-        onNodeDragStop={(_, node) => onLayoutChange(node.id, node.position)}
+        onNodeDragStop={(_, node) => { if (mode === 'edit') onLayoutChange(node.id, node.position) }}
         onReconnect={handleReconnect}
         onConnect={connection => connection.source && connection.target && onConnectNodes(connection.source, connection.target)}
         nodesConnectable={mode === 'edit'}
+        nodesDraggable={mode === 'edit'}
         edgesReconnectable={mode === 'edit'}
+        deleteKeyCode={null}
         onInit={onInstance}
         fitView
         minZoom={0.15}

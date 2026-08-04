@@ -96,6 +96,14 @@ def prune_audit_logs(
         paths = (
             _project_file(project_dir, record["stdout_path"]),
             _project_file(project_dir, record["stderr_path"]),
+            _project_file(
+                project_dir,
+                Path(str(record["stdout_path"])).with_name("combined.txt"),
+            ),
+            _project_file(
+                project_dir,
+                Path(str(record["stdout_path"])).with_name("stdout.raw.jsonl"),
+            ),
         )
         if any(path is None for path in paths):
             continue
@@ -184,11 +192,14 @@ def export_audit_bundle(
                 "files": [],
             }
             if record["logs_retained"]:
-                for stream in ("stdout", "stderr"):
-                    path = _project_file(
-                        project_dir,
-                        record[f"{stream}_path"],
-                    )
+                artifacts = {
+                    "stdout.txt": record["stdout_path"],
+                    "stderr.txt": record["stderr_path"],
+                    "combined.txt": Path(str(record["stdout_path"])).with_name("combined.txt"),
+                    "stdout.raw.jsonl": Path(str(record["stdout_path"])).with_name("stdout.raw.jsonl"),
+                }
+                for filename, path_value in artifacts.items():
+                    path = _project_file(project_dir, path_value)
                     if path is None or not path.is_file():
                         continue
                     try:
@@ -199,7 +210,7 @@ def export_audit_bundle(
                     except OSError:
                         continue
                     archive_name = (
-                        f"logs/{record['kind']}/{record['id']}/{stream}.txt"
+                        f"logs/{record['kind']}/{record['id']}/{filename}"
                     )
                     archive.writestr(
                         archive_name,

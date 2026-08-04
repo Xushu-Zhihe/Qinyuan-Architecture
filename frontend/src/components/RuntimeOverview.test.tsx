@@ -14,6 +14,7 @@ const runtime: RuntimeSnapshot = {
     id: 'project-1', name: 'Runtime project', mode: 'run', status: 'running', challenge_path: null,
     providers: ['codex'], agent_limit: 1, created_at: 'now', updated_at: 'now', last_opened_at: 'now',
     active_task_count: 1, recovery: { planning_attempts: 0, executions: 0, total: 0, latest_at: null },
+    event_metrics: { subscribers: 1, queue_depth: 0, queue_capacity: 500, published_events: 3, dropped_events: 0, backfilled_events: 1, log_events_last_minute: 2 },
     provider_health: [{ provider: 'codex', status: 'healthy', consecutive_failures: 0, last_error: null, checked_at: 'now', cooldown_until: null, updated_at: 'now', cli_version: 'codex 1' }],
   }],
   active_tasks: [{ kind: 'execution', id: 'execution-1', project_id: 'project-1', project_name: 'Runtime project', provider: 'codex', status: 'running', queued_at: 'now', started_at: 'now', intent_id: 'intent-1' }],

@@ -15,6 +15,21 @@
 
 ## [Unreleased]
 
+- 项目支持可恢复删除：运行项目会先停止并清理，项目目录移动到
+  `web-data/.trash/`，注册表删除失败会自动回滚。
+- 编辑模式支持 Fact/Hint 归档、恢复、无执行历史边删除；浏览模式锁定语义修改，
+  活动图隐藏归档节点及悬空边。
+- 统一 Planning/Execution 流式日志、WebSocket 重连补读、按到达顺序持久化的
+  stdout/stderr 合并视图，并显示 provider 非实时输出状态、日志事件速率、丢弃和补读指标。
+- Claude `stream-json` 同时保留可读输出与独立的脱敏原始 JSONL 审计文件。
+- 图快照改用独立只读事务，避免运行轮询与 Supervisor 并发访问共享 SQLite 游标。
+- 最终答案协议增加 `answer_key` 和 schema v4 迁移，按规范答案指纹达成跨 provider 共识。
+
+### Upgrade notes
+
+- Blackboard schema v4 会在首次打开旧数据库时自动迁移，并在同目录生成迁移前备份。
+- Kimi 默认标记为仅任务完成后输出；Codex 与 Claude 使用流式适配器。
+
 - 正式许可证待仓库所有者选择。
 - Windows Server 上的真实容器运行仍需要可用的容器守护进程；Linux CI 负责执行
   fake-provider Docker 集成测试。

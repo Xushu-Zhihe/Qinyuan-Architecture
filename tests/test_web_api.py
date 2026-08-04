@@ -58,6 +58,35 @@ class WebApiTests(unittest.TestCase):
         )
         self.assertEqual(graph.json()["layout"]["revision"], 0)
 
+    def test_deletes_project_to_recoverable_trash(self) -> None:
+        challenge = self.data_root / "challenge"
+        challenge.mkdir()
+        challenge_file = challenge / "keep.txt"
+        challenge_file.write_text("keep", encoding="utf-8")
+        response = self.client.post(
+            "/api/projects",
+            json={
+                "name": "Disposable",
+                "goal": "Goal",
+                "origin": "Origin",
+                "hints": [],
+                "mode": "manual",
+                "providers": [],
+                "agent_limit": 1,
+                "challenge_path": str(challenge),
+            },
+        )
+        project_id = response.json()["id"]
+
+        deleted = self.client.delete(f"/api/projects/{project_id}")
+
+        self.assertEqual(deleted.status_code, 204, deleted.text)
+        self.assertEqual(self.client.get(f"/api/projects/{project_id}").status_code, 404)
+        trash = tuple((self.data_root / ".trash").glob(f"{project_id}-*"))
+        self.assertEqual(len(trash), 1)
+        self.assertTrue((trash[0] / "blackboard.db").is_file())
+        self.assertEqual(challenge_file.read_text(encoding="utf-8"), "keep")
+
     def test_reopens_persisted_project_in_new_app(self) -> None:
         project = self.create_project("Persistent")
 
@@ -190,6 +219,64 @@ class WebApiTests(unittest.TestCase):
         ).json()
         self.assertNotIn(edge["id"], [item["id"] for item in refreshed["edges"]])
 
+    def test_archives_restores_node_and_filters_connected_edges(self) -> None:
+        project = self.create_project()
+        project_id = project["id"]
+        graph = self.client.get(f"/api/projects/{project_id}/graph").json()
+        goal = next(node for node in graph["nodes"] if node["type"] == "goal")
+        fact = self.client.post(
+            f"/api/projects/{project_id}/nodes",
+            json={"type": "fact", "content": "Temporary fact"},
+        ).json()
+        edge = self.client.post(
+            f"/api/projects/{project_id}/edges",
+            json={
+                "type": "intent",
+                "from_node_id": fact["id"],
+                "to_node_id": goal["id"],
+                "content": "Investigate",
+            },
+        ).json()
+
+        archived = self.client.delete(
+            f"/api/projects/{project_id}/nodes/{fact['id']}"
+        )
+        active_graph = self.client.get(
+            f"/api/projects/{project_id}/graph"
+        ).json()
+        audit_graph = self.client.get(
+            f"/api/projects/{project_id}/graph?include_archived=true"
+        ).json()
+
+        self.assertEqual(archived.status_code, 204)
+        self.assertNotIn(fact["id"], [node["id"] for node in active_graph["nodes"]])
+        self.assertNotIn(edge["id"], [item["id"] for item in active_graph["edges"]])
+        self.assertIn(fact["id"], [node["id"] for node in audit_graph["nodes"]])
+        self.assertIn(edge["id"], [item["id"] for item in audit_graph["edges"]])
+
+        restored = self.client.post(
+            f"/api/projects/{project_id}/nodes/{fact['id']}/restore"
+        )
+        restored_graph = self.client.get(
+            f"/api/projects/{project_id}/graph"
+        ).json()
+        self.assertEqual(restored.status_code, 204)
+        self.assertIn(fact["id"], [node["id"] for node in restored_graph["nodes"]])
+        self.assertIn(edge["id"], [item["id"] for item in restored_graph["edges"]])
+
+    def test_goal_and_execution_output_cannot_be_archived(self) -> None:
+        project = self.create_project()
+        project_id = project["id"]
+        handle = self.client.app.state.projects.get_handle(project_id)
+        goal_id = handle.store.node_id("goal")
+
+        response = self.client.delete(
+            f"/api/projects/{project_id}/nodes/{goal_id}"
+        )
+
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("human Fact or Hint", response.json()["detail"])
+
     def test_execution_from_another_project_is_not_visible(self) -> None:
         first = self.create_project("First")
         second = self.create_project("Second")
@@ -224,6 +311,10 @@ class WebApiTests(unittest.TestCase):
         stderr = work_dir / "stderr.txt"
         stdout.write_text("abcdefghij", encoding="utf-8")
         stderr.write_text("error-data", encoding="utf-8")
+        (work_dir / "combined.txt").write_text(
+            "[stderr]\nerror-data[stdout]\nabcdefghij",
+            encoding="utf-8",
+        )
         attempt_id = handle.store.start_planning_attempt(
             "codex",
             3,
@@ -249,7 +340,7 @@ class WebApiTests(unittest.TestCase):
         )
         second = self.client.get(
             f"/api/projects/{project_id}/planning-attempts/"
-            f"{attempt_id}/logs?stdout_offset=4&stderr_offset=4&limit=4"
+            f"{attempt_id}/logs?stdout_offset=4&stderr_offset=4&all_offset=4&limit=4"
         )
 
         self.assertEqual(listed.status_code, 200)
@@ -257,12 +348,14 @@ class WebApiTests(unittest.TestCase):
         self.assertEqual(detail.json()["status"], "idle")
         self.assertEqual(first.json()["stdout"], "abcd")
         self.assertEqual(first.json()["stderr"], "erro")
+        self.assertEqual(first.json()["all"], "[std")
         self.assertEqual(
             first.json()["pagination"]["stdout"]["next_offset"],
             4,
         )
         self.assertTrue(first.json()["pagination"]["stdout"]["has_more"])
         self.assertEqual(second.json()["stdout"], "efgh")
+        self.assertEqual(second.json()["all"], "err]")
 
     def test_audit_export_endpoint_returns_redacted_zip(self) -> None:
         project = self.create_project("Audit export")
@@ -329,6 +422,8 @@ class WebApiTests(unittest.TestCase):
         self.assertEqual(payload["projects"][0]["active_task_count"], 1)
         self.assertEqual(payload["active_tasks"][0]["id"], execution.id)
         self.assertEqual(payload["active_tasks"][0]["kind"], "execution")
+        self.assertEqual(payload["projects"][0]["event_metrics"]["queue_capacity"], 500)
+        self.assertEqual(payload["projects"][0]["event_metrics"]["backfilled_events"], 0)
 
     def test_reopen_achieved_project_isolates_previous_answer(self) -> None:
         project = self.create_project("Reopen")

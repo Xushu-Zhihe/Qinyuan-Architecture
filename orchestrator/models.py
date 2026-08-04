@@ -61,6 +61,7 @@ class ExecutionUpdate:
     edges: tuple[RelationProposal, ...]
     goal_achieved: bool
     final_answer: str | None
+    answer_key: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

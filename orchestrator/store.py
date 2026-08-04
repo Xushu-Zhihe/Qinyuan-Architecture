@@ -194,9 +194,14 @@ CREATE TABLE final_answers (
     id TEXT PRIMARY KEY,
     provider TEXT NOT NULL,
     answer TEXT NOT NULL,
+    answer_key TEXT NOT NULL,
+    answer_fingerprint TEXT NOT NULL,
     goal_version INTEGER NOT NULL,
     created_at TEXT NOT NULL
 );
+
+CREATE INDEX final_answers_by_consensus
+ON final_answers(goal_version, answer_fingerprint, provider);
 
 CREATE TABLE events (
     sequence INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -244,7 +249,7 @@ def _timestamp_after(value: str, seconds: float) -> str:
     ).isoformat()
 
 
-BLACKBOARD_SCHEMA_VERSION = 3
+BLACKBOARD_SCHEMA_VERSION = 4
 
 
 def _add_columns(
@@ -314,10 +319,41 @@ def _migrate_blackboard_v3(connection: sqlite3.Connection) -> None:
     _add_columns(connection, "planning_attempts", backend_columns)
 
 
+def _migrate_blackboard_v4(connection: sqlite3.Connection) -> None:
+    _add_columns(
+        connection,
+        "final_answers",
+        {
+            "answer_key": "TEXT NOT NULL DEFAULT ''",
+            "answer_fingerprint": "TEXT NOT NULL DEFAULT ''",
+        },
+    )
+    rows = connection.execute(
+        "SELECT id, answer FROM final_answers"
+    ).fetchall()
+    for row in rows:
+        answer_key = _normalize(str(row["answer"]))
+        connection.execute(
+            """
+            UPDATE final_answers
+            SET answer_key = ?, answer_fingerprint = ?
+            WHERE id = ?
+            """,
+            (answer_key, _fingerprint(answer_key), str(row["id"])),
+        )
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS final_answers_by_consensus
+        ON final_answers(goal_version, answer_fingerprint, provider)
+        """
+    )
+
+
 BLACKBOARD_MIGRATIONS = {
     1: ("provider health state", _migrate_blackboard_v1),
     2: ("planning and execution audit", _migrate_blackboard_v2),
     3: ("execution backend audit", _migrate_blackboard_v3),
+    4: ("canonical final answer consensus", _migrate_blackboard_v4),
 }
 
 
@@ -357,6 +393,7 @@ BLACKBOARD_REQUIRED_SCHEMA = {
         "cleanup_status",
         "backend_metadata_json",
     },
+    "final_answers": {"answer_key", "answer_fingerprint"},
 }
 
 
@@ -766,7 +803,10 @@ class BlackboardStore:
 
     def _node_generation(self, node_id: str) -> int:
         row = self.connection.execute(
-            "SELECT generation FROM nodes WHERE id = ? AND project_id = ?",
+            """
+            SELECT generation FROM nodes
+            WHERE id = ? AND project_id = ? AND state = 'active'
+            """,
             (node_id, self.project_id),
         ).fetchone()
         if row is None:
@@ -1503,6 +1543,7 @@ class BlackboardStore:
                 self._record_answer(
                     str(execution["provider"]),
                     update.final_answer,
+                    update.answer_key,
                 )
 
             self.connection.execute(
@@ -1706,14 +1747,28 @@ class BlackboardStore:
             return "cancelled"
         return "failed"
 
-    def record_answer(self, provider: str, answer: str) -> None:
+    def record_answer(
+        self,
+        provider: str,
+        answer: str,
+        answer_key: str | None = None,
+    ) -> None:
         with self.connection:
-            self._record_answer(provider, answer)
+            self._record_answer(provider, answer, answer_key)
 
-    def _record_answer(self, provider: str, answer: str) -> None:
+    def _record_answer(
+        self,
+        provider: str,
+        answer: str,
+        answer_key: str | None = None,
+    ) -> None:
         normalized = answer.strip()
         if not normalized:
             raise ValueError("answer must be non-empty")
+        canonical = _normalize(answer_key if answer_key is not None else answer)
+        if not canonical:
+            raise ValueError("answer_key must be non-empty")
+        fingerprint = _fingerprint(canonical)
         goal_version = int(
             self.connection.execute(
                 "SELECT goal_version FROM projects WHERE id = ?",
@@ -1723,18 +1778,35 @@ class BlackboardStore:
         self.connection.execute(
             """
             INSERT INTO final_answers(
-                id, provider, answer, goal_version, created_at
-            ) VALUES (?, ?, ?, ?, ?)
+                id, provider, answer, answer_key, answer_fingerprint,
+                goal_version, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
-            (_id("answer"), provider, normalized, goal_version, _now()),
+            (
+                _id("answer"),
+                provider,
+                normalized,
+                canonical,
+                fingerprint,
+                goal_version,
+                _now(),
+            ),
         )
         self._event(
             "answer.proposed",
             provider,
-            {"answer": normalized, "goal_version": goal_version},
+            {
+                "answer": normalized,
+                "answer_key": canonical,
+                "answer_fingerprint": fingerprint,
+                "goal_version": goal_version,
+            },
         )
 
-    def consensus(self, available_providers: int) -> str | None:
+    def consensus_details(
+        self,
+        available_providers: int,
+    ) -> dict[str, object] | None:
         goal_version = int(
             self.connection.execute(
                 "SELECT goal_version FROM projects WHERE id = ?",
@@ -1743,21 +1815,46 @@ class BlackboardStore:
         )
         rows = self.connection.execute(
             """
-            SELECT trim(answer) AS answer, COUNT(DISTINCT provider) AS supporters
+            SELECT answer_fingerprint, MIN(answer_key) AS answer_key,
+                   COUNT(DISTINCT provider) AS supporters
             FROM final_answers
             WHERE goal_version = ?
-            GROUP BY trim(answer)
-            ORDER BY supporters DESC, answer
+            GROUP BY answer_fingerprint
+            ORDER BY supporters DESC, answer_key
             """,
             (goal_version,),
         ).fetchall()
         threshold = 1 if available_providers == 1 else 2
         winners = [
-            str(row["answer"])
+            row
             for row in rows
             if int(row["supporters"]) >= threshold
         ]
-        return winners[0] if len(winners) == 1 else None
+        if len(winners) != 1:
+            return None
+        winner = winners[0]
+        display = self.connection.execute(
+            """
+            SELECT answer FROM final_answers
+            WHERE goal_version = ? AND answer_fingerprint = ?
+            ORDER BY length(answer) DESC, created_at DESC, id DESC
+            LIMIT 1
+            """,
+            (goal_version, str(winner["answer_fingerprint"])),
+        ).fetchone()
+        if display is None:
+            return None
+        return {
+            "answer": str(display["answer"]),
+            "answer_key": str(winner["answer_key"]),
+            "answer_fingerprint": str(winner["answer_fingerprint"]),
+            "supporters": int(winner["supporters"]),
+            "threshold": threshold,
+        }
+
+    def consensus(self, available_providers: int) -> str | None:
+        details = self.consensus_details(available_providers)
+        return str(details["answer"]) if details is not None else None
 
     def candidates(self) -> tuple[str, ...]:
         goal_version = int(
@@ -1913,6 +2010,16 @@ class BlackboardStore:
             """
         ).fetchone()
         return int(row["count"])
+
+    def active_work_count(self) -> int:
+        planning = self.connection.execute(
+            """
+            SELECT COUNT(*) AS count FROM planning_attempts
+            WHERE project_id = ? AND status IN ('queued', 'running')
+            """,
+            (self.project_id,),
+        ).fetchone()
+        return self.active_execution_count() + int(planning["count"])
 
     def mark_interrupted(self) -> int:
         now = _now()
@@ -2155,6 +2262,30 @@ class BlackboardStore:
 
     def archive_node(self, node_id: str, source: str = "human") -> None:
         with self.connection:
+            row = self.connection.execute(
+                """
+                SELECT n.type, n.state,
+                    EXISTS(
+                        SELECT 1 FROM node_provenance AS p
+                        WHERE p.node_id = n.id AND p.source = 'human'
+                    ) AS is_human,
+                    EXISTS(
+                        SELECT 1 FROM intent_outputs AS output
+                        WHERE output.node_id = n.id
+                    ) AS is_execution_output
+                FROM nodes AS n
+                WHERE n.id = ? AND n.project_id = ?
+                """,
+                (node_id, self.project_id),
+            ).fetchone()
+            if row is None:
+                raise KeyError(node_id)
+            if row["state"] == "archived":
+                raise ValueError("node is already archived")
+            if row["type"] not in {"fact", "hint"} or not row["is_human"]:
+                raise ValueError("only human Fact or Hint nodes can be archived")
+            if row["is_execution_output"]:
+                raise ValueError("node produced by an execution cannot be archived")
             cursor = self.connection.execute(
                 """
                 UPDATE nodes SET state = 'archived'
@@ -2170,7 +2301,46 @@ class BlackboardStore:
                 {"node_id": node_id, "state": "archived"},
             )
 
+    def restore_node(self, node_id: str, source: str = "human") -> None:
+        with self.connection:
+            row = self.connection.execute(
+                """
+                SELECT type, state FROM nodes
+                WHERE id = ? AND project_id = ?
+                """,
+                (node_id, self.project_id),
+            ).fetchone()
+            if row is None:
+                raise KeyError(node_id)
+            if row["state"] != "archived":
+                raise ValueError("node is not archived")
+            if row["type"] not in {"fact", "hint"}:
+                raise ValueError("only Fact or Hint nodes can be restored")
+            self.connection.execute(
+                "UPDATE nodes SET state = 'active' WHERE id = ?",
+                (node_id,),
+            )
+            self._event(
+                "graph.node_updated",
+                source,
+                {"node_id": node_id, "state": "active"},
+            )
+
     def snapshot(self) -> dict[str, object]:
+        connection = sqlite3.connect(self.path, check_same_thread=False)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys = ON")
+        connection.execute("PRAGMA busy_timeout = 5000")
+        connection.execute("PRAGMA query_only = ON")
+        reader = BlackboardStore(self.path, connection, self.project_id)
+        try:
+            connection.execute("BEGIN")
+            return reader._snapshot_from_connection()
+        finally:
+            connection.rollback()
+            connection.close()
+
+    def _snapshot_from_connection(self) -> dict[str, object]:
         project_row = self.connection.execute(
             "SELECT * FROM projects WHERE id = ?",
             (self.project_id,),

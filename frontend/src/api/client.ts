@@ -1,11 +1,13 @@
 import type {
   ExecutionLogs,
+  ExecutionLogPage,
   IntentExecution,
   LayoutSnapshot,
   PlanningAttempt,
   ProjectSnapshot,
   ProjectSummary,
   RuntimeSnapshot,
+  SyncedExecutionLogs,
 } from '../types'
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -24,17 +26,48 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return response.json() as Promise<T>
 }
 
+async function syncLogs(path: string): Promise<SyncedExecutionLogs> {
+  let stdoutOffset = 0
+  let stderrOffset = 0
+  let allOffset = 0
+  let stdout = ''
+  let stderr = ''
+  let all = ''
+  while (true) {
+    const separator = path.includes('?') ? '&' : '?'
+    const page = await request<ExecutionLogPage>(
+      `${path}${separator}stdout_offset=${stdoutOffset}&stderr_offset=${stderrOffset}&all_offset=${allOffset}&limit=1048576`,
+    )
+    stdout += page.stdout
+    stderr += page.stderr
+    all += page.all ?? ''
+    stdoutOffset = page.pagination.stdout.next_offset
+    stderrOffset = page.pagination.stderr.next_offset
+    allOffset = page.pagination.all.next_offset
+    if (!page.pagination.stdout.has_more && !page.pagination.stderr.has_more && !page.pagination.all.has_more) {
+      return {
+        logs: { stdout, stderr, all },
+        offsets: { stdout: stdoutOffset, stderr: stderrOffset, all: allOffset },
+      }
+    }
+  }
+}
+
 export const api = {
   listProjects: () => request<ProjectSummary[]>('/api/projects'),
   getRuntime: () => request<RuntimeSnapshot>('/api/runtime'),
   createProject: (payload: object) =>
     request<ProjectSummary>('/api/projects', { method: 'POST', body: JSON.stringify(payload) }),
-  getGraph: (projectId: string) =>
-    request<ProjectSnapshot>(`/api/projects/${projectId}/graph`),
+  deleteProject: (projectId: string) =>
+    request<void>(`/api/projects/${projectId}`, { method: 'DELETE' }),
+  getGraph: (projectId: string, includeArchived = false) =>
+    request<ProjectSnapshot>(`/api/projects/${projectId}/graph?include_archived=${includeArchived}`),
   addNode: (projectId: string, payload: Record<string, unknown>) =>
     request(`/api/projects/${projectId}/nodes`, { method: 'POST', body: JSON.stringify(payload) }),
   archiveNode: (projectId: string, nodeId: string) =>
     request<void>(`/api/projects/${projectId}/nodes/${nodeId}`, { method: 'DELETE' }),
+  restoreNode: (projectId: string, nodeId: string) =>
+    request<void>(`/api/projects/${projectId}/nodes/${nodeId}/restore`, { method: 'POST' }),
   addEdge: (projectId: string, payload: Record<string, unknown>) =>
     request(`/api/projects/${projectId}/edges`, { method: 'POST', body: JSON.stringify(payload) }),
   updateEdge: (projectId: string, edgeId: string, payload: Record<string, unknown>) =>
@@ -53,8 +86,12 @@ export const api = {
     request<IntentExecution>(`/api/projects/${projectId}/executions/${executionId}/retry`, { method: 'POST' }),
   executionLogs: (projectId: string, executionId: string) =>
     request<ExecutionLogs>(`/api/projects/${projectId}/executions/${executionId}/logs`),
+  syncExecutionLogs: (projectId: string, executionId: string) =>
+    syncLogs(`/api/projects/${projectId}/executions/${executionId}/logs`),
   planningLogs: (projectId: string, attemptId: string) =>
     request<ExecutionLogs>(`/api/projects/${projectId}/planning-attempts/${attemptId}/logs`),
+  syncPlanningLogs: (projectId: string, attemptId: string) =>
+    syncLogs(`/api/projects/${projectId}/planning-attempts/${attemptId}/logs`),
   planningAttempts: (projectId: string) =>
     request<PlanningAttempt[]>(`/api/projects/${projectId}/planning-attempts`),
   auditExportUrl: (projectId: string) => `/api/projects/${projectId}/audit/export`,

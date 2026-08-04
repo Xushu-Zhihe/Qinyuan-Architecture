@@ -12,12 +12,16 @@ Web 工作区使用节点表示 `Goal`、`Origin`、`Fact` 和 `Hint`，使用�
 - 将 Intent 建模为边，不再创建 Intent 节点。
 - 同一 Intent 合并语义边，同时保留各 provider 的独立 execution 和日志。
 - 通过项目级 WebSocket 实时接收图事件和 stdout/stderr 分块。
+- 断线后按事件序号和日志字节偏移自动补读，避免实时日志丢失或重复。
+- 按实际到达顺序持久化“全部”日志；Claude 可读输出与脱敏原始 JSONL 分开审计。
 - 从 Fact 追溯 producing Intent、execution 和 provider。
 - 持久化 Planning Attempt、调度等待、健康检查、熔断、恢复和执行指标。
 - 分页读取受大小与保留策略约束的日志，并导出二次脱敏的项目审计包。
 - 从全局运行面板查看配额、排队任务、活动任务和 provider 健康状态。
 - 在项目诊断侧栏筛选规划/执行记录、查看日志、人工重试和受控重新打开项目。
 - 同时运行多个相互隔离的项目。
+- 项目可安全移入 `web-data/.trash/`，不会触碰外部 `challenge_path` 或 workspace。
+- 编辑模式可归档/恢复人工 Fact、Hint，并删除没有执行历史的边；浏览模式为只读。
 - 通过 FastAPI 提供 REST、WebSocket 和生产前端静态资源。
 
 ## 架构
@@ -127,6 +131,13 @@ Set-Location ..
 `requirements.lock`。前端必须使用 `npm ci`，`frontend/package-lock.json` 和
 `frontend/package.json` 中的依赖版本均已固定。
 
+运行后端测试时使用开发依赖锁定文件：
+
+```powershell
+.\.venv\Scripts\python -m pip install -r requirements-dev.lock
+.\.venv\Scripts\python -m unittest discover -s tests -p "test*.py"
+```
+
 打开 [http://127.0.0.1:8000](http://127.0.0.1:8000)。服务只监听 localhost。
 
 生产入口默认读取：
@@ -168,7 +179,18 @@ Vite 默认地址为 `http://127.0.0.1:5173`，并将 `/api` 和 `/ws` 代理到
 
 创建项目后立即启动所选 provider。每个 provider 异步规划和执行，页面实时显示项目状态、Intent execution 和日志。
 
+### 删除项目
+
+项目卡片的垃圾桶按钮会显示项目名称和状态。确认后，运行中的 Supervisor 会先停止，
+SQLite 与文件句柄关闭，项目目录移动到 `web-data/.trash/<project-id>-<timestamp>/`，
+随后才删除 `projects.db` 注册记录。移动或注册表操作失败会恢复原目录和可读句柄；
+服务返回 409 时，卡片和全部数据保持不变。
+
 ## Provider 配置
+
+`stream_format` 控制原始 provider 输出适配器；`streaming_supported: false` 会在界面明确
+显示“完成后输出”，不会被误认为 WebSocket 断线。Claude 使用 `claude-stream-json`，
+Codex 使用纯文本流式适配器，Kimi 默认仅在任务完成后输出。
 
 默认配置文件是 `worker/providers.json`：
 
@@ -506,7 +528,7 @@ npm test -- --run
 npm run build
 ```
 
-2026-07-30 当前工作区基线：后端全量测试包含容器集成用例（没有显式启用 Docker 时跳过），前端单元测试 `21/21`、Playwright E2E `8/8`，生产构建成功；最终发布前应以本次验收输出的实际测试总数为准。fake Docker backend 测试与真实 Docker boundary 测试必须分别报告。
+2026-07-31 当前工作区基线：pytest `162 passed, 3 skipped`，跳过项为未显式启用的容器集成用例；前端单元测试 `28/28`、Playwright E2E `14/14`，生产构建成功。fake Docker backend 测试与真实 Docker boundary 测试必须分别报告。
 
 Playwright E2E 首次运行前安装浏览器：
 
@@ -517,12 +539,12 @@ npm run test:e2e
 
 E2E 使用本地 fake providers，不调用真实模型，不消耗模型额度。测试覆盖桌面
 `1440x900`、窄屏 `390x844`、多项目隔离、人工建图后启动、运行总览、规划/执行
-诊断、Intent 跳转、审计入口、真实日志文件和 WebSocket 更新。测试端口可通过
+诊断、Intent 跳转、审计入口、真实日志文件、WebSocket 更新与断线重连。测试端口可通过
 `BLACKBOARD_E2E_API_PORT` 与 `BLACKBOARD_E2E_WEB_PORT` 调整。
 
 ## 发布与版本
 
-`VERSION` 是当前版本号（目前为 `0.2.0`），并且必须与 `pyproject.toml` 和
+`VERSION` 是当前版本号（目前为 `0.3.0`），并且必须与 `pyproject.toml` 和
 `frontend/package.json` 一致。发布前运行：
 
 ```powershell

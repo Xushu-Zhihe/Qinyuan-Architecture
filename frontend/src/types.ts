@@ -77,6 +77,8 @@ export interface ProviderHealth {
   cooldown_until: string | null
   updated_at: string
   cli_version: string
+  stream_format?: string
+  streaming_supported?: boolean
 }
 
 export interface RecoverySummary {
@@ -150,6 +152,29 @@ export interface ProjectEvent {
 export interface ExecutionLogs {
   stdout: string
   stderr: string
+  all?: string
+}
+
+export interface LogPageState {
+  offset: number
+  next_offset: number
+  total_bytes: number
+  has_more: boolean
+  retained: boolean
+}
+
+export interface ExecutionLogPage extends ExecutionLogs {
+  pagination: {
+    limit_bytes: number
+    stdout: LogPageState
+    stderr: LogPageState
+    all: LogPageState
+  }
+}
+
+export interface SyncedExecutionLogs {
+  logs: ExecutionLogs
+  offsets: { stdout: number; stderr: number; all: number }
 }
 
 export interface RuntimeTask {
@@ -177,6 +202,15 @@ export interface RuntimeProject extends ProjectSummary {
   provider_health: ProviderHealth[]
   active_task_count: number
   recovery: RecoverySummary
+  event_metrics: {
+    subscribers: number
+    queue_depth: number
+    queue_capacity: number
+    published_events: number
+    dropped_events: number
+    backfilled_events: number
+    log_events_last_minute: number
+  }
 }
 
 export interface RuntimeSnapshot {

@@ -152,6 +152,11 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(executions[0]["status"], "completed")
         self.assertEqual(executions[0]["retry_count"], 0)
         self.assertEqual(executions[0]["duration_seconds"], 0.01)
+        self.assertEqual(
+            (Path(str(executions[0]["stdout_path"])).with_name("combined.txt"))
+            .read_text(encoding="utf-8"),
+            "[stdout]\nworking\n",
+        )
 
     async def test_planning_uses_dedicated_timeout(self) -> None:
         store, root = self.make_store()
@@ -214,6 +219,213 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(status, "completed")
         self.assertEqual(observed_timeouts, [30, 900])
+
+    async def test_timeout_recovers_verified_facts_with_summary_pass(self) -> None:
+        store, root = self.make_store()
+        calls: list[str] = []
+
+        async def execute(config, request, challenge_dir, work_dir, **kwargs):
+            if "BLACKBOARD_INTENT:" in request:
+                calls.append("planning")
+                return self.result(
+                    config.name,
+                    work_dir,
+                    "BLACKBOARD_INTENT: "
+                    + json.dumps(
+                        {
+                            "action": "plan",
+                            "source_node_id": store.node_id("origin"),
+                            "target_node_id": store.node_id("goal"),
+                            "content": "Inspect the challenge",
+                        }
+                    ),
+                )
+            if "immediate timeout-recovery pass" in request:
+                calls.append("timeout-summary")
+                intent_id = next(
+                    edge["id"]
+                    for edge in store.snapshot()["edges"]
+                    if edge["type"] == "intent"
+                )
+                return self.result(
+                    config.name,
+                    work_dir,
+                    "BLACKBOARD_RESULT: "
+                    + json.dumps(
+                        {
+                            "intent_id": intent_id,
+                            "facts": [
+                                {
+                                    "ref": "recovered-fact",
+                                    "content": "The captured output verified the key.",
+                                }
+                            ],
+                            "edges": [],
+                            "goal_achieved": False,
+                            "answer_key": None,
+                            "final_answer": None,
+                        }
+                    ),
+                )
+            calls.append("execution")
+            return self.result(
+                config.name,
+                work_dir,
+                "The key was verified before the provider timed out.",
+                status="timeout",
+            )
+
+        supervisor = ProjectSupervisor(
+            store=store,
+            providers=(provider("codex"),),
+            challenge_dir=None,
+            project_dir=root,
+            execute=execute,
+            max_iterations=1,
+        )
+
+        status = await supervisor.run_agent_once("codex")
+
+        self.assertEqual(status, "completed")
+        self.assertEqual(calls, ["planning", "execution", "timeout-summary"])
+        facts = [
+            node["content"]
+            for node in store.snapshot()["nodes"]
+            if node["type"] == "fact"
+        ]
+        self.assertEqual(facts, ["The captured output verified the key."])
+        execution = store.executions()[0]
+        self.assertEqual(execution["status"], "completed")
+        self.assertEqual(
+            execution["backend_metadata"]["timeout_recovery"]["mode"],
+            "summary_process",
+        )
+
+    async def test_timeout_with_existing_result_does_not_start_second_pass(self) -> None:
+        store, root = self.make_store()
+        calls = 0
+
+        async def execute(config, request, challenge_dir, work_dir, **kwargs):
+            nonlocal calls
+            calls += 1
+            if "BLACKBOARD_INTENT:" in request:
+                return self.result(
+                    config.name,
+                    work_dir,
+                    "BLACKBOARD_INTENT: "
+                    + json.dumps(
+                        {
+                            "action": "plan",
+                            "source_node_id": store.node_id("origin"),
+                            "target_node_id": store.node_id("goal"),
+                            "content": "Inspect the challenge",
+                        }
+                    ),
+                )
+            intent_id = next(
+                edge["id"]
+                for edge in store.snapshot()["edges"]
+                if edge["type"] == "intent"
+            )
+            return self.result(
+                config.name,
+                work_dir,
+                "BLACKBOARD_RESULT: "
+                + json.dumps(
+                    {
+                        "intent_id": intent_id,
+                        "facts": [
+                            {"ref": "partial", "content": "Captured fact"}
+                        ],
+                        "edges": [],
+                        "goal_achieved": False,
+                        "answer_key": None,
+                        "final_answer": None,
+                    }
+                ),
+                status="timeout",
+            )
+
+        supervisor = ProjectSupervisor(
+            store=store,
+            providers=(provider("codex"),),
+            challenge_dir=None,
+            project_dir=root,
+            execute=execute,
+            max_iterations=1,
+        )
+
+        status = await supervisor.run_agent_once("codex")
+
+        self.assertEqual(status, "completed")
+        self.assertEqual(calls, 2)
+        self.assertEqual(
+            store.executions()[0]["backend_metadata"]["timeout_recovery"]["mode"],
+            "captured_result",
+        )
+
+    async def test_empty_timeout_summary_preserves_timeout_failure(self) -> None:
+        store, root = self.make_store()
+
+        async def execute(config, request, challenge_dir, work_dir, **kwargs):
+            if "BLACKBOARD_INTENT:" in request:
+                return self.result(
+                    config.name,
+                    work_dir,
+                    "BLACKBOARD_INTENT: "
+                    + json.dumps(
+                        {
+                            "action": "plan",
+                            "source_node_id": store.node_id("origin"),
+                            "target_node_id": store.node_id("goal"),
+                            "content": "Inspect the challenge",
+                        }
+                    ),
+                )
+            if "immediate timeout-recovery pass" not in request:
+                return self.result(
+                    config.name,
+                    work_dir,
+                    "No verified result was produced.",
+                    status="timeout",
+                )
+            intent_id = next(
+                edge["id"]
+                for edge in store.snapshot()["edges"]
+                if edge["type"] == "intent"
+            )
+            return self.result(
+                config.name,
+                work_dir,
+                "BLACKBOARD_RESULT: "
+                + json.dumps(
+                    {
+                        "intent_id": intent_id,
+                        "facts": [],
+                        "edges": [],
+                        "goal_achieved": False,
+                        "answer_key": None,
+                        "final_answer": None,
+                    }
+                ),
+            )
+
+        supervisor = ProjectSupervisor(
+            store=store,
+            providers=(provider("codex"),),
+            challenge_dir=None,
+            project_dir=root,
+            execute=execute,
+            max_iterations=1,
+        )
+
+        status = await supervisor.run_agent_once("codex")
+
+        self.assertEqual(status, "health_failure")
+        self.assertEqual(store.executions()[0]["status"], "timeout")
+        self.assertFalse(
+            any(node["type"] == "fact" for node in store.snapshot()["nodes"])
+        )
 
     async def test_stale_bootstrap_plan_replans_without_failure(self) -> None:
         store, root = self.make_store()
@@ -633,7 +845,12 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
                         "facts": [],
                         "edges": [],
                         "goal_achieved": True,
-                        "final_answer": "flag{same}",
+                        "answer_key": "flag{same}",
+                        "final_answer": (
+                            "flag{same}"
+                            if config.name == "codex"
+                            else "Verified answer: flag{same}"
+                        ),
                     }
                 ),
             )
@@ -653,7 +870,7 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(store.snapshot()["project"]["status"], "achieved")
         self.assertEqual(
             store.snapshot()["project"]["final_answer"],
-            "flag{same}",
+            "Verified answer: flag{same}",
         )
 
     async def test_protocol_error_retries_same_intent_and_reaches_goal(

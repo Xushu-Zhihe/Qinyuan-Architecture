@@ -43,7 +43,8 @@
         "failure_threshold": 3
       },
       "planning_timeout_seconds": 120,
-      "timeout_seconds": 900
+      "timeout_seconds": 900,
+      "streaming_supported": true
     },
     {
       "name": "claude",
@@ -54,9 +55,13 @@
         "claude",
         "-p",
         "--output-format",
-        "text",
+        "stream-json",
+        "--verbose",
+        "--include-partial-messages",
         "--dangerously-skip-permissions"
       ],
+      "stream_format": "claude-stream-json",
+      "streaming_supported": true,
       "health_check": {
         "command": [
           "claude",
@@ -89,6 +94,7 @@
         "max_cooldown_seconds": 300,
         "failure_threshold": 3
       },
+      "streaming_supported": false,
       "timeout_seconds": 900
     }
   ]

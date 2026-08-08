@@ -4,7 +4,7 @@ import asyncio
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from worker.models import LogChunk, ProviderConfig, WorkerResult
 
@@ -53,6 +53,7 @@ class ExecutionBackend(ABC):
         request: str,
         challenge_dir: Path | None,
         work_dir: Path,
+        environment: Mapping[str, str] | None = None,
     ) -> BackendHandle:
         raise NotImplementedError
 
@@ -99,5 +100,7 @@ class ExecutionBackend(ABC):
         on_chunk: Any = None,
         cancel_event: asyncio.Event | None = None,
         max_log_bytes: int = 8 * 1024 * 1024,
+        environment: Mapping[str, str] | None = None,
+        execution_context: object | None = None,
     ) -> WorkerResult:
         raise NotImplementedError

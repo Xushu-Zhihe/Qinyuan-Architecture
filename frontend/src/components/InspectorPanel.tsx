@@ -67,6 +67,7 @@ export function InspectorPanel({
     ?? executions[0]?.id
     ?? null
   const [activeExecutionId, setActiveExecutionId] = useState<string | null>(preferredExecutionId)
+  const activeExecution = executions.find(execution => execution.id === activeExecutionId)
 
   useEffect(() => {
     setActiveExecutionId(preferredExecutionId)
@@ -191,10 +192,13 @@ export function InspectorPanel({
                   </button>
                 ))}
               </div>
-              {executions.find(execution => execution.id === activeExecutionId) && (
+              {activeExecution && (
                 <dl className="execution-summary">
                   <div><dt>执行</dt><dd>{activeExecutionId}</dd></div>
-                  <div><dt>状态</dt><dd>{executionStatusLabel[executions.find(execution => execution.id === activeExecutionId)?.status ?? ''] ?? executions.find(execution => execution.id === activeExecutionId)?.status}</dd></div>
+                  <div><dt>状态</dt><dd>{executionStatusLabel[activeExecution.status] ?? activeExecution.status}</dd></div>
+                  <div><dt>Provider</dt><dd>{activeExecution.provider_isolation ?? activeExecution.isolation ?? 'unknown'}</dd></div>
+                  <div><dt>工具</dt><dd>{activeExecution.tool_isolation === 'container' ? `container · ${activeExecution.tool_cleanup_status ?? 'unknown'}` : 'not applicable'}</dd></div>
+                  {activeExecution.tool_sandbox_image && <div><dt>镜像</dt><dd>{activeExecution.tool_sandbox_image}</dd></div>}
                 </dl>
               )}
             </section>

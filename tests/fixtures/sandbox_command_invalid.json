@@ -1,0 +1,8 @@
+{
+  "protocol_version": 2,
+  "call_id": "",
+  "tool": "powershell",
+  "arguments": "nmap 127.0.0.1",
+  "timeout_seconds": 0,
+  "agent_run_id": "model-selected-run"
+}

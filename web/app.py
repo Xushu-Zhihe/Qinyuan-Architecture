@@ -47,6 +47,7 @@ def create_app(
     coordinator_config: CoordinatorConfig | None = None,
     audit_config: AuditConfig | None = None,
     frontend_dist: Path | None = None,
+    runtime=None,
 ) -> FastAPI:
     service = ProjectService(
         (data_root or DEFAULT_DATA_ROOT).resolve(),
@@ -65,13 +66,18 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        if runtime is not None:
+            await runtime.start()
         yield
         await autopilot.aclose()
         await service.aclose()
+        if runtime is not None:
+            await runtime.close()
 
     app = FastAPI(title="Blackboard", lifespan=lifespan)
     app.state.projects = service
     app.state.autopilot = autopilot
+    app.state.provider_runtime = runtime
     dist_root = (frontend_dist or DEFAULT_FRONTEND_DIST).resolve()
     index_file = dist_root / "index.html"
     assets_root = dist_root / "assets"

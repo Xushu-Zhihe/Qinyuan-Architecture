@@ -1,0 +1,7 @@
+{
+  "protocol_version": 1,
+  "call_id": "tool-call-id",
+  "tool": "nmap",
+  "arguments": ["-sT", "-Pn", "-n", "-p", "80,443", "127.0.0.1"],
+  "timeout_seconds": 60
+}

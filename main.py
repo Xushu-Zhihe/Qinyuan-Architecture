@@ -12,7 +12,10 @@ from worker.config import (
     load_coordinator_config,
     load_execution_config,
     load_provider_configs,
+    load_tool_sandbox_config,
+    validate_provider_tool_config,
 )
+from worker.runtime import ProviderRuntime
 
 
 DEFAULT_CONFIG = Path(__file__).resolve().parent / "worker" / "providers.json"
@@ -82,22 +85,35 @@ def run_cli(
         execution_backend = build_execution_backend(
             load_execution_config(args.config.resolve())
         )
-        result = asyncio.run(
-            run_orchestration(
-                providers=providers,
-                goal=goal,
-                origin=origin,
-                hints=tuple(
-                    hint.strip() for hint in args.hint if hint.strip()
-                ),
-                challenge_dir=challenge_dir,
-                runs_root=DEFAULT_RUNS_ROOT,
-                max_iterations=args.max_iterations,
-                coordinator_config=coordinator_config,
-                audit_config=audit_config,
-                execute=execution_backend.execute,
+        tool_config = load_tool_sandbox_config(args.config.resolve())
+        validate_provider_tool_config(providers, tool_config)
+
+        async def run() -> object:
+            runtime = ProviderRuntime(
+                execution_backend,
+                tool_config,
+                DEFAULT_RUNS_ROOT / "artifacts",
             )
-        )
+            await runtime.start()
+            try:
+                return await run_orchestration(
+                    providers=providers,
+                    goal=goal,
+                    origin=origin,
+                    hints=tuple(
+                        hint.strip() for hint in args.hint if hint.strip()
+                    ),
+                    challenge_dir=challenge_dir,
+                    runs_root=DEFAULT_RUNS_ROOT,
+                    max_iterations=args.max_iterations,
+                    coordinator_config=coordinator_config,
+                    audit_config=audit_config,
+                    execute=runtime.execute,
+                )
+            finally:
+                await runtime.close()
+
+        result = asyncio.run(run())
     except ConfigError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1

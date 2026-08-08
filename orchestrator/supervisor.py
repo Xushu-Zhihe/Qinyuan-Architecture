@@ -234,6 +234,14 @@ class ProjectSupervisor:
             execute,
             "max_log_bytes",
         )
+        self._execute_accepts_invocation_context = (
+            self._declares_keyword(execute, "execution_kind")
+            or self._declares_keyword(execute, "thread_id")
+        )
+        self._execute_accepts_tool_profile_override = self._declares_keyword(
+            execute,
+            "tool_profile_override",
+        )
         self.cancel_event = asyncio.Event()
         self.wake_event = asyncio.Event()
         self.write_lock = asyncio.Lock()
@@ -253,6 +261,13 @@ class ProjectSupervisor:
             parameter.kind is inspect.Parameter.VAR_KEYWORD
             for parameter in parameters.values()
         )
+
+    @staticmethod
+    def _declares_keyword(function: Callable[..., object], name: str) -> bool:
+        try:
+            return name in inspect.signature(function).parameters
+        except (TypeError, ValueError):
+            return False
 
     async def _append_runtime_event(
         self,
@@ -556,6 +571,7 @@ class ProjectSupervisor:
         kind: str,
         on_chunk=None,
         on_permit: PermitCallback | None = None,
+        tool_profile_override: str | None = None,
     ) -> WorkerResult:
         async def run() -> WorkerResult:
             kwargs = {
@@ -564,6 +580,14 @@ class ProjectSupervisor:
             }
             if self._execute_accepts_log_limit:
                 kwargs["max_log_bytes"] = self.audit_config.max_log_bytes
+            if self._execute_accepts_invocation_context:
+                kwargs["execution_kind"] = kind
+                kwargs["thread_id"] = work_dir.name
+                if (
+                    tool_profile_override is not None
+                    and self._execute_accepts_tool_profile_override
+                ):
+                    kwargs["tool_profile_override"] = tool_profile_override
             return await self.execute(
                 provider,
                 request,
@@ -1173,6 +1197,7 @@ class ProjectSupervisor:
                 execution_dir / "timeout-summary",
                 kind="execution",
                 on_chunk=execution_logs.add,
+                tool_profile_override="no_tools",
             )
         except Exception as exc:
             await self._append_runtime_event(

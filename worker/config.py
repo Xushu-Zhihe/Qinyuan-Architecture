@@ -10,6 +10,7 @@ from worker.models import (
     ExecutionConfig,
     HealthCheckConfig,
     ProviderConfig,
+    ToolSandboxConfig,
 )
 from worker.output_adapters import STREAM_FORMATS
 
@@ -165,6 +166,35 @@ def _parse_provider(raw: object, index: int) -> ProviderConfig:
     streaming_supported = raw.get("streaming_supported", True)
     if not isinstance(streaming_supported, bool):
         raise ConfigError(f"provider {name!r}.streaming_supported must be a boolean")
+    tool_profile = raw.get("tool_sandbox_profile")
+    if tool_profile is not None and tool_profile not in {"nmap", "no_tools"}:
+        raise ConfigError(
+            f"provider {name!r}.tool_sandbox_profile must be nmap or no_tools"
+        )
+    provider_isolation = raw.get("provider_isolation", "unsafe_local")
+    if provider_isolation not in {"host_process", "unsafe_local", "container"}:
+        raise ConfigError(
+            f"provider {name!r}.provider_isolation is invalid"
+        )
+    host_tools_disabled = raw.get("host_tools_disabled", False)
+    if not isinstance(host_tools_disabled, bool):
+        raise ConfigError(f"provider {name!r}.host_tools_disabled must be a boolean")
+    if enabled and tool_profile == "nmap" and not host_tools_disabled:
+        raise ConfigError(
+            f"provider {name!r} enables a tool Sandbox but does not confirm "
+            "host_tools_disabled"
+        )
+    authorized_targets_raw = raw.get("authorized_targets", [])
+    if not isinstance(authorized_targets_raw, list) or any(
+        not isinstance(target, str)
+        or not target.strip()
+        or "\x00" in target
+        or len(target.encode("utf-8")) > 4096
+        for target in authorized_targets_raw
+    ):
+        raise ConfigError(
+            f"provider {name!r}.authorized_targets must be a list of safe strings"
+        )
     if (
         not isinstance(planning_timeout, (int, float))
         or isinstance(planning_timeout, bool)
@@ -223,6 +253,10 @@ def _parse_provider(raw: object, index: int) -> ProviderConfig:
         ),
         stream_format=str(stream_format),
         streaming_supported=streaming_supported,
+        tool_sandbox_profile=tool_profile,
+        provider_isolation=str(provider_isolation),
+        host_tools_disabled=host_tools_disabled,
+        authorized_targets=tuple(target.strip() for target in authorized_targets_raw),
     )
 
 
@@ -502,3 +536,76 @@ def load_execution_config(path: Path) -> ExecutionConfig:
             setup_timeout_seconds=setup_timeout,
         ),
     )
+
+
+def load_tool_sandbox_config(path: Path) -> ToolSandboxConfig:
+    payload = _load_payload(path)
+    raw = payload.get("tool_sandbox", {})
+    if not isinstance(raw, dict):
+        raise ConfigError("tool_sandbox must be an object")
+    defaults = ToolSandboxConfig()
+    enabled = raw.get("enabled", defaults.enabled)
+    if not isinstance(enabled, bool):
+        raise ConfigError("tool_sandbox.enabled must be a boolean")
+    runtime = _string_list(
+        raw.get("runtime_command", list(defaults.runtime_command)),
+        "tool_sandbox.runtime_command",
+    )
+    image = raw.get("image", defaults.image)
+    digest = raw.get("image_digest", defaults.image_digest)
+    network = raw.get("network", defaults.network)
+    memory = raw.get("memory_limit", defaults.memory_limit)
+    for value, field in ((image, "image"), (network, "network"), (memory, "memory_limit")):
+        if not isinstance(value, str) or not value.strip():
+            raise ConfigError(f"tool_sandbox.{field} must be a non-empty string")
+    if network == "host":
+        raise ConfigError("tool_sandbox.network cannot be host")
+    if digest is not None and (not isinstance(digest, str) or not digest.strip()):
+        raise ConfigError("tool_sandbox.image_digest must be a non-empty string")
+    command_timeout = _positive_number(
+        raw.get("max_command_timeout_seconds", defaults.max_command_timeout_seconds),
+        "tool_sandbox.max_command_timeout_seconds",
+    )
+    kill_grace = _positive_number(
+        raw.get("kill_grace_seconds", defaults.kill_grace_seconds),
+        "tool_sandbox.kill_grace_seconds",
+    )
+    api_timeout = _positive_number(
+        raw.get("docker_api_timeout_seconds", defaults.docker_api_timeout_seconds),
+        "tool_sandbox.docker_api_timeout_seconds",
+    )
+    if command_timeout > 900:
+        raise ConfigError("tool_sandbox.max_command_timeout_seconds cannot exceed 900")
+    if api_timeout <= command_timeout + kill_grace:
+        raise ConfigError("tool_sandbox.docker_api_timeout_seconds must include command timeout and kill grace")
+    return ToolSandboxConfig(
+        enabled=enabled,
+        runtime_command=runtime,
+        image=image.strip(),
+        image_digest=digest.strip() if isinstance(digest, str) else None,
+        network=network.strip(),
+        max_output_bytes=_positive_integer(raw.get("max_output_bytes", defaults.max_output_bytes), "tool_sandbox.max_output_bytes"),
+        max_artifact_bytes=_positive_integer(raw.get("max_artifact_bytes", defaults.max_artifact_bytes), "tool_sandbox.max_artifact_bytes"),
+        max_command_timeout_seconds=command_timeout,
+        docker_api_timeout_seconds=api_timeout,
+        kill_grace_seconds=kill_grace,
+        memory_limit=memory.strip(),
+        cpu_limit=_positive_number(raw.get("cpu_limit", defaults.cpu_limit), "tool_sandbox.cpu_limit"),
+        pids_limit=_positive_integer(raw.get("pids_limit", defaults.pids_limit), "tool_sandbox.pids_limit"),
+    )
+
+
+def validate_provider_tool_config(
+    providers: tuple[ProviderConfig, ...],
+    tool_sandbox: ToolSandboxConfig,
+) -> None:
+    enabled_tool_providers = tuple(
+        provider
+        for provider in providers
+        if provider.enabled and provider.tool_sandbox_profile == "nmap"
+    )
+    if enabled_tool_providers and not tool_sandbox.enabled:
+        names = ", ".join(provider.name for provider in enabled_tool_providers)
+        raise ConfigError(
+            f"tool_sandbox.enabled must be true for Nmap providers: {names}"
+        )

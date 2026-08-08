@@ -42,6 +42,18 @@ export interface IntentExecution {
   cli_version?: string
   token_usage?: object | string
   logs_retained?: boolean
+  execution_backend?: string
+  isolation?: string
+  provider_isolation?: string
+  tool_isolation?: string
+  backend_run_id?: string | null
+  cleanup_status?: string
+  cleanup_detail?: string | null
+  agent_run_id?: string | null
+  tool_sandbox_id?: string | null
+  tool_sandbox_image?: string | null
+  tool_cleanup_status?: string | null
+  tool_profile?: string | null
 }
 
 export interface PlanningAttempt {
@@ -66,6 +78,18 @@ export interface PlanningAttempt {
   cli_version: string
   token_usage: object | string
   logs_retained: boolean
+  execution_backend?: string
+  isolation?: string
+  provider_isolation?: string
+  tool_isolation?: string
+  backend_run_id?: string | null
+  cleanup_status?: string
+  cleanup_detail?: string | null
+  agent_run_id?: string | null
+  tool_sandbox_id?: string | null
+  tool_sandbox_image?: string | null
+  tool_cleanup_status?: string | null
+  tool_profile?: string | null
 }
 
 export interface ProviderHealth {

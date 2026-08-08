@@ -9,6 +9,7 @@ import time
 from collections.abc import Awaitable, Callable
 from contextlib import nullcontext
 from pathlib import Path
+from typing import Mapping
 
 from worker.backend import (
     BackendHandle,
@@ -239,6 +240,7 @@ class LocalExecutionBackend(ExecutionBackend):
         request: str,
         challenge_dir: Path | None,
         work_dir: Path,
+        environment: Mapping[str, str] | None = None,
     ) -> BackendHandle:
         kwargs: dict[str, object] = {}
         if os.name == "nt":
@@ -251,6 +253,7 @@ class LocalExecutionBackend(ExecutionBackend):
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            env=(dict(os.environ) | dict(environment)) if environment is not None else None,
             **kwargs,
         )
         return BackendHandle(process=process, run_id=str(process.pid))
@@ -368,6 +371,8 @@ class LocalExecutionBackend(ExecutionBackend):
         on_chunk: ChunkCallback | None = None,
         cancel_event: asyncio.Event | None = None,
         max_log_bytes: int = 8 * 1024 * 1024,
+        environment: Mapping[str, str] | None = None,
+        execution_context: object | None = None,
     ) -> WorkerResult:
         work_dir.mkdir(parents=True, exist_ok=True)
         stdout_path = work_dir / "stdout.txt"
@@ -388,6 +393,7 @@ class LocalExecutionBackend(ExecutionBackend):
                 request,
                 challenge_dir,
                 work_dir,
+                environment,
             )
             handle.metadata["stream_format"] = provider.stream_format
             stdin_task, stdout_task, stderr_task = await self.stream(
@@ -465,6 +471,8 @@ async def execute_provider(
     on_chunk: ChunkCallback | None = None,
     cancel_event: asyncio.Event | None = None,
     max_log_bytes: int = 8 * 1024 * 1024,
+    environment: Mapping[str, str] | None = None,
+    execution_context: object | None = None,
 ) -> WorkerResult:
     """Backward-compatible local executor.
 
@@ -479,4 +487,6 @@ async def execute_provider(
         on_chunk=on_chunk,
         cancel_event=cancel_event,
         max_log_bytes=max_log_bytes,
+        environment=environment,
+        execution_context=execution_context,
     )

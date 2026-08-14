@@ -6,6 +6,7 @@ import shutil
 import signal
 import subprocess
 import time
+import uuid
 from collections.abc import Awaitable, Callable
 from contextlib import nullcontext
 from pathlib import Path
@@ -169,6 +170,19 @@ async def _write_stdin(
 async def _terminate_process_tree(process: asyncio.subprocess.Process) -> None:
     if process.returncode is not None:
         return
+
+    # Give providers a short chance to close MCP clients and external
+    # resources before falling back to the existing forceful termination.
+    try:
+        if os.name == "nt":
+            process.send_signal(getattr(signal, "CTRL_BREAK_EVENT", signal.SIGTERM))
+        else:
+            os.killpg(process.pid, signal.SIGTERM)
+        await asyncio.wait_for(process.wait(), timeout=5.0)
+        return
+    except (OSError, ProcessLookupError, asyncio.TimeoutError, ValueError):
+        pass
+
     if os.name == "nt":
         try:
             killer = await asyncio.create_subprocess_exec(
@@ -245,15 +259,23 @@ class LocalExecutionBackend(ExecutionBackend):
             kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
         else:
             kwargs["start_new_session"] = True
+        cancel_file = work_dir / f".provider-cancel-{uuid.uuid4().hex}"
+        environment = os.environ.copy()
+        environment["QINYUAN_PROVIDER_CANCEL_FILE"] = str(cancel_file.resolve())
         process = await asyncio.create_subprocess_exec(
             *_resolve_executable(command),
             cwd=work_dir,
+            env=environment,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             **kwargs,
         )
-        return BackendHandle(process=process, run_id=str(process.pid))
+        return BackendHandle(
+            process=process,
+            run_id=str(process.pid),
+            metadata={"cancel_file": str(cancel_file.resolve())},
+        )
 
     async def stream(
         self,
@@ -350,7 +372,23 @@ class LocalExecutionBackend(ExecutionBackend):
         return outcome
 
     async def cancel(self, handle: BackendHandle) -> None:
-        await _terminate_process_tree(handle.process)
+        cancel_file_value = handle.metadata.get("cancel_file")
+        cancel_file = (
+            Path(str(cancel_file_value)) if cancel_file_value is not None else None
+        )
+        try:
+            if cancel_file is not None:
+                try:
+                    cancel_file.write_text("cancel\n", encoding="utf-8")
+                except OSError:
+                    pass
+            await _terminate_process_tree(handle.process)
+        finally:
+            if cancel_file is not None:
+                try:
+                    cancel_file.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
     async def cleanup(
         self,

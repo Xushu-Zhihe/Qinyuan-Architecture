@@ -322,6 +322,21 @@ class ProviderConfigTests(unittest.TestCase):
         self.assertTrue(codex.streaming_supported)
         self.assertTrue(claude.streaming_supported)
         self.assertFalse(providers["kimi"].streaming_supported)
+        qinyuan = providers["qinyuan-agent"]
+        self.assertEqual(
+            qinyuan.command,
+            (
+                "qinyuan-agent",
+                "--challenge-dir",
+                "{challenge_dir}",
+                "--work-dir",
+                "{work_dir}",
+            ),
+        )
+        self.assertEqual(qinyuan.max_running, 2)
+        self.assertEqual(qinyuan.planning_timeout_seconds, 120)
+        self.assertFalse(qinyuan.streaming_supported)
+        self.assertIsNotNone(qinyuan.health_check)
         self.assertTrue(all(provider.health_check for provider in providers.values()))
 
     def test_rejects_invalid_health_check_cooldown_range(self) -> None:

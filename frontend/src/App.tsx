@@ -88,7 +88,7 @@ export default function App() {
       <ProjectDashboard projects={projects} runtime={runtime} onOpen={openProject} onCreate={() => setDialogOpen(true)} onDelete={deleteProject} onOpenAutopilot={openAutopilot} />
       <NewProjectDialog
         open={dialogOpen}
-        providers={['codex', 'claude', 'kimi']}
+        providers={['codex', 'claude', 'kimi', 'qinyuan-agent']}
         onSubmit={createProject}
         onClose={() => setDialogOpen(false)}
       />

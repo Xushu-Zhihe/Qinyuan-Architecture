@@ -96,6 +96,32 @@
       },
       "streaming_supported": false,
       "timeout_seconds": 900
+    },
+    {
+      "name": "qinyuan-agent",
+      "enabled": true,
+      "priority": 70,
+      "max_running": 2,
+      "command": [
+        "qinyuan-agent",
+        "--challenge-dir",
+        "{challenge_dir}",
+        "--work-dir",
+        "{work_dir}"
+      ],
+      "planning_timeout_seconds": 120,
+      "timeout_seconds": 900,
+      "streaming_supported": false,
+      "health_check": {
+        "command": [
+          "qinyuan-agent",
+          "--version"
+        ],
+        "timeout_seconds": 10,
+        "cooldown_seconds": 15,
+        "max_cooldown_seconds": 300,
+        "failure_threshold": 3
+      }
     }
   ]
 }

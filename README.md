@@ -43,22 +43,6 @@ flowchart TD
     Executor --> Kimi["Kimi CLI"]
 ```
 
-### Qinyuan Main 与工具 Sandbox
-
-`qinyuan-main` 作为普通宿主机 provider 进程运行，和 Codex、Claude、Kimi
-一样从 stdin 接收任务并通过 stdout/stderr、退出码和唯一
-`BLACKBOARD_RESULT:` 返回结果。bat 不 import main，不启动或共享 main 的
-MCPManager；Nmap MCP 仍只属于 main。
-
-工具执行是另一条独立边界。bat 启动仅绑定 `127.0.0.1` 随机端口的
-Sandbox Bridge，每个 provider invocation 创建独立 UUID、短期 token 和
-`run_context.json`，但只有第一次合法 Nmap 请求才创建容器。同一 run 的调用
-串行复用一个容器，其他 run 可并行；planning 和 timeout recovery 固定为
-`no_tools`。页面和 API 分别显示 `provider_isolation=host_process` 与
-`tool_isolation=container`，不会把宿主机 main 标成已容器隔离。
-
-完整 wire contract 见 `docs/sandbox-protocol.md`。
-
 每个启用的 provider 在项目 Supervisor 下运行独立循环：
 
 1. 读取当前图快照。
@@ -123,8 +107,7 @@ web-data/
 - npm `11.16.0`；
 - Git；
 - 至少一个已安装并完成认证的 CLI provider（Codex、Claude 或 Kimi）；
-- Docker CLI 和可用 daemon 是可选依赖；整 provider `container` 后端或
-  Qinyuan Nmap 工具 Sandbox 启用时需要；
+- Docker CLI 和可用 daemon 是可选依赖，仅在使用 `container` 后端时需要；
 - Windows、macOS 或 Linux。
 
 如果需要在受支持的 Windows 机器上安装环境，可运行仓库中的
@@ -278,55 +261,8 @@ Codex 使用纯文本流式适配器，Kimi 默认仅在任务完成后输出。
 | `health_check.failure_threshold` | 连续失败达到该值后将项目标记为 `degraded` |
 | `planning_timeout_seconds` | 规划调用超时；省略时取 `timeout_seconds` 与 120 秒中的较小值 |
 | `timeout_seconds` | Intent 执行调用超时 |
-| `tool_sandbox_profile` | 仅 `nmap` 或 `no_tools`；不复用 `container_image` |
-| `provider_isolation` | Qinyuan Main 使用真实值 `host_process` |
-| `host_tools_disabled` | 启用 Nmap profile 前必须为 `true`，否则配置 fail closed |
 
 支持 `{work_dir}` 和 `{challenge_dir}` 占位符。prompt 通过 stdin 发送，CLI 认证由各 provider 自己管理，平台不读取或保存 API Key。
-
-### Nmap 工具镜像与 Bridge
-
-先构建固定工具镜像：
-
-```powershell
-docker build -f sandbox/dockerfile -t qinyuan-tools:nmap-1 sandbox
-docker image inspect qinyuan-tools:nmap-1 --format '{{.Id}}'
-```
-
-然后将 `worker/providers.json` 的 `tool_sandbox.enabled` 设为 `true`，按授权
-实验网络设置 `network`，并启用 `qinyuan-main`。同时必须确认 main 的宿主机
-PowerShell/任意命令工具已禁用，再设置 `host_tools_disabled: true`。工具容器
-不继承 bat/provider 环境，不挂载 Docker socket、用户目录、`.env`、SSH key
-或 provider 工作目录；默认 `network: none`、非 root、只读 rootfs、cap drop
-和 CPU/内存/PID 限制。
-
-Bridge 地址和 bearer token 不进入 prompt、命令行、Blackboard 或审计导出；
-它们仅通过受保护文件路径传给 main。启动时若非 loopback bind 会直接失败。
-provider 结束时先撤销 token，再取消活动命令并销毁工具容器，清理失败作为
-独立审计状态保留，不覆盖 provider 原结果。
-
-排查顺序：确认 `qinyuan-main --version`、`docker version`、工具镜像 inspect、
-配置 schema 和 `127.0.0.1` Bridge 均正常。只清理本项目标签命名空间的遗留容器：
-
-```powershell
-docker ps -aq --filter 'label=io.qinyuan.namespace=qinyuan-bat'
-```
-
-核对列表后再逐个执行 `docker rm --force <container-id>`；不要使用宽泛的全局
-容器删除命令。main 仍在宿主机运行是明确的剩余风险，工具容器隔离不等于
-provider 本身隔离。
-
-真实 Docker smoke 默认跳过，且只应对已获授权的实验目标运行。构建镜像并确认
-Docker daemon 可用后，显式设置开关、授权目标和受控网络，再运行单个测试：
-
-```powershell
-$env:QINYUAN_RUN_DOCKER_SMOKE = "1"
-$env:QINYUAN_SANDBOX_TEST_TARGET = "<authorized-host-or-ip>"
-$env:QINYUAN_SANDBOX_TEST_NETWORK = "<authorized-docker-network>"
-python -m pytest tests/test_sandbox_runtime.py -q
-```
-
-未设置开关或目标时测试会跳过，不会创建容器或发起扫描。
 
 ### 执行配额与公平调度
 

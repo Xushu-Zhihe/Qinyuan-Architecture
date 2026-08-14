@@ -91,6 +91,67 @@ class StreamingExecutorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.status, "cancelled")
         self.assertIn("started", Path(result.stdout_path).read_text(encoding="utf-8"))
 
+    async def test_cancel_gives_provider_cleanup_hook_a_chance(self) -> None:
+        work_dir = self.make_work_dir()
+        cleanup_script = (
+            "import os,pathlib,signal,time\n"
+            "def cleanup(*_):\n"
+            " pathlib.Path('cleanup.marker').write_text('cleaned')\n"
+            " raise SystemExit(0)\n"
+            "signal.signal(getattr(signal,'SIGBREAK',signal.SIGTERM), cleanup)\n"
+            "cancel=pathlib.Path(os.environ['QINYUAN_PROVIDER_CANCEL_FILE'])\n"
+            "print('started',flush=True)\n"
+            "while not cancel.exists(): time.sleep(.02)\n"
+            "cleanup()\n"
+        )
+        cancel = asyncio.Event()
+        started = asyncio.Event()
+
+        def collect(chunk: LogChunk) -> None:
+            if chunk.stream == "stdout" and "started" in chunk.text:
+                started.set()
+
+        task = asyncio.create_task(
+            execute_provider(
+                provider_for(cleanup_script),
+                "request",
+                None,
+                work_dir,
+                on_chunk=collect,
+                cancel_event=cancel,
+            )
+        )
+        await asyncio.wait_for(started.wait(), timeout=1)
+        cancel.set()
+
+        result = await asyncio.wait_for(task, timeout=3)
+
+        self.assertEqual(result.status, "cancelled")
+        self.assertTrue((work_dir / "cleanup.marker").is_file())
+
+    async def test_timeout_gives_provider_cleanup_hook_a_chance(self) -> None:
+        work_dir = self.make_work_dir()
+        cleanup_script = (
+            "import os,pathlib,signal,time\n"
+            "def cleanup(*_):\n"
+            " pathlib.Path('cleanup.marker').write_text('cleaned')\n"
+            " raise SystemExit(0)\n"
+            "signal.signal(getattr(signal,'SIGBREAK',signal.SIGTERM), cleanup)\n"
+            "cancel=pathlib.Path(os.environ['QINYUAN_PROVIDER_CANCEL_FILE'])\n"
+            "print('started',flush=True)\n"
+            "while not cancel.exists(): time.sleep(.02)\n"
+            "cleanup()\n"
+        )
+        result = await execute_provider(
+            provider_for(cleanup_script, timeout=0.1),
+            "request",
+            None,
+            work_dir,
+        )
+
+        self.assertEqual(result.status, "timeout")
+        self.assertTrue((work_dir / "cleanup.marker").is_file())
+
     async def test_timeout_reports_timeout_and_keeps_logs(self) -> None:
         result = await execute_provider(
             provider_for(

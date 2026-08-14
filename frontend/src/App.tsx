@@ -40,15 +40,10 @@ export default function App() {
   }, [])
 
   async function createProject(payload: NewProjectPayload) {
-    try {
-      setError(null)
-      const project = await api.createProject(payload)
-      if (payload.mode === 'run') await api.startProject(project.id)
-      setDialogOpen(false)
-      await refresh()
-    } catch (caught) {
-      setError(caught instanceof Error ? caught.message : String(caught))
-    }
+    const project = await api.createProject(payload)
+    if (payload.mode === 'run') await api.startProject(project.id)
+    setDialogOpen(false)
+    await refresh()
   }
 
   async function deleteProject(projectId: string) {
@@ -93,7 +88,7 @@ export default function App() {
       <ProjectDashboard projects={projects} runtime={runtime} onOpen={openProject} onCreate={() => setDialogOpen(true)} onDelete={deleteProject} onOpenAutopilot={openAutopilot} />
       <NewProjectDialog
         open={dialogOpen}
-        providers={runtime?.providers ?? ['codex', 'claude', 'kimi', 'qinyuan-main']}
+        providers={['codex', 'claude', 'kimi', 'qinyuan-agent']}
         onSubmit={createProject}
         onClose={() => setDialogOpen(false)}
       />

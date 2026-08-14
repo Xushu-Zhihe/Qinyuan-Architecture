@@ -9,8 +9,6 @@ from worker.config import (
     load_coordinator_config,
     load_execution_config,
     load_provider_configs,
-    load_tool_sandbox_config,
-    validate_provider_tool_config,
 )
 
 
@@ -324,6 +322,21 @@ class ProviderConfigTests(unittest.TestCase):
         self.assertTrue(codex.streaming_supported)
         self.assertTrue(claude.streaming_supported)
         self.assertFalse(providers["kimi"].streaming_supported)
+        qinyuan = providers["qinyuan-agent"]
+        self.assertEqual(
+            qinyuan.command,
+            (
+                "qinyuan-agent",
+                "--challenge-dir",
+                "{challenge_dir}",
+                "--work-dir",
+                "{work_dir}",
+            ),
+        )
+        self.assertEqual(qinyuan.max_running, 2)
+        self.assertEqual(qinyuan.planning_timeout_seconds, 120)
+        self.assertFalse(qinyuan.streaming_supported)
+        self.assertIsNotNone(qinyuan.health_check)
         self.assertTrue(all(provider.health_check for provider in providers.values()))
 
     def test_rejects_invalid_health_check_cooldown_range(self) -> None:
@@ -363,61 +376,6 @@ class ProviderConfigTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = self.write_config(directory, {"providers": [provider, provider]})
             with self.assertRaisesRegex(ConfigError, "duplicate provider name"):
-                load_provider_configs(path)
-
-    def test_loads_tool_sandbox_and_requires_explicit_host_tool_disable(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            path = self.write_config(
-                directory,
-                {
-                    "tool_sandbox": {
-                        "enabled": True,
-                        "runtime_command": ["docker"],
-                        "image": "tools:nmap",
-                        "network": "lab-net",
-                        "max_output_bytes": 1024,
-                        "max_artifact_bytes": 2048,
-                        "max_command_timeout_seconds": 60,
-                        "docker_api_timeout_seconds": 70,
-                        "kill_grace_seconds": 3,
-                    },
-                    "providers": [
-                        {
-                            "name": "qinyuan-main",
-                            "enabled": True,
-                            "priority": 1,
-                            "command": ["qinyuan-main"],
-                            "timeout_seconds": 60,
-                            "tool_sandbox_profile": "nmap",
-                            "host_tools_disabled": True,
-                        }
-                    ],
-                },
-            )
-            tool = load_tool_sandbox_config(path)
-            providers = load_provider_configs(path)
-            validate_provider_tool_config(providers, tool)
-            self.assertEqual(tool.network, "lab-net")
-            self.assertEqual(providers[0].authorized_targets, ())
-
-    def test_rejects_enabled_nmap_provider_without_host_tool_confirmation(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            path = self.write_config(
-                directory,
-                {
-                    "providers": [
-                        {
-                            "name": "qinyuan-main",
-                            "enabled": True,
-                            "priority": 1,
-                            "command": ["qinyuan-main"],
-                            "timeout_seconds": 60,
-                            "tool_sandbox_profile": "nmap",
-                        }
-                    ]
-                },
-            )
-            with self.assertRaisesRegex(ConfigError, "host_tools_disabled"):
                 load_provider_configs(path)
 
     def test_rejects_case_insensitive_duplicate_names(self) -> None:

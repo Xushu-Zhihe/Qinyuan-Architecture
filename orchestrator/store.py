@@ -1055,24 +1055,6 @@ class BlackboardStore:
                 )
         if "logs_retained" in record:
             record["logs_retained"] = bool(record["logs_retained"])
-        metadata = record.get("backend_metadata")
-        if isinstance(metadata, dict):
-            record["provider_isolation"] = metadata.get(
-                "provider_isolation",
-                record.get("isolation", "unknown"),
-            )
-            record["tool_isolation"] = metadata.get(
-                "tool_isolation",
-                "not_applicable",
-            )
-            for field in (
-                "agent_run_id",
-                "tool_sandbox_id",
-                "tool_sandbox_image",
-                "tool_cleanup_status",
-                "tool_profile",
-            ):
-                record[field] = metadata.get(field)
         return record
 
     def start_planning_attempt(

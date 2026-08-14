@@ -42,22 +42,6 @@ class ProviderConfig:
     container_command: tuple[str, ...] | None = None
     stream_format: str = "text"
     streaming_supported: bool = True
-    tool_sandbox_profile: str | None = None
-    provider_isolation: str = "unsafe_local"
-    host_tools_disabled: bool = False
-    authorized_targets: tuple[str, ...] = ()
-
-
-@dataclass(frozen=True, slots=True)
-class ProviderRunContext:
-    agent_run_id: str
-    thread_id: str
-    execution_kind: str
-    tool_profile: str
-    deadline: str
-    work_dir: str
-    artifact_scope: str
-    sandbox_endpoint: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,23 +67,6 @@ class ContainerBackendConfig:
 class ExecutionConfig:
     backend: str = "local"
     container: ContainerBackendConfig | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class ToolSandboxConfig:
-    enabled: bool = False
-    runtime_command: tuple[str, ...] = ("docker",)
-    image: str = "qinyuan-tools:nmap-1"
-    image_digest: str | None = None
-    network: str = "none"
-    max_output_bytes: int = 256 * 1024
-    max_artifact_bytes: int = 8 * 1024 * 1024
-    max_command_timeout_seconds: float = 900.0
-    docker_api_timeout_seconds: float = 960.0
-    kill_grace_seconds: float = 3.0
-    memory_limit: str = "256m"
-    cpu_limit: float = 1.0
-    pids_limit: int = 64
 
 
 @dataclass(frozen=True, slots=True)

@@ -2,20 +2,6 @@
   "execution": {
     "backend": "local"
   },
-  "tool_sandbox": {
-    "enabled": true,
-    "runtime_command": ["docker"],
-    "image": "qinyuan-tools:nmap-1",
-    "network": "bridge",
-    "max_output_bytes": 262144,
-    "max_artifact_bytes": 8388608,
-    "max_command_timeout_seconds": 900,
-    "docker_api_timeout_seconds": 960,
-    "kill_grace_seconds": 3,
-    "memory_limit": "256m",
-    "cpu_limit": 1.0,
-    "pids_limit": 64
-  },
   "coordinator": {
     "max_global_running": 16,
     "max_project_running": 4,
@@ -112,30 +98,30 @@
       "timeout_seconds": 900
     },
     {
-      "name": "qinyuan-main",
+      "name": "qinyuan-agent",
       "enabled": true,
       "priority": 70,
       "max_running": 2,
       "command": [
-        "qinyuan-main"
+        "qinyuan-agent",
+        "--challenge-dir",
+        "{challenge_dir}",
+        "--work-dir",
+        "{work_dir}"
       ],
-      "tool_sandbox_profile": "interactive_unrestricted",
-      "provider_isolation": "host_process",
-      "host_tools_disabled": false,
-      "authorized_targets": [],
+      "planning_timeout_seconds": 120,
+      "timeout_seconds": 900,
+      "streaming_supported": false,
       "health_check": {
         "command": [
-          "qinyuan-main",
+          "qinyuan-agent",
           "--version"
         ],
         "timeout_seconds": 10,
         "cooldown_seconds": 15,
         "max_cooldown_seconds": 300,
         "failure_threshold": 3
-      },
-      "planning_timeout_seconds": 120,
-      "timeout_seconds": 900,
-      "streaming_supported": true
+      }
     }
   ]
 }

@@ -10,7 +10,6 @@ from orchestrator.protocol import (
     render_execution_request,
     render_intent_request,
     render_timeout_summary_request,
-    validate_result_semantics,
 )
 
 
@@ -96,58 +95,6 @@ class IntentProtocolTests(unittest.TestCase):
 
 
 class ResultProtocolTests(unittest.TestCase):
-    def test_rejects_procedural_completion_answer(self) -> None:
-        payload = {
-            "intent_id": "intent-1",
-            "facts": [
-                {
-                    "ref": "fact-1",
-                    "content": "Focus on the next client-side probe",
-                }
-            ],
-            "edges": [],
-            "goal_achieved": True,
-            "answer_key": "probe js assets and source maps",
-            "final_answer": "Probe JS assets and source maps, then extract routes.",
-        }
-        parsed = parse_result(
-            "BLACKBOARD_RESULT: " + json.dumps(payload),
-            assigned_intent_id="intent-1",
-            existing_node_ids=set(),
-        )
-
-        self.assertEqual(parsed.status, "valid")
-        assert parsed.update is not None
-        error = validate_result_semantics(
-            parsed.update,
-            {"content": "Probe JS assets and source maps for routes"},
-        )
-        self.assertIn("next-step plan", error)
-
-    def test_accepts_concrete_completion_answer(self) -> None:
-        payload = {
-            "intent_id": "intent-1",
-            "facts": [{"ref": "fact-1", "content": "The flag is flag{same}"}],
-            "edges": [],
-            "goal_achieved": True,
-            "answer_key": "flag{same}",
-            "final_answer": "flag{same}",
-        }
-        parsed = parse_result(
-            "BLACKBOARD_RESULT: " + json.dumps(payload),
-            assigned_intent_id="intent-1",
-            existing_node_ids=set(),
-        )
-
-        self.assertEqual(parsed.status, "valid")
-        assert parsed.update is not None
-        self.assertIsNone(
-            validate_result_semantics(
-                parsed.update,
-                {"content": "Recover the flag"},
-            )
-        )
-
     def test_parses_fact_and_relation_result(self) -> None:
         payload = {
             "intent_id": "intent-1",
@@ -310,7 +257,6 @@ class ResultProtocolTests(unittest.TestCase):
             self.assertIn(edge_type, request)
         self.assertIn("environment or provider limitations", request)
         self.assertIn("diagnostics, not challenge facts", request)
-        self.assertIn("observed answer supported by the execution", request)
 
     def test_render_timeout_summary_request_is_immediate_and_data_only(self) -> None:
         request = render_timeout_summary_request(

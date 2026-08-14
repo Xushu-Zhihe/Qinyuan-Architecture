@@ -31,7 +31,6 @@ from orchestrator.protocol import (
     render_execution_request,
     render_intent_request,
     render_timeout_summary_request,
-    validate_result_semantics,
 )
 from orchestrator.store import BlackboardStore, ExecutionRecord, IntentRecord
 from worker.executor import execute_provider
@@ -227,24 +226,13 @@ class ProjectSupervisor:
         self.answer_quorum_provider_count = (
             answer_quorum_provider_count
             if answer_quorum_provider_count is not None
-            # A single provider can produce a syntactically valid but
-            # unverified answer. Require an explicit override before a
-            # production project is auto-marked achieved on one opinion.
-            else max(2, len(self.providers))
+            else len(self.providers)
         )
         if self.answer_quorum_provider_count <= 0:
             raise ValueError("answer_quorum_provider_count must be positive")
         self._execute_accepts_log_limit = self._accepts_keyword(
             execute,
             "max_log_bytes",
-        )
-        self._execute_accepts_invocation_context = (
-            self._declares_keyword(execute, "execution_kind")
-            or self._declares_keyword(execute, "thread_id")
-        )
-        self._execute_accepts_tool_profile_override = self._declares_keyword(
-            execute,
-            "tool_profile_override",
         )
         self.cancel_event = asyncio.Event()
         self.wake_event = asyncio.Event()
@@ -265,13 +253,6 @@ class ProjectSupervisor:
             parameter.kind is inspect.Parameter.VAR_KEYWORD
             for parameter in parameters.values()
         )
-
-    @staticmethod
-    def _declares_keyword(function: Callable[..., object], name: str) -> bool:
-        try:
-            return name in inspect.signature(function).parameters
-        except (TypeError, ValueError):
-            return False
 
     async def _append_runtime_event(
         self,
@@ -575,7 +556,6 @@ class ProjectSupervisor:
         kind: str,
         on_chunk=None,
         on_permit: PermitCallback | None = None,
-        tool_profile_override: str | None = None,
     ) -> WorkerResult:
         async def run() -> WorkerResult:
             kwargs = {
@@ -584,14 +564,6 @@ class ProjectSupervisor:
             }
             if self._execute_accepts_log_limit:
                 kwargs["max_log_bytes"] = self.audit_config.max_log_bytes
-            if self._execute_accepts_invocation_context:
-                kwargs["execution_kind"] = kind
-                kwargs["thread_id"] = work_dir.name
-                if (
-                    tool_profile_override is not None
-                    and self._execute_accepts_tool_profile_override
-                ):
-                    kwargs["tool_profile_override"] = tool_profile_override
             return await self.execute(
                 provider,
                 request,
@@ -1144,24 +1116,6 @@ class ProjectSupervisor:
             assigned_intent_id=intent.id,
             existing_node_ids=existing_node_ids,
         )
-        if parsed.status == "valid" and parsed.update is not None:
-            semantic_error = validate_result_semantics(
-                parsed.update,
-                {
-                    "id": intent.id,
-                    "source_node_id": intent.source_node_id,
-                    "target_node_id": intent.target_node_id,
-                    "content": intent.content,
-                    "generation": intent.generation,
-                },
-            )
-            if semantic_error is not None:
-                parsed = replace(
-                    parsed,
-                    status="protocol_error",
-                    update=None,
-                    error=semantic_error,
-                )
         if (
             parsed.status == "valid"
             and parsed.update is not None
@@ -1219,7 +1173,6 @@ class ProjectSupervisor:
                 execution_dir / "timeout-summary",
                 kind="execution",
                 on_chunk=execution_logs.add,
-                tool_profile_override="interactive_unrestricted",
             )
         except Exception as exc:
             await self._append_runtime_event(
@@ -1238,24 +1191,6 @@ class ProjectSupervisor:
             assigned_intent_id=intent.id,
             existing_node_ids=set(self.store.node_types()),
         )
-        if parsed.status == "valid" and parsed.update is not None:
-            semantic_error = validate_result_semantics(
-                parsed.update,
-                {
-                    "id": intent.id,
-                    "source_node_id": intent.source_node_id,
-                    "target_node_id": intent.target_node_id,
-                    "content": intent.content,
-                    "generation": intent.generation,
-                },
-            )
-            if semantic_error is not None:
-                parsed = replace(
-                    parsed,
-                    status="protocol_error",
-                    update=None,
-                    error=semantic_error,
-                )
         recovered = (
             parsed.status == "valid"
             and parsed.update is not None
@@ -1344,24 +1279,12 @@ class ProjectSupervisor:
         finally:
             await execution_logs.close()
         if result.status != "success":
-            tool_protocol_error = result.backend_metadata.get(
-                "tool_protocol_error"
-            )
-            is_tool_protocol_error = isinstance(tool_protocol_error, str)
-            failure_status = (
-                "protocol_error" if is_tool_protocol_error else result.status
-            )
-            failure_message = (
-                tool_protocol_error
-                if is_tool_protocol_error
-                else f"provider process status was {result.status}"
-            )
             async with self.write_lock:
                 sequence = int(self.store.snapshot()["sequence"])
                 self.store.fail_execution(
                     execution.id,
-                    failure_status,
-                    failure_message,
+                    result.status,
+                    f"provider process status was {result.status}",
                     result.exit_code,
                     queue_seconds=result.queue_seconds,
                     duration_seconds=result.duration_seconds,
@@ -1384,12 +1307,6 @@ class ProjectSupervisor:
             await self._prune_finished_logs()
             if result.status == "cancelled":
                 return IntentAttemptResult("cancelled")
-            if is_tool_protocol_error:
-                return IntentAttemptResult(
-                    status="protocol_error",
-                    protocol_error=str(tool_protocol_error),
-                    rejected_result_line=last_result_line(result.output),
-                )
             await self._record_worker_failure(provider, result)
             return IntentAttemptResult("health_failure")
 
@@ -1398,24 +1315,6 @@ class ProjectSupervisor:
             assigned_intent_id=intent.id,
             existing_node_ids=set(self.store.node_types()),
         )
-        if parsed_result.status == "valid" and parsed_result.update is not None:
-            semantic_error = validate_result_semantics(
-                parsed_result.update,
-                {
-                    "id": intent.id,
-                    "source_node_id": intent.source_node_id,
-                    "target_node_id": intent.target_node_id,
-                    "content": intent.content,
-                    "generation": intent.generation,
-                },
-            )
-            if semantic_error is not None:
-                parsed_result = replace(
-                    parsed_result,
-                    status="protocol_error",
-                    update=None,
-                    error=semantic_error,
-                )
         if parsed_result.status != "valid" or parsed_result.update is None:
             error = parsed_result.error or "invalid result protocol"
             async with self.write_lock:

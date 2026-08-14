@@ -6,10 +6,10 @@ import shutil
 import signal
 import subprocess
 import time
+import uuid
 from collections.abc import Awaitable, Callable
 from contextlib import nullcontext
 from pathlib import Path
-from typing import Mapping
 
 from worker.backend import (
     BackendHandle,
@@ -24,20 +24,6 @@ from worker.redaction import redact_text
 
 
 ChunkCallback = Callable[[LogChunk], Awaitable[None] | None]
-
-
-def _tool_protocol_error(*outputs: str) -> str | None:
-    """Extract a recoverable function-call correlation failure from logs."""
-    markers = (
-        "no tool call found for function call output",
-        "function call output with call_id",
-    )
-    for output in outputs:
-        for line in output.splitlines():
-            normalized = line.casefold()
-            if any(marker in normalized for marker in markers):
-                return line.strip()[:1000]
-    return None
 
 
 def _resolve_executable(command: tuple[str, ...]) -> tuple[str, ...]:
@@ -184,6 +170,19 @@ async def _write_stdin(
 async def _terminate_process_tree(process: asyncio.subprocess.Process) -> None:
     if process.returncode is not None:
         return
+
+    # Give providers a short chance to close MCP clients and external
+    # resources before falling back to the existing forceful termination.
+    try:
+        if os.name == "nt":
+            process.send_signal(getattr(signal, "CTRL_BREAK_EVENT", signal.SIGTERM))
+        else:
+            os.killpg(process.pid, signal.SIGTERM)
+        await asyncio.wait_for(process.wait(), timeout=5.0)
+        return
+    except (OSError, ProcessLookupError, asyncio.TimeoutError, ValueError):
+        pass
+
     if os.name == "nt":
         try:
             killer = await asyncio.create_subprocess_exec(
@@ -254,23 +253,29 @@ class LocalExecutionBackend(ExecutionBackend):
         request: str,
         challenge_dir: Path | None,
         work_dir: Path,
-        environment: Mapping[str, str] | None = None,
     ) -> BackendHandle:
         kwargs: dict[str, object] = {}
         if os.name == "nt":
             kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
         else:
             kwargs["start_new_session"] = True
+        cancel_file = work_dir / f".provider-cancel-{uuid.uuid4().hex}"
+        environment = os.environ.copy()
+        environment["QINYUAN_PROVIDER_CANCEL_FILE"] = str(cancel_file.resolve())
         process = await asyncio.create_subprocess_exec(
             *_resolve_executable(command),
             cwd=work_dir,
+            env=environment,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            env=(dict(os.environ) | dict(environment)) if environment is not None else None,
             **kwargs,
         )
-        return BackendHandle(process=process, run_id=str(process.pid))
+        return BackendHandle(
+            process=process,
+            run_id=str(process.pid),
+            metadata={"cancel_file": str(cancel_file.resolve())},
+        )
 
     async def stream(
         self,
@@ -367,7 +372,23 @@ class LocalExecutionBackend(ExecutionBackend):
         return outcome
 
     async def cancel(self, handle: BackendHandle) -> None:
-        await _terminate_process_tree(handle.process)
+        cancel_file_value = handle.metadata.get("cancel_file")
+        cancel_file = (
+            Path(str(cancel_file_value)) if cancel_file_value is not None else None
+        )
+        try:
+            if cancel_file is not None:
+                try:
+                    cancel_file.write_text("cancel\n", encoding="utf-8")
+                except OSError:
+                    pass
+            await _terminate_process_tree(handle.process)
+        finally:
+            if cancel_file is not None:
+                try:
+                    cancel_file.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
     async def cleanup(
         self,
@@ -385,8 +406,6 @@ class LocalExecutionBackend(ExecutionBackend):
         on_chunk: ChunkCallback | None = None,
         cancel_event: asyncio.Event | None = None,
         max_log_bytes: int = 8 * 1024 * 1024,
-        environment: Mapping[str, str] | None = None,
-        execution_context: object | None = None,
     ) -> WorkerResult:
         work_dir.mkdir(parents=True, exist_ok=True)
         stdout_path = work_dir / "stdout.txt"
@@ -398,7 +417,6 @@ class LocalExecutionBackend(ExecutionBackend):
         outcome = BackendOutcome("unavailable", None)
         cleanup = CleanupOutcome(None, "not_applicable")
         stdout_text = ""
-        stderr_text = ""
         handle: BackendHandle | None = None
 
         try:
@@ -408,7 +426,6 @@ class LocalExecutionBackend(ExecutionBackend):
                 request,
                 challenge_dir,
                 work_dir,
-                environment,
             )
             handle.metadata["stream_format"] = provider.stream_format
             stdin_task, stdout_task, stderr_task = await self.stream(
@@ -425,7 +442,7 @@ class LocalExecutionBackend(ExecutionBackend):
                 cancel_event,
             )
             await asyncio.gather(stdin_task, return_exceptions=True)
-            stdout_text, stderr_text = await asyncio.gather(stdout_task, stderr_task)
+            stdout_text, _ = await asyncio.gather(stdout_task, stderr_task)
             if outcome.diagnostic is not None:
                 await _append_stderr(
                     stderr_path,
@@ -444,17 +461,6 @@ class LocalExecutionBackend(ExecutionBackend):
             )
             if handle is not None:
                 cleanup = await self.cleanup(handle, outcome)
-
-        metadata: dict[str, object] = {
-            "challenge_enforcement": "prompt_only",
-        }
-        tool_error = _tool_protocol_error(stdout_text, stderr_text)
-        if tool_error is not None:
-            metadata["tool_protocol_error"] = tool_error
-        if provider.stream_format == "claude-stream-json":
-            metadata["raw_stdout_path"] = str(
-                stdout_path.with_name("stdout.raw.jsonl").resolve()
-            )
 
         return WorkerResult(
             provider=provider.name,
@@ -475,7 +481,14 @@ class LocalExecutionBackend(ExecutionBackend):
             cleanup_policy=cleanup.policy,
             cleanup_status=cleanup.status,
             cleanup_detail=cleanup.detail,
-            backend_metadata=metadata,
+            backend_metadata={
+                "challenge_enforcement": "prompt_only",
+                **(
+                    {"raw_stdout_path": str(stdout_path.with_name("stdout.raw.jsonl").resolve())}
+                    if provider.stream_format == "claude-stream-json"
+                    else {}
+                ),
+            },
         )
 
 
@@ -490,8 +503,6 @@ async def execute_provider(
     on_chunk: ChunkCallback | None = None,
     cancel_event: asyncio.Event | None = None,
     max_log_bytes: int = 8 * 1024 * 1024,
-    environment: Mapping[str, str] | None = None,
-    execution_context: object | None = None,
 ) -> WorkerResult:
     """Backward-compatible local executor.
 
@@ -506,6 +517,4 @@ async def execute_provider(
         on_chunk=on_chunk,
         cancel_event=cancel_event,
         max_log_bytes=max_log_bytes,
-        environment=environment,
-        execution_context=execution_context,
     )

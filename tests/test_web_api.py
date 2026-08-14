@@ -58,35 +58,6 @@ class WebApiTests(unittest.TestCase):
         )
         self.assertEqual(graph.json()["layout"]["revision"], 0)
 
-    def test_rejects_run_project_without_provider(self) -> None:
-        response = self.client.post(
-            "/api/projects",
-            json={
-                "name": "No agent",
-                "goal": "Recover the flag",
-                "origin": "Challenge statement",
-                "hints": [],
-                "mode": "run",
-                "providers": [],
-                "agent_limit": 1,
-                "challenge_path": None,
-            },
-        )
-
-        self.assertEqual(response.status_code, 400)
-        self.assertIn("provider", response.json()["detail"])
-
-    def test_starting_manual_project_without_provider_returns_clear_error(self) -> None:
-        project = self.create_project("No configured agent")
-
-        response = self.client.post(f"/api/projects/{project['id']}/start")
-
-        self.assertEqual(response.status_code, 400)
-        self.assertEqual(
-            response.json()["detail"],
-            "project has no enabled configured providers",
-        )
-
     def test_deletes_project_to_recoverable_trash(self) -> None:
         challenge = self.data_root / "challenge"
         challenge.mkdir()

@@ -424,10 +424,10 @@ class ProjectService:
         configs = tuple(
             self.provider_configs[name]
             for name in handle.record.providers
-            if name in self.provider_configs and self.provider_configs[name].enabled
+            if name in self.provider_configs
         )[: handle.record.agent_limit]
         if not configs:
-            raise ValueError("project has no enabled configured providers")
+            raise ValueError("project has no configured providers")
         kwargs = {}
         if self.execute is not None:
             kwargs["execute"] = self.execute
@@ -544,11 +544,6 @@ class ProjectService:
                 }
             )
         return {
-            "providers": [
-                provider.name
-                for provider in self.provider_configs.values()
-                if provider.enabled
-            ],
             "limits": asdict(self.coordinator.config),
             "coordinator": coordinator,
             "projects": projects,

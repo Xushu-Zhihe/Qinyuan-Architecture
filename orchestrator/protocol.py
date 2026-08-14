@@ -1,5 +1,4 @@
 import json
-import re
 from pathlib import Path
 
 from orchestrator.models import (
@@ -42,74 +41,6 @@ LEGACY_RESULT_FIELDS = {
 }
 RESULT_FIELDS = LEGACY_RESULT_FIELDS | {"answer_key"}
 FACT_FIELDS = {"ref", "content"}
-
-# A provider can satisfy the wire contract while returning the next action
-# instead of an observed answer. Keep this deliberately small and conservative;
-# it is a final-result guard, not a general language classifier.
-_PROCEDURAL_MARKERS = frozenset(
-    {
-        "check",
-        "continue",
-        "extract",
-        "fetch",
-        "find",
-        "focus",
-        "inspect",
-        "investigate",
-        "look",
-        "plan",
-        "probe",
-        "search",
-        "target",
-    }
-)
-
-
-def _words(value: str) -> tuple[str, ...]:
-    return tuple(re.findall(r"[a-z0-9]+", value.casefold()))
-
-
-def validate_result_semantics(
-    update: ExecutionUpdate,
-    intent: dict[str, object],
-) -> str | None:
-    """Reject protocol-valid output that only restates the next action.
-
-    The provider is still free to return facts without claiming completion. A
-    completion claim must carry a concrete-looking answer rather than a
-    procedural summary of the assigned intent. This protects the project
-    status transition from the common ``goal_achieved=true`` false positive.
-    """
-    if not update.goal_achieved:
-        return None
-
-    answer_key = update.answer_key or ""
-    answer_words = _words(answer_key)
-    if answer_words and answer_words[0] in _PROCEDURAL_MARKERS:
-        return "goal_achieved requires a verified answer, not a next-step plan"
-
-    answer_text = (update.final_answer or "").casefold()
-    if any(
-        marker in answer_text
-        for marker in (
-            "next step",
-            "should probe",
-            "should inspect",
-            "continue probing",
-            "continue investigating",
-        )
-    ):
-        return "goal_achieved requires a verified answer, not a next-step plan"
-
-    intent_words = set(_words(str(intent.get("content", ""))))
-    if len(answer_words) >= 4 and intent_words:
-        overlap = len(set(answer_words) & intent_words) / len(set(answer_words))
-        if overlap >= 0.75 and any(
-            word in _PROCEDURAL_MARKERS for word in answer_words
-        ):
-            return "goal_achieved answer is only a restatement of the assigned plan"
-
-    return None
 
 
 def render_request(
@@ -183,9 +114,6 @@ def _result_contract(intent: dict[str, object]) -> str:
         "strings. answer_key is the minimal canonical answer used for exact "
         "cross-provider consensus; do not include explanation, Markdown, or "
         "labels in it. When false, answer_key and final_answer may be null. "
-        "When true, report an observed answer supported by the execution; "
-        "do not summarize the next probe, investigation, or plan as the "
-        "final answer. "
         "Use empty arrays when there are "
         "no facts or edges. Do not use Python dict syntax, key=value syntax, "
         "tuples, or a Markdown fence for the protocol line.\n"

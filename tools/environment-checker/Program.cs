@@ -14,9 +14,9 @@ using System.Windows.Forms;
 [assembly: AssemblyCompany("Qinyuan")]
 [assembly: AssemblyProduct("Qinyuan Environment Checker")]
 [assembly: AssemblyCopyright("Copyright (c) 2026")]
-[assembly: AssemblyVersion("1.2.0.0")]
-[assembly: AssemblyFileVersion("1.2.0.0")]
-[assembly: AssemblyInformationalVersion("1.2.0")]
+[assembly: AssemblyVersion("1.1.0.0")]
+[assembly: AssemblyFileVersion("1.1.0.0")]
+[assembly: AssemblyInformationalVersion("1.1.0")]
 
 namespace Qinyuan.EnvironmentChecker
 {
@@ -54,19 +54,17 @@ namespace Qinyuan.EnvironmentChecker
             CheckResult codex = CheckAvailable("Codex CLI", "Provider（至少一个）", "codex", "--version", false);
             CheckResult claude = CheckAvailable("Claude CLI", "Provider（至少一个）", "claude", "--version", false);
             CheckResult kimi = CheckAvailable("Kimi CLI", "Provider（至少一个）", "kimi", "--version", false);
-            CheckResult qinyuan = CheckAvailable("Qinyuan Main", "可选：Nmap Sandbox Provider", "qinyuan-main", "--version", false);
             results.Add(codex);
             results.Add(claude);
             results.Add(kimi);
-            results.Add(qinyuan);
             results.Add(new CheckResult
             {
                 Name = "Provider CLI",
-                Requirement = "Codex / Claude / Kimi / Qinyuan 至少一个",
+                Requirement = "Codex / Claude / Kimi 至少一个",
                 Required = true,
-                Passed = codex.Passed || claude.Passed || kimi.Passed || qinyuan.Passed,
-                Status = codex.Passed || claude.Passed || kimi.Passed || qinyuan.Passed ? "通过" : "缺失",
-                Detail = codex.Passed || claude.Passed || kimi.Passed || qinyuan.Passed
+                Passed = codex.Passed || claude.Passed || kimi.Passed,
+                Status = codex.Passed || claude.Passed || kimi.Passed ? "通过" : "缺失",
+                Detail = codex.Passed || claude.Passed || kimi.Passed
                     ? "已检测到至少一个可用 Provider CLI"
                     : "请安装并认证至少一个 Provider CLI"
             });
@@ -88,14 +86,6 @@ namespace Qinyuan.EnvironmentChecker
                     daemon.Detail = "Docker CLI 已安装，但守护进程不可用；local 后端不受影响。";
                 }
                 results.Add(daemon);
-                CheckResult toolImage = CheckAvailable(
-                    "Nmap 工具镜像",
-                    "可选：qinyuan-tools:nmap-1",
-                    "docker",
-                    "image inspect qinyuan-tools:nmap-1 --format {{.Id}}",
-                    false
-                );
-                results.Add(toolImage);
             }
             else
             {
@@ -108,32 +98,7 @@ namespace Qinyuan.EnvironmentChecker
                     Status = "可选未安装",
                     Detail = "未检查；local 后端不需要 Docker。"
                 });
-                results.Add(new CheckResult
-                {
-                    Name = "Nmap 工具镜像",
-                    Requirement = "可选：qinyuan-tools:nmap-1",
-                    Required = false,
-                    Passed = false,
-                    Status = "可选未检查",
-                    Detail = "Docker daemon 不可用。"
-                });
             }
-            results.Add(new CheckResult
-            {
-                Name = "Sandbox Bridge",
-                Requirement = "仅绑定 127.0.0.1",
-                Required = true,
-                Passed = true,
-                Status = "通过",
-                Detail = "应用配置固定为 loopback 随机端口；非 loopback 配置会拒绝启动。"
-            });
-            results.Add(CheckAvailable(
-                "Blackboard schema",
-                "版本 4 或更高",
-                "python",
-                "-c \"from orchestrator.store import BLACKBOARD_SCHEMA_VERSION; assert BLACKBOARD_SCHEMA_VERSION >= 4; print(BLACKBOARD_SCHEMA_VERSION)\"",
-                false
-            ));
             return results;
         }
 
@@ -335,7 +300,7 @@ namespace Qinyuan.EnvironmentChecker
 
         public MainForm()
         {
-            Text = "钦原环境检查器 1.2";
+            Text = "钦原环境检查器 1.1";
             StartPosition = FormStartPosition.CenterScreen;
             MinimumSize = new Size(840, 520);
             Size = new Size(1040, 650);
@@ -473,7 +438,7 @@ namespace Qinyuan.EnvironmentChecker
                 return;
             }
             StringBuilder builder = new StringBuilder();
-            builder.AppendLine("钦原环境检查器 1.2");
+            builder.AppendLine("钦原环境检查器 1.1");
             foreach (CheckResult result in currentResults)
             {
                 builder.AppendLine(result.Name + "\t" + result.Status + "\t" + result.Detail);
@@ -518,7 +483,7 @@ namespace Qinyuan.EnvironmentChecker
                 }
             }
             StringBuilder builder = new StringBuilder();
-            builder.Append("{\n  \"checker_version\": \"1.2.0\",\n");
+            builder.Append("{\n  \"checker_version\": \"1.1.0\",\n");
             builder.Append("  \"generated_at\": \"");
             builder.Append(JsonEscape(DateTimeOffset.UtcNow.ToString("o")));
             builder.Append("\",\n  \"success\": ");

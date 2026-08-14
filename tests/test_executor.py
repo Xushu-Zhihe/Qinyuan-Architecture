@@ -80,31 +80,6 @@ class ExecutorTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(result.exit_code, 7)
             self.assertIn("bad", Path(result.stderr_path).read_text(encoding="utf-8"))
 
-    async def test_classifies_tool_call_correlation_failure(self) -> None:
-        provider = ProviderConfig(
-            name="qinyuan-main",
-            enabled=True,
-            priority=10,
-            command=(
-                sys.executable,
-                "-c",
-                "import sys;print('No tool call found for function call output with call_id call_1', file=sys.stderr);sys.exit(1)",
-            ),
-            timeout_seconds=5,
-        )
-
-        with tempfile.TemporaryDirectory() as directory:
-            result = await execute_provider(
-                provider,
-                "task",
-                None,
-                Path(directory) / "tool-error",
-            )
-
-        self.assertEqual(result.status, "failed")
-        self.assertIn("tool_protocol_error", result.backend_metadata)
-        self.assertIn("call_id", result.backend_metadata["tool_protocol_error"])
-
     async def test_records_missing_executable(self) -> None:
         provider = ProviderConfig(
             name="missing",

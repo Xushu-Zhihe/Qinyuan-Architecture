@@ -47,7 +47,6 @@ def create_app(
     coordinator_config: CoordinatorConfig | None = None,
     audit_config: AuditConfig | None = None,
     frontend_dist: Path | None = None,
-    runtime=None,
 ) -> FastAPI:
     service = ProjectService(
         (data_root or DEFAULT_DATA_ROOT).resolve(),
@@ -66,18 +65,13 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        if runtime is not None:
-            await runtime.start()
         yield
         await autopilot.aclose()
         await service.aclose()
-        if runtime is not None:
-            await runtime.close()
 
     app = FastAPI(title="Blackboard", lifespan=lifespan)
     app.state.projects = service
     app.state.autopilot = autopilot
-    app.state.provider_runtime = runtime
     dist_root = (frontend_dist or DEFAULT_FRONTEND_DIST).resolve()
     index_file = dist_root / "index.html"
     assets_root = dist_root / "assets"
@@ -210,11 +204,6 @@ def create_app(
         challenge = Path(payload.challenge_path).resolve() if payload.challenge_path else None
         if challenge is not None and not challenge.is_dir():
             raise HTTPException(status_code=400, detail="challenge path is not a directory")
-        if payload.mode == "run" and not payload.providers:
-            raise HTTPException(
-                status_code=400,
-                detail="立即启动 Agent 需要至少选择一个 provider",
-            )
         try:
             project = service.create_project(
                 name=payload.name,

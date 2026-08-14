@@ -26,14 +26,12 @@ export function NewProjectDialog({
   const [mode, setMode] = useState<'manual' | 'run'>('manual')
   const [selected, setSelected] = useState<string[]>([])
   const [hints, setHints] = useState<string[]>([''])
-  const [validationError, setValidationError] = useState<string | null>(null)
 
   useEffect(() => {
     if (!open) {
       setMode('manual')
       setSelected([])
       setHints([''])
-      setValidationError(null)
     }
   }, [open])
 
@@ -41,11 +39,6 @@ export function NewProjectDialog({
 
   function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
-    if (mode === 'run' && selected.length === 0) {
-      setValidationError('立即启动 Agent 前请至少选择一个 provider。')
-      return
-    }
-    setValidationError(null)
     const data = new FormData(event.currentTarget)
     void onSubmit({
       name: String(data.get('name')).trim(),
@@ -69,7 +62,6 @@ export function NewProjectDialog({
           </button>
         </header>
         <div className="dialog-grid">
-          {validationError && <p className="form-error" role="alert">{validationError}</p>}
           <label>项目名称<input name="name" required /></label>
           <label>Goal<textarea name="goal" required rows={3} /></label>
           <label>Origin<textarea name="origin" required rows={4} /></label>

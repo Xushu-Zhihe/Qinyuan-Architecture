@@ -50,26 +50,6 @@ describe('NewProjectDialog', () => {
     )
   })
 
-  it('requires a provider in run mode', async () => {
-    const onSubmit = vi.fn()
-    render(
-      <NewProjectDialog
-        open
-        providers={['codex', 'qinyuan-main']}
-        onSubmit={onSubmit}
-        onClose={() => {}}
-      />,
-    )
-    await fillRequiredFields()
-    await userEvent.click(screen.getAllByRole('radio')[1])
-    const submit = document.querySelector<HTMLButtonElement>('button[type="submit"]')
-    expect(submit).not.toBeNull()
-    await userEvent.click(submit!)
-
-    expect(onSubmit).not.toHaveBeenCalled()
-    expect(screen.getByRole('alert')).toHaveTextContent('provider')
-  })
-
   it('keeps selected providers for a manual project that can start later', async () => {
     const onSubmit = vi.fn()
     render(

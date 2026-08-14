@@ -26,6 +26,20 @@ from worker.redaction import redact_text
 ChunkCallback = Callable[[LogChunk], Awaitable[None] | None]
 
 
+def _tool_protocol_error(*outputs: str) -> str | None:
+    """Extract a recoverable function-call correlation failure from logs."""
+    markers = (
+        "no tool call found for function call output",
+        "function call output with call_id",
+    )
+    for output in outputs:
+        for line in output.splitlines():
+            normalized = line.casefold()
+            if any(marker in normalized for marker in markers):
+                return line.strip()[:1000]
+    return None
+
+
 def _resolve_executable(command: tuple[str, ...]) -> tuple[str, ...]:
     if os.name != "nt":
         return command
@@ -384,6 +398,7 @@ class LocalExecutionBackend(ExecutionBackend):
         outcome = BackendOutcome("unavailable", None)
         cleanup = CleanupOutcome(None, "not_applicable")
         stdout_text = ""
+        stderr_text = ""
         handle: BackendHandle | None = None
 
         try:
@@ -410,7 +425,7 @@ class LocalExecutionBackend(ExecutionBackend):
                 cancel_event,
             )
             await asyncio.gather(stdin_task, return_exceptions=True)
-            stdout_text, _ = await asyncio.gather(stdout_task, stderr_task)
+            stdout_text, stderr_text = await asyncio.gather(stdout_task, stderr_task)
             if outcome.diagnostic is not None:
                 await _append_stderr(
                     stderr_path,
@@ -429,6 +444,17 @@ class LocalExecutionBackend(ExecutionBackend):
             )
             if handle is not None:
                 cleanup = await self.cleanup(handle, outcome)
+
+        metadata: dict[str, object] = {
+            "challenge_enforcement": "prompt_only",
+        }
+        tool_error = _tool_protocol_error(stdout_text, stderr_text)
+        if tool_error is not None:
+            metadata["tool_protocol_error"] = tool_error
+        if provider.stream_format == "claude-stream-json":
+            metadata["raw_stdout_path"] = str(
+                stdout_path.with_name("stdout.raw.jsonl").resolve()
+            )
 
         return WorkerResult(
             provider=provider.name,
@@ -449,14 +475,7 @@ class LocalExecutionBackend(ExecutionBackend):
             cleanup_policy=cleanup.policy,
             cleanup_status=cleanup.status,
             cleanup_detail=cleanup.detail,
-            backend_metadata={
-                "challenge_enforcement": "prompt_only",
-                **(
-                    {"raw_stdout_path": str(stdout_path.with_name("stdout.raw.jsonl").resolve())}
-                    if provider.stream_format == "claude-stream-json"
-                    else {}
-                ),
-            },
+            backend_metadata=metadata,
         )
 
 

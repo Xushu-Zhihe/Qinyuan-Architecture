@@ -1,5 +1,6 @@
 import asyncio
 import json
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -59,13 +60,21 @@ class ToolCallingBackend(FakeBackend):
 def provider() -> ProviderConfig:
     return ProviderConfig(
         "qinyuan-main", True, 1, ("qinyuan-main",), 5,
+        tool_sandbox_profile="interactive_unrestricted", provider_isolation="host_process",
+        host_tools_disabled=False,
+    )
+
+
+def sandbox_provider() -> ProviderConfig:
+    return ProviderConfig(
+        "qinyuan-main", True, 1, ("qinyuan-main",), 5,
         tool_sandbox_profile="nmap", provider_isolation="host_process",
         host_tools_disabled=True,
     )
 
 
 class QinyuanProviderTests(unittest.IsolatedAsyncioTestCase):
-    async def test_planning_uses_no_tools_and_does_not_create_container(self) -> None:
+    async def test_unrestricted_planning_does_not_create_container(self) -> None:
         backend = FakeBackend()
         wrapper = QinyuanMainProvider(backend=backend)
         with tempfile.TemporaryDirectory() as directory:
@@ -73,7 +82,44 @@ class QinyuanProviderTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(result.status, "success")
             self.assertEqual(backend.environments[0]["QINYUAN_RUN_CONTEXT_FILE"], str(Path(directory, "run_context.json").resolve()))
             self.assertNotIn("QINYUAN_SANDBOX_TOKEN_FILE", backend.environments[0])
+            self.assertEqual(json.loads(Path(directory, "run_context.json").read_text())['tool_profile'], "interactive_unrestricted")
+            self.assertEqual(result.backend_metadata["tool_isolation"], "host_process")
+            self.assertFalse(result.backend_metadata["tool_sandbox_active"])
             self.assertFalse(Path(directory, "sandbox.token").exists())
+
+    async def test_records_qinyuan_tool_usage_from_state_database(self) -> None:
+        backend = FakeBackend()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = root / "state" / "state.sqlite3"
+            database.parent.mkdir()
+            connection = sqlite3.connect(database)
+            try:
+                connection.execute(
+                    "CREATE TABLE tool_calls (name TEXT NOT NULL)"
+                )
+                connection.executemany(
+                    "INSERT INTO tool_calls(name) VALUES (?)",
+                    [("powershell",), ("powershell",), ("list_skills",)],
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            result = await QinyuanMainProvider(backend=backend).execute(
+                provider(),
+                "execute",
+                None,
+                root,
+                execution_kind="execution",
+            )
+
+        self.assertEqual(result.backend_metadata["tool_call_count"], 3)
+        self.assertEqual(
+            result.backend_metadata["tool_names"],
+            {"list_skills": 1, "powershell": 2},
+        )
+        self.assertTrue(result.backend_metadata["observed"])
 
     async def test_execution_issues_lease_and_cleans_tool_sandbox(self) -> None:
         backend = FakeBackend()
@@ -83,11 +129,13 @@ class QinyuanProviderTests(unittest.IsolatedAsyncioTestCase):
         await bridge.start()
         wrapper = QinyuanMainProvider(backend=backend, bridge=bridge)
         with tempfile.TemporaryDirectory() as directory:
-            result = await wrapper.execute(provider(), "execute", None, Path(directory), execution_kind="execution")
+            result = await wrapper.execute(sandbox_provider(), "execute", None, Path(directory), execution_kind="execution")
             self.assertEqual(result.status, "success")
             self.assertIn("QINYUAN_SANDBOX_TOKEN_FILE", backend.environments[0])
             self.assertEqual(runtime.create_calls, 0)
             self.assertEqual(result.backend_metadata["tool_profile"], "nmap_optional")
+            self.assertEqual(result.backend_metadata["tool_isolation"], "container")
+            self.assertTrue(result.backend_metadata["tool_sandbox_active"])
             self.assertEqual(result.backend_metadata["tool_cleanup_status"], "not_required")
             self.assertFalse(Path(directory, "sandbox.token").exists())
         await bridge.close()
@@ -100,7 +148,7 @@ class QinyuanProviderTests(unittest.IsolatedAsyncioTestCase):
         backend = ToolCallingBackend(bridge)
         wrapper = QinyuanMainProvider(backend=backend, bridge=bridge)
         with tempfile.TemporaryDirectory() as directory:
-            result = await wrapper.execute(provider(), "execute", None, Path(directory), execution_kind="execution")
+            result = await wrapper.execute(sandbox_provider(), "execute", None, Path(directory), execution_kind="execution")
         self.assertEqual(runtime.create_calls, 1)
         self.assertEqual(runtime.execute_calls, 2)
         self.assertEqual(runtime.destroy_calls, 1)
@@ -128,7 +176,7 @@ class QinyuanProviderTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(runtime.bridge.running)
 
             qinyuan_result = await runtime.execute(
-                provider(), "execute", None, Path(directory) / "qinyuan"
+                sandbox_provider(), "execute", None, Path(directory) / "qinyuan"
             )
             self.assertEqual(qinyuan_result.status, "unavailable")
             self.assertEqual(

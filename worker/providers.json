@@ -3,10 +3,10 @@
     "backend": "local"
   },
   "tool_sandbox": {
-    "enabled": false,
+    "enabled": true,
     "runtime_command": ["docker"],
     "image": "qinyuan-tools:nmap-1",
-    "network": "none",
+    "network": "bridge",
     "max_output_bytes": 262144,
     "max_artifact_bytes": 8388608,
     "max_command_timeout_seconds": 900,
@@ -113,13 +113,13 @@
     },
     {
       "name": "qinyuan-main",
-      "enabled": false,
+      "enabled": true,
       "priority": 70,
       "max_running": 2,
       "command": [
         "qinyuan-main"
       ],
-      "tool_sandbox_profile": "nmap",
+      "tool_sandbox_profile": "interactive_unrestricted",
       "provider_isolation": "host_process",
       "host_tools_disabled": false,
       "authorized_targets": [],

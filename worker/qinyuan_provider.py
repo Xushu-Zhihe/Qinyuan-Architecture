@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import os
+import sqlite3
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -31,6 +32,48 @@ def _write_private(path: Path, content: str) -> None:
         os.chmod(path, 0o600)
     except OSError:
         pass
+
+
+def _tool_usage(work_dir: Path) -> dict[str, object]:
+    """Read qinyuan's persisted tool ledger without creating or mutating it."""
+    database = work_dir / "state" / "state.sqlite3"
+    if not database.is_file():
+        return {"tool_call_count": 0, "tool_names": {}, "observed": False}
+    try:
+        uri = f"{database.resolve().as_uri()}?mode=ro"
+        connection = sqlite3.connect(uri, uri=True, timeout=0.2)
+        try:
+            tables = {
+                str(row[0])
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                )
+            }
+            if "tool_calls" not in tables:
+                return {
+                    "tool_call_count": 0,
+                    "tool_names": {},
+                    "observed": True,
+                }
+            names = {
+                str(row[0]): int(row[1])
+                for row in connection.execute(
+                    "SELECT name, COUNT(*) FROM tool_calls GROUP BY name"
+                )
+            }
+            return {
+                "tool_call_count": sum(names.values()),
+                "tool_names": names,
+                "observed": True,
+            }
+        finally:
+            connection.close()
+    except (OSError, sqlite3.Error):
+        return {
+            "tool_call_count": 0,
+            "tool_names": {},
+            "observed": False,
+        }
 
 
 class QinyuanMainProvider:
@@ -83,9 +126,10 @@ class QinyuanMainProvider:
 
         run_id = str(uuid4())
         thread = thread_id or work_dir.name
-        profile = tool_profile_override or ("no_tools" if execution_kind == "planning" else (
-            "nmap_optional" if provider.tool_sandbox_profile == "nmap" else "no_tools"
-        ))
+        configured_profile = provider.tool_sandbox_profile or "no_tools"
+        if configured_profile == "nmap":
+            configured_profile = "nmap_optional"
+        profile = tool_profile_override or configured_profile
         host_tools_blocked = profile == "nmap_optional" and not provider.host_tools_disabled
         deadline = _deadline(provider.timeout_seconds)
         endpoint = self.bridge.endpoint if self.bridge is not None else "disabled://sandbox"
@@ -124,7 +168,7 @@ class QinyuanMainProvider:
                 cleanup_detail="host tools are not confirmed disabled",
                 backend_metadata={"health_category": "unsafe_host_tools", "tool_profile": "nmap_optional"},
             )
-        if profile != "no_tools" and self._tool_unavailable_category is not None:
+        if profile == "nmap_optional" and self._tool_unavailable_category is not None:
             (work_dir / "stdout.txt").write_text("", encoding="utf-8")
             (work_dir / "stderr.txt").write_text("tool sandbox runtime is unavailable\n", encoding="utf-8")
             return WorkerResult(
@@ -146,9 +190,9 @@ class QinyuanMainProvider:
                     "tool_profile": profile,
                 },
             )
-        if bridge_ready and self.bridge is not None:
+        if profile == "nmap_optional" and bridge_ready and self.bridge is not None:
             lease = self.bridge.issue_token(run_id, profile, deadline, token_file=token_path)
-        elif profile != "no_tools":
+        elif profile == "nmap_optional":
             (work_dir / "stdout.txt").write_text("", encoding="utf-8")
             (work_dir / "stderr.txt").write_text("sandbox bridge is not configured\n", encoding="utf-8")
             return WorkerResult(
@@ -169,8 +213,10 @@ class QinyuanMainProvider:
             )
         environment: dict[str, str] = {
             "QINYUAN_RUN_CONTEXT_FILE": str(context_path.resolve()),
+            "PYTHONUTF8": "1",
+            "PYTHONIOENCODING": "utf-8",
         }
-        if bridge_ready and self.bridge is not None and lease is not None:
+        if profile == "nmap_optional" and bridge_ready and self.bridge is not None and lease is not None:
             environment["QINYUAN_SANDBOX_TOKEN_FILE"] = str(token_path.resolve())
             environment["QINYUAN_SANDBOX_ENDPOINT"] = endpoint
         result: WorkerResult | None = None
@@ -214,16 +260,25 @@ class QinyuanMainProvider:
                 pass
         assert result is not None
         session_metadata = created_session
+        tool_isolation = (
+            "container"
+            if profile == "nmap_optional"
+            else "host_process"
+            if profile == "interactive_unrestricted"
+            else "none"
+        )
         metadata = {
             **result.backend_metadata,
             "provider_isolation": "host_process",
-            "tool_isolation": "container",
+            "tool_isolation": tool_isolation,
             "agent_run_id": run_id,
             "tool_profile": profile,
+            "tool_sandbox_active": bool(lease is not None),
             "tool_sandbox_id": session_metadata.sandbox_id if session_metadata else None,
             "tool_sandbox_image": session_metadata.container.image if session_metadata and session_metadata.container else None,
             "tool_cleanup_status": cleanup_status,
             "run_context_file": str(context_path.resolve()),
+            **_tool_usage(work_dir),
         }
         return replace(
             result,

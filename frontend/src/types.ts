@@ -238,6 +238,7 @@ export interface RuntimeProject extends ProjectSummary {
 }
 
 export interface RuntimeSnapshot {
+  providers?: string[]
   limits: {
     max_global_running: number
     max_project_running: number

@@ -66,6 +66,7 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         work_dir: Path,
         output: str,
         status: str = "success",
+        backend_metadata: dict[str, object] | None = None,
     ) -> WorkerResult:
         work_dir.mkdir(parents=True, exist_ok=True)
         stdout = work_dir / "stdout.txt"
@@ -82,6 +83,7 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             stdout_path=str(stdout),
             stderr_path=str(stderr),
             work_dir=str(work_dir),
+            backend_metadata=backend_metadata or {},
         )
 
     async def test_agent_plans_before_execution_and_streams_log(self) -> None:
@@ -948,6 +950,7 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
                 hub=hub,
                 execute=execute,
                 max_iterations=1,
+                answer_quorum_provider_count=1,
             )
             status = await supervisor.run_agent_once("codex")
             while not queue.empty():
@@ -1172,6 +1175,151 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
 
         blocker_release.set()
         await blocker
+
+    async def test_procedural_completion_is_not_accepted(self) -> None:
+        store, root = self.make_store()
+        execution_calls = 0
+
+        async def execute(config, request, challenge_dir, work_dir, **kwargs):
+            nonlocal execution_calls
+            if "BLACKBOARD_INTENT:" in request:
+                return self.result(
+                    config.name,
+                    work_dir,
+                    "BLACKBOARD_INTENT: "
+                    + json.dumps(
+                        {
+                            "action": "plan",
+                            "source_node_id": store.node_id("origin"),
+                            "target_node_id": store.node_id("goal"),
+                            "content": "Probe JS assets and source maps for routes",
+                        }
+                    ),
+                )
+            execution_calls += 1
+            intent_id = next(
+                edge["id"]
+                for edge in store.snapshot()["edges"]
+                if edge["type"] == "intent"
+            )
+            return self.result(
+                config.name,
+                work_dir,
+                "BLACKBOARD_RESULT: "
+                + json.dumps(
+                    {
+                        "intent_id": intent_id,
+                        "facts": [
+                            {
+                                "ref": "plan-fact",
+                                "content": "Focus on the next client-side probe",
+                            }
+                        ],
+                        "edges": [],
+                        "goal_achieved": True,
+                        "answer_key": "probe js assets and source maps",
+                        "final_answer": "Probe JS assets and source maps, then extract routes.",
+                    }
+                ),
+            )
+
+        supervisor = ProjectSupervisor(
+            store=store,
+            providers=(provider("codex"),),
+            challenge_dir=None,
+            project_dir=root,
+            execute=execute,
+            max_iterations=1,
+        )
+
+        status = await supervisor.run_agent_once("codex")
+
+        self.assertEqual(status, "failed")
+        self.assertEqual(execution_calls, 2)
+        intent = next(
+            edge for edge in store.snapshot()["edges"] if edge["type"] == "intent"
+        )
+        self.assertEqual(
+            [execution["status"] for execution in intent["executions"]],
+            ["protocol_error", "protocol_error"],
+        )
+        self.assertNotEqual(store.snapshot()["project"]["status"], "achieved")
+
+    async def test_tool_call_protocol_failure_retries_same_intent(self) -> None:
+        store, root = self.make_store()
+        execution_calls = 0
+
+        async def execute(config, request, challenge_dir, work_dir, **kwargs):
+            nonlocal execution_calls
+            if "BLACKBOARD_INTENT:" in request:
+                return self.result(
+                    config.name,
+                    work_dir,
+                    "BLACKBOARD_INTENT: "
+                    + json.dumps(
+                        {
+                            "action": "plan",
+                            "source_node_id": store.node_id("origin"),
+                            "target_node_id": store.node_id("goal"),
+                            "content": "Recover the flag",
+                        }
+                    ),
+                )
+            execution_calls += 1
+            intent_id = next(
+                edge["id"]
+                for edge in store.snapshot()["edges"]
+                if edge["type"] == "intent"
+            )
+            if execution_calls == 1:
+                return self.result(
+                    config.name,
+                    work_dir,
+                    "BLACKBOARD_RESULT: {\"status\":\"failed\"}",
+                    status="failed",
+                    backend_metadata={
+                        "tool_protocol_error": (
+                            "No tool call found for function call output with call_id call_1"
+                        )
+                    },
+                )
+            return self.result(
+                config.name,
+                work_dir,
+                "BLACKBOARD_RESULT: "
+                + json.dumps(
+                    {
+                        "intent_id": intent_id,
+                        "facts": [
+                            {"ref": "verified", "content": "The key was verified"}
+                        ],
+                        "edges": [],
+                        "goal_achieved": False,
+                        "final_answer": None,
+                    }
+                ),
+            )
+
+        supervisor = ProjectSupervisor(
+            store=store,
+            providers=(provider("codex"),),
+            challenge_dir=None,
+            project_dir=root,
+            execute=execute,
+            max_iterations=1,
+        )
+
+        status = await supervisor.run_agent_once("codex")
+
+        self.assertEqual(status, "completed")
+        self.assertEqual(execution_calls, 2)
+        intent = next(
+            edge for edge in store.snapshot()["edges"] if edge["type"] == "intent"
+        )
+        self.assertEqual(
+            [execution["status"] for execution in intent["executions"]],
+            ["protocol_error", "completed"],
+        )
 
 
 if __name__ == "__main__":

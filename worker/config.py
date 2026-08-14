@@ -167,7 +167,11 @@ def _parse_provider(raw: object, index: int) -> ProviderConfig:
     if not isinstance(streaming_supported, bool):
         raise ConfigError(f"provider {name!r}.streaming_supported must be a boolean")
     tool_profile = raw.get("tool_sandbox_profile")
-    if tool_profile is not None and tool_profile not in {"nmap", "no_tools"}:
+    if tool_profile is not None and tool_profile not in {
+        "interactive_unrestricted",
+        "nmap",
+        "no_tools",
+    }:
         raise ConfigError(
             f"provider {name!r}.tool_sandbox_profile must be nmap or no_tools"
         )

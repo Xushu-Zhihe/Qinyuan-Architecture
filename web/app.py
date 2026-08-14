@@ -210,6 +210,11 @@ def create_app(
         challenge = Path(payload.challenge_path).resolve() if payload.challenge_path else None
         if challenge is not None and not challenge.is_dir():
             raise HTTPException(status_code=400, detail="challenge path is not a directory")
+        if payload.mode == "run" and not payload.providers:
+            raise HTTPException(
+                status_code=400,
+                detail="立即启动 Agent 需要至少选择一个 provider",
+            )
         try:
             project = service.create_project(
                 name=payload.name,

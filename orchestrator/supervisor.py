@@ -1509,6 +1509,11 @@ class ProjectSupervisor:
             if not await self._ensure_provider_ready(provider):
                 break
             graph_sequence = self.store.graph_sequence()
+            evidence_signature = (
+                self._evidence_signature()
+                if provider_name == "qinyuan-agent"
+                else None
+            )
             status = await self.run_agent_once(provider_name)
             if status == "stale":
                 continue
@@ -1516,10 +1521,46 @@ class ProjectSupervisor:
             if status in {"failed", "cancelled"}:
                 if self._failures[provider_name] >= self.failure_threshold:
                     break
+            if (
+                provider_name == "qinyuan-agent"
+                and status == "completed"
+                and self.store.snapshot()["project"]["status"] == "running"
+                and self._evidence_signature() == evidence_signature
+            ):
+                await self._set_agent_status(provider_name, "idle")
+                if self.max_iterations is not None:
+                    break
+                await self._wait_for_graph_change(self.store.graph_sequence())
+                continue
             if status == "idle":
                 if self.max_iterations is not None:
                     break
                 await self._wait_for_graph_change(graph_sequence)
+
+    def _evidence_signature(self) -> tuple[frozenset[tuple[object, ...]], ...]:
+        snapshot = self.store.snapshot()
+        nodes = frozenset(
+            (
+                node["id"],
+                node["type"],
+                node["content"],
+                node["state"],
+                node["generation"],
+            )
+            for node in snapshot["nodes"]
+        )
+        relations = frozenset(
+            (
+                edge["id"],
+                edge["type"],
+                edge["from_node"],
+                edge["to_node"],
+                edge["generation"],
+            )
+            for edge in snapshot["edges"]
+            if edge["type"] != "intent"
+        )
+        return nodes, relations
 
     async def _wait_for_graph_change(self, observed_sequence: int) -> None:
         while not self.cancel_event.is_set():

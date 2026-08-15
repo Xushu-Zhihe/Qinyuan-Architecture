@@ -559,6 +559,155 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(planning_calls, 2)
 
+    async def test_qinyuan_agent_empty_execution_waits_for_new_evidence(self) -> None:
+        store, root = self.make_store()
+        planning_calls = 0
+        execution_calls = 0
+        first_execution = asyncio.Event()
+        resumed_planning = asyncio.Event()
+
+        async def execute(config, request, challenge_dir, work_dir, **kwargs):
+            nonlocal planning_calls, execution_calls
+            if "BLACKBOARD_INTENT:" in request:
+                planning_calls += 1
+                if planning_calls == 2:
+                    resumed_planning.set()
+                    return self.result(
+                        config.name,
+                        work_dir,
+                        "BLACKBOARD_INTENT: "
+                        + json.dumps(
+                            {
+                                "action": "idle",
+                                "reason": "Wait for more evidence",
+                            }
+                        ),
+                    )
+                return self.result(
+                    config.name,
+                    work_dir,
+                    "BLACKBOARD_INTENT: "
+                    + json.dumps(
+                        {
+                            "action": "plan",
+                            "source_node_id": store.node_id("origin"),
+                            "target_node_id": store.node_id("goal"),
+                            "content": "Inspect the challenge",
+                        }
+                    ),
+                )
+
+            execution_calls += 1
+            first_execution.set()
+            intent_id = next(
+                edge["id"]
+                for edge in store.snapshot()["edges"]
+                if edge["type"] == "intent"
+            )
+            return self.result(
+                config.name,
+                work_dir,
+                "BLACKBOARD_RESULT: "
+                + json.dumps(
+                    {
+                        "intent_id": intent_id,
+                        "facts": [],
+                        "edges": [],
+                        "goal_achieved": False,
+                        "final_answer": None,
+                    }
+                ),
+            )
+
+        supervisor = ProjectSupervisor(
+            store=store,
+            providers=(provider("qinyuan-agent"),),
+            challenge_dir=None,
+            project_dir=root,
+            execute=execute,
+            idle_poll_interval=0.01,
+        )
+        try:
+            await supervisor.start()
+            await asyncio.wait_for(first_execution.wait(), timeout=1)
+            for _ in range(20):
+                if supervisor.agent_statuses()["qinyuan-agent"] == "idle":
+                    break
+                await asyncio.sleep(0.01)
+
+            self.assertEqual(planning_calls, 1)
+            self.assertEqual(execution_calls, 1)
+            self.assertEqual(
+                supervisor.agent_statuses()["qinyuan-agent"],
+                "idle",
+            )
+
+            store.add_human_node("fact", "Human supplied evidence")
+            await asyncio.wait_for(resumed_planning.wait(), timeout=1)
+        finally:
+            await supervisor.stop()
+
+        self.assertEqual(planning_calls, 2)
+        self.assertEqual(execution_calls, 1)
+
+    async def test_other_provider_empty_execution_keeps_existing_loop(self) -> None:
+        store, root = self.make_store()
+        planning_calls = 0
+        execution_calls = 0
+
+        async def execute(config, request, challenge_dir, work_dir, **kwargs):
+            nonlocal planning_calls, execution_calls
+            if "BLACKBOARD_INTENT:" in request:
+                planning_calls += 1
+                return self.result(
+                    config.name,
+                    work_dir,
+                    "BLACKBOARD_INTENT: "
+                    + json.dumps(
+                        {
+                            "action": "plan",
+                            "source_node_id": store.node_id("origin"),
+                            "target_node_id": store.node_id("goal"),
+                            "content": "Inspect the challenge",
+                        }
+                    ),
+                )
+
+            execution_calls += 1
+            intent_id = next(
+                edge["id"]
+                for edge in store.snapshot()["edges"]
+                if edge["type"] == "intent"
+            )
+            return self.result(
+                config.name,
+                work_dir,
+                "BLACKBOARD_RESULT: "
+                + json.dumps(
+                    {
+                        "intent_id": intent_id,
+                        "facts": [],
+                        "edges": [],
+                        "goal_achieved": False,
+                        "final_answer": None,
+                    }
+                ),
+            )
+
+        supervisor = ProjectSupervisor(
+            store=store,
+            providers=(provider("codex"),),
+            challenge_dir=None,
+            project_dir=root,
+            execute=execute,
+            max_iterations=2,
+        )
+        await supervisor.start()
+        await supervisor.wait_until_idle(timeout=1)
+
+        self.assertEqual(planning_calls, 2)
+        self.assertEqual(execution_calls, 2)
+
     async def test_stop_wakes_idle_agent_immediately(self) -> None:
         store, root = self.make_store()
         idle_returned = asyncio.Event()

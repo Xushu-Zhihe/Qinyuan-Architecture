@@ -122,6 +122,36 @@
         "max_cooldown_seconds": 300,
         "failure_threshold": 3
       }
+    },
+    {
+      "name": "q-subagent",
+      "enabled": true,
+      "priority": 60,
+      "max_running": 2,
+      "command": [
+        "q-subagent",
+        "exec",
+        "--execution-backend",
+        "auto",
+        "--work-dir",
+        "{work_dir}",
+        "--challenge-dir",
+        "{challenge_dir}",
+        "-"
+      ],
+      "planning_timeout_seconds": 120,
+      "timeout_seconds": 900,
+      "streaming_supported": false,
+      "health_check": {
+        "command": [
+          "q-subagent",
+          "--version"
+        ],
+        "timeout_seconds": 10,
+        "cooldown_seconds": 15,
+        "max_cooldown_seconds": 300,
+        "failure_threshold": 3
+      }
     }
   ]
 }

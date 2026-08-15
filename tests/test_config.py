@@ -337,6 +337,25 @@ class ProviderConfigTests(unittest.TestCase):
         self.assertEqual(qinyuan.planning_timeout_seconds, 120)
         self.assertFalse(qinyuan.streaming_supported)
         self.assertIsNotNone(qinyuan.health_check)
+        q_subagent = providers["q-subagent"]
+        self.assertEqual(
+            q_subagent.command,
+            (
+                "q-subagent",
+                "exec",
+                "--execution-backend",
+                "auto",
+                "--work-dir",
+                "{work_dir}",
+                "--challenge-dir",
+                "{challenge_dir}",
+                "-",
+            ),
+        )
+        self.assertEqual(q_subagent.max_running, 2)
+        self.assertEqual(q_subagent.planning_timeout_seconds, 120)
+        self.assertFalse(q_subagent.streaming_supported)
+        self.assertIsNotNone(q_subagent.health_check)
         self.assertTrue(all(provider.health_check for provider in providers.values()))
 
     def test_rejects_invalid_health_check_cooldown_range(self) -> None:

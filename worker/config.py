@@ -14,7 +14,7 @@ from worker.models import (
 from worker.output_adapters import STREAM_FORMATS
 
 
-ALLOWED_PLACEHOLDERS = {"challenge_dir", "work_dir"}
+ALLOWED_PLACEHOLDERS = {"challenge_dir", "work_dir", "origin_host"}
 
 
 class ConfigError(ValueError):

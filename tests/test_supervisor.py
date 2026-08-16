@@ -844,7 +844,7 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             result = self.result(
                 config.name,
                 work_dir,
-                "403 Forbidden token=sk-secret-value",
+                "Error: authentication failed (403) token=sk-secret-value",
                 status="failed",
             )
             results.append(result)
@@ -867,7 +867,10 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(calls, 1)
         self.assertEqual(health["status"], "auth_failed")
         self.assertNotIn("sk-secret-value", str(health["last_error"]))
-        self.assertEqual(Path(results[0].stdout_path).read_text(encoding="utf-8"), "")
+        self.assertIn(
+            "authentication failed",
+            Path(results[0].stdout_path).read_text(encoding="utf-8"),
+        )
         self.assertNotIn(
             "sk-secret-value",
             Path(results[0].stderr_path).read_text(encoding="utf-8"),

@@ -342,13 +342,18 @@ class ProviderConfigTests(unittest.TestCase):
             q_subagent.command,
             (
                 "q-subagent",
+                "--execution-mode",
+                "approval",
                 "exec",
+                "--auto-resume",
                 "--execution-backend",
                 "auto",
                 "--work-dir",
                 "{work_dir}",
                 "--challenge-dir",
                 "{challenge_dir}",
+                "--authorized-host",
+                "{origin_host}",
                 "-",
             ),
         )

@@ -387,6 +387,7 @@ class ContainerExecutionBackend(ExecutionBackend):
         on_chunk: ChunkCallback | None = None,
         cancel_event: asyncio.Event | None = None,
         max_log_bytes: int = 8 * 1024 * 1024,
+        origin_host: str | None = None,
     ) -> WorkerResult:
         work_dir.mkdir(parents=True, exist_ok=True)
         stdout_path = work_dir / "stdout.txt"
@@ -398,6 +399,7 @@ class ContainerExecutionBackend(ExecutionBackend):
             self.config.challenge_mount_path,
             self.config.work_mount_path,
             has_challenge=challenge_dir is not None,
+            origin_host=origin_host,
         )
         started = time.monotonic()
         outcome = BackendOutcome("unavailable", None)

@@ -4,6 +4,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from urllib.parse import urlparse
 from uuid import uuid4
 
 from orchestrator.audit import prune_audit_logs
@@ -20,7 +21,6 @@ from orchestrator.health import (
     classify_probe_failure,
     classify_worker_failure,
     probe_provider,
-    replace_auth_failure_logs,
     summarize_failure,
     worker_failure_detail,
 )
@@ -35,6 +35,7 @@ from orchestrator.protocol import (
 from orchestrator.store import BlackboardStore, ExecutionRecord, IntentRecord
 from worker.executor import execute_provider
 from worker.models import AuditConfig, LogChunk, ProviderConfig, WorkerResult
+from worker.provider_adapters import get_provider_adapter
 
 
 Executor = Callable[..., Awaitable[WorkerResult]]
@@ -233,6 +234,10 @@ class ProjectSupervisor:
         self._execute_accepts_log_limit = self._accepts_keyword(
             execute,
             "max_log_bytes",
+        )
+        self._execute_accepts_origin_host = self._accepts_keyword(
+            execute,
+            "origin_host",
         )
         self.cancel_event = asyncio.Event()
         self.wake_event = asyncio.Event()
@@ -481,12 +486,11 @@ class ProjectSupervisor:
         result: WorkerResult,
     ) -> str:
         detail = worker_failure_detail(result)
-        category = classify_worker_failure(result, detail)
-        if category == "auth_failed":
-            replace_auth_failure_logs(
-                result,
-                summarize_failure(category, result.status, detail),
-            )
+        category = classify_worker_failure(
+            result,
+            detail,
+            get_provider_adapter(provider.name),
+        )
         record = await self._record_provider_failure(
             provider,
             category,
@@ -494,6 +498,18 @@ class ProjectSupervisor:
             detail,
         )
         return str(record["status"])
+
+    def _origin_host(self) -> str | None:
+        for node in self.store.snapshot().get("nodes", []):
+            if not isinstance(node, dict) or node.get("type") != "origin":
+                continue
+            raw = str(node.get("content", "")).strip()
+            if not raw:
+                continue
+            parsed = urlparse(raw if "://" in raw else f"//{raw}")
+            if parsed.hostname and not any(char.isspace() for char in parsed.hostname):
+                return parsed.hostname.rstrip(".").lower()
+        return None
 
     @staticmethod
     def _cooldown_delay(record: dict[str, object]) -> float:
@@ -564,6 +580,8 @@ class ProjectSupervisor:
             }
             if self._execute_accepts_log_limit:
                 kwargs["max_log_bytes"] = self.audit_config.max_log_bytes
+            if self._execute_accepts_origin_host:
+                kwargs["origin_host"] = self._origin_host()
             return await self.execute(
                 provider,
                 request,

@@ -99,5 +99,6 @@ class ExecutionBackend(ABC):
         on_chunk: Any = None,
         cancel_event: asyncio.Event | None = None,
         max_log_bytes: int = 8 * 1024 * 1024,
+        origin_host: str | None = None,
     ) -> WorkerResult:
         raise NotImplementedError

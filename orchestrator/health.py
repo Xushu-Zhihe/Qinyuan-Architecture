@@ -9,6 +9,7 @@ from pathlib import Path
 
 from worker.executor import _terminate_process_tree
 from worker.models import ProviderConfig, WorkerResult
+from worker.provider_adapters import ProviderAdapter, get_provider_adapter
 from worker.redaction import redact_error
 
 
@@ -37,7 +38,7 @@ class ProbeResult:
 HealthProbe = Callable[[ProviderConfig], Awaitable[ProbeResult]]
 
 
-_AUTH_PATTERN = re.compile(
+_PROBE_AUTH_PATTERN = re.compile(
     r"(?i)(?:\b401\b|\b403\b|unauthori[sz]ed|forbidden|not[ -]?logged[ -]?in|"
     r"login required|authentication (?:failed|required)|请(?:先)?登录|未登录|认证失败)"
 )
@@ -53,15 +54,20 @@ _TEMPORARY_PATTERN = re.compile(
 def classify_probe_failure(result: ProbeResult) -> str:
     if result.status == "missing":
         return "missing"
-    if _AUTH_PATTERN.search(result.detail):
+    if _PROBE_AUTH_PATTERN.search(result.detail):
         return "auth_failed"
     if result.status == "timeout" or _TEMPORARY_PATTERN.search(result.detail):
         return "cooldown"
     return "unhealthy"
 
 
-def classify_worker_failure(result: WorkerResult, detail: str) -> str:
-    if _AUTH_PATTERN.search(detail):
+def classify_worker_failure(
+    result: WorkerResult,
+    detail: str,
+    adapter: ProviderAdapter | None = None,
+) -> str:
+    adapter = adapter or get_provider_adapter(result.provider)
+    if adapter.is_auth_failure(detail):
         return "auth_failed"
     if result.status == "unavailable":
         return "missing" if _MISSING_PATTERN.search(detail) else "unhealthy"
@@ -72,8 +78,10 @@ def classify_worker_failure(result: WorkerResult, detail: str) -> str:
 
 def summarize_failure(category: str, status: str, detail: str) -> str:
     if category == "auth_failed":
-        code = "403" if re.search(r"\b403\b", detail) else "401"
-        return f"authentication failed ({code}); sign in before retrying"
+        match = re.search(r"\b(401|403)\b", detail)
+        if match:
+            return f"authentication failed ({match.group(1)}); sign in before retrying"
+        return "authentication failed; sign in before retrying"
     if category == "missing":
         return "provider executable is missing"
     if category == "cooldown":
@@ -95,18 +103,6 @@ def worker_failure_detail(result: WorkerResult) -> str:
         except OSError:
             pass
     return "\n".join(part for part in parts if part)
-
-
-def replace_auth_failure_logs(result: WorkerResult, summary: str) -> None:
-    for path_value, content in (
-        (result.stdout_path, ""),
-        (result.stderr_path, summary + "\n"),
-    ):
-        path = Path(path_value)
-        try:
-            path.write_text(content, encoding="utf-8")
-        except OSError:
-            pass
 
 
 async def probe_provider(provider: ProviderConfig) -> ProbeResult:

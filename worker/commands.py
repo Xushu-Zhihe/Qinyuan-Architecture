@@ -9,6 +9,7 @@ def expand_command(
     work_path: str,
     *,
     container: bool = False,
+    origin_host: str = "",
 ) -> tuple[str, ...]:
     template = (
         provider.container_command
@@ -18,6 +19,7 @@ def expand_command(
     replacements = {
         "{challenge_dir}": challenge_path,
         "{work_dir}": work_path,
+        "{origin_host}": origin_host,
     }
     expanded: list[str] = []
     for configured in template:
@@ -32,11 +34,14 @@ def local_command(
     provider: ProviderConfig,
     challenge_dir: Path | None,
     work_dir: Path,
+    *,
+    origin_host: str | None = None,
 ) -> tuple[str, ...]:
     return expand_command(
         provider,
         str(challenge_dir.resolve()) if challenge_dir else "",
         str(work_dir.resolve()),
+        origin_host=origin_host or "",
     )
 
 
@@ -46,10 +51,12 @@ def container_command(
     work_mount_path: str,
     *,
     has_challenge: bool,
+    origin_host: str | None = None,
 ) -> tuple[str, ...]:
     return expand_command(
         provider,
         challenge_mount_path if has_challenge else "",
         work_mount_path,
         container=True,
+        origin_host=origin_host or "",
     )

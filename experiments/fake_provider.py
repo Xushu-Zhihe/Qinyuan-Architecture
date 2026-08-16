@@ -27,8 +27,9 @@ class DeterministicFakeExecutor:
         on_chunk=None,
         cancel_event: asyncio.Event | None = None,
         max_log_bytes: int = 8 * 1024 * 1024,
+        origin_host: str | None = None,
     ) -> WorkerResult:
-        del challenge_dir, max_log_bytes
+        del challenge_dir, max_log_bytes, origin_host
         work_dir.mkdir(parents=True, exist_ok=True)
         stdout_path = work_dir / "stdout.txt"
         stderr_path = work_dir / "stderr.txt"

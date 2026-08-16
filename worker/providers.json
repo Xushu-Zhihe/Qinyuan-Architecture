@@ -130,17 +130,22 @@
       "max_running": 2,
       "command": [
         "q-subagent",
+        "--execution-mode",
+        "approval",
         "exec",
+        "--auto-resume",
         "--execution-backend",
         "auto",
         "--work-dir",
         "{work_dir}",
         "--challenge-dir",
         "{challenge_dir}",
+        "--authorized-host",
+        "{origin_host}",
         "-"
       ],
       "planning_timeout_seconds": 120,
-      "timeout_seconds": 900,
+      "timeout_seconds": 1500,
       "streaming_supported": false,
       "health_check": {
         "command": [

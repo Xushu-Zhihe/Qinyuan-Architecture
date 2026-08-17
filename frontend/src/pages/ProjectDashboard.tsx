@@ -115,7 +115,7 @@ export function ProjectDashboard({
             <header className="dialog-header">
               <div>
                 <h2 id="delete-project-title">删除项目</h2>
-                <p>{pendingDelete.name} · {statusLabel[pendingDelete.status] ?? pendingDelete.status}</p>
+                <p>{pendingDelete.name} · {getStatusLabel(pendingDelete)}</p>
               </div>
               <button className="icon-button" aria-label="关闭" disabled={deleting} onClick={() => setPendingDelete(null)}><X size={20} /></button>
             </header>
@@ -142,4 +142,9 @@ const statusLabel: Record<string, string> = {
   degraded: '有失败',
   achieved: '已完成',
   stopped: '已停止',
+}
+
+function getStatusLabel(project: Pick<ProjectSummary, 'mode' | 'status'>) {
+  if (project.mode === 'run' && project.status === 'idle') return '启动中'
+  return statusLabel[project.status] ?? project.status
 }

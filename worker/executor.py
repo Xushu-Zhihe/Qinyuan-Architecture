@@ -408,24 +408,26 @@ class LocalExecutionBackend(ExecutionBackend):
         max_log_bytes: int = 8 * 1024 * 1024,
         origin_host: str | None = None,
     ) -> WorkerResult:
-        work_dir.mkdir(parents=True, exist_ok=True)
         stdout_path = work_dir / "stdout.txt"
         stderr_path = work_dir / "stderr.txt"
-        stdout_path.write_text("", encoding="utf-8")
-        stderr_path.write_text("", encoding="utf-8")
-        command = local_command(
-            provider,
-            challenge_dir,
-            work_dir,
-            origin_host=origin_host,
-        )
         started = time.monotonic()
         outcome = BackendOutcome("unavailable", None)
         cleanup = CleanupOutcome(None, "not_applicable")
         stdout_text = ""
         handle: BackendHandle | None = None
+        command: tuple[str, ...] = ()
+        startup_error: str | None = None
 
         try:
+            work_dir.mkdir(parents=True, exist_ok=True)
+            stdout_path.write_text("", encoding="utf-8")
+            stderr_path.write_text("", encoding="utf-8")
+            command = local_command(
+                provider,
+                challenge_dir,
+                work_dir,
+                origin_host=origin_host,
+            )
             handle = await self.start(
                 provider,
                 command,
@@ -457,14 +459,21 @@ class LocalExecutionBackend(ExecutionBackend):
                     max_log_bytes,
                 )
             cleanup = await self.cleanup(handle, outcome)
-        except OSError as exc:
-            message = f"cannot start provider command {command[0]!r}: {exc}\n"
-            await _append_stderr(
-                stderr_path,
-                message,
-                on_chunk,
-                max_log_bytes,
+        except Exception as exc:
+            command_name = command[0] if command else provider.command[0]
+            startup_error = (
+                f"cannot start provider command {command_name!r}: "
+                f"{type(exc).__name__}: {exc}"
             )
+            try:
+                await _append_stderr(
+                    stderr_path,
+                    startup_error + "\n",
+                    on_chunk,
+                    max_log_bytes,
+                )
+            except OSError:
+                pass
             if handle is not None:
                 cleanup = await self.cleanup(handle, outcome)
 
@@ -474,7 +483,7 @@ class LocalExecutionBackend(ExecutionBackend):
             status=outcome.status,
             exit_code=outcome.exit_code,
             duration_seconds=round(time.monotonic() - started, 3),
-            output=stdout_text.strip(),
+            output=(stdout_text.strip() or startup_error or ""),
             stdout_path=str(stdout_path.resolve()),
             stderr_path=str(stderr_path.resolve()),
             work_dir=str(work_dir.resolve()),
@@ -489,6 +498,14 @@ class LocalExecutionBackend(ExecutionBackend):
             cleanup_detail=cleanup.detail,
             backend_metadata={
                 "challenge_enforcement": "prompt_only",
+                **(
+                    {
+                        "startup_error": redact_text(startup_error),
+                        "command": [redact_text(str(item)) for item in command],
+                    }
+                    if startup_error
+                    else {}
+                ),
                 **(
                     {"raw_stdout_path": str(stdout_path.with_name("stdout.raw.jsonl").resolve())}
                     if provider.stream_format == "claude-stream-json"

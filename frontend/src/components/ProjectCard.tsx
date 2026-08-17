@@ -10,6 +10,11 @@ const statusLabel: Record<string, string> = {
   stopped: '已停止',
 }
 
+function getStatusLabel(project: Pick<ProjectSummary, 'mode' | 'status'>) {
+  if (project.mode === 'run' && project.status === 'idle') return '启动中'
+  return statusLabel[project.status] ?? project.status
+}
+
 export function ProjectCard({
   project,
   onOpen,
@@ -24,12 +29,12 @@ export function ProjectCard({
       <button
         className="project-card__open"
         onClick={() => onOpen(project.id)}
-        aria-label={`${project.name}，${statusLabel[project.status] ?? project.status}`}
+        aria-label={`${project.name}，${getStatusLabel(project)}`}
       >
         <span className="project-card__topline">
           <span className="project-card__name">{project.name}</span>
           <span className={`status status--${project.status}`}>
-            {statusLabel[project.status] ?? project.status}
+            {getStatusLabel(project)}
           </span>
         </span>
         <span className="project-card__summary">

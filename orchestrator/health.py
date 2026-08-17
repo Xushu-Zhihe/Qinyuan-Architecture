@@ -51,12 +51,25 @@ _TEMPORARY_PATTERN = re.compile(
     r"(?:reset|refused|aborted)|network|dns|service unavailable|rate limit|"
     r"网络|连接.*(?:重置|拒绝|中断)|服务不可用)"
 )
+_DOCKER_PATTERN = re.compile(
+    r"(?i)(?:docker (?:daemon|desktop)|cannot connect to (?:the )?docker"
+    r"|docker is not running)"
+)
+_PERMISSION_PATTERN = re.compile(
+    r"(?i)(?:permission denied|access is denied|winerror 5|拒绝访问|权限)"
+)
+
+
 def classify_probe_failure(result: ProbeResult) -> str:
     if result.status == "missing":
         return "missing"
     if _PROBE_AUTH_PATTERN.search(result.detail):
         return "auth_failed"
-    if result.status == "timeout" or _TEMPORARY_PATTERN.search(result.detail):
+    if (
+        result.status == "timeout"
+        or _TEMPORARY_PATTERN.search(result.detail)
+        or _DOCKER_PATTERN.search(result.detail)
+    ):
         return "cooldown"
     return "unhealthy"
 
@@ -85,24 +98,41 @@ def summarize_failure(category: str, status: str, detail: str) -> str:
     if category == "missing":
         return "provider executable is missing"
     if category == "cooldown":
-        if status == "timeout":
-            return "provider timed out"
-        if _TEMPORARY_PATTERN.search(detail):
-            return "temporary provider or network failure"
-        return "provider process failed"
+        if status == "timeout" or re.search(
+            r"(?i)timed? out|timeout",
+            detail,
+        ):
+            suffix = redact_error(detail, limit=240)
+            return "provider timed out" + (f": {suffix}" if suffix else "")
+        if _TEMPORARY_PATTERN.search(detail) or _DOCKER_PATTERN.search(detail):
+            suffix = redact_error(detail, limit=240)
+            return "temporary provider or network failure" + (
+                f": {suffix}" if suffix else ""
+            )
+        suffix = redact_error(detail, limit=240)
+        return "provider process failed" + (f": {suffix}" if suffix else "")
     safe = redact_error(detail)
+    if _PERMISSION_PATTERN.search(detail):
+        return "provider workspace or permission failure" + (
+            f": {safe}" if safe else ""
+        )
     return safe or f"provider health check failed ({status})"
 
 
 def worker_failure_detail(result: WorkerResult) -> str:
     parts = [result.output]
+    metadata_error = result.backend_metadata.get("startup_error")
+    if metadata_error:
+        parts.append(str(metadata_error))
+    if result.cleanup_detail:
+        parts.append(str(result.cleanup_detail))
     stderr_path = Path(result.stderr_path)
     if stderr_path.is_file():
         try:
             parts.append(stderr_path.read_text(encoding="utf-8", errors="replace")[-4096:])
         except OSError:
             pass
-    return "\n".join(part for part in parts if part)
+    return redact_error("\n".join(part for part in parts if part), limit=4096)
 
 
 async def probe_provider(provider: ProviderConfig) -> ProbeResult:
@@ -138,7 +168,12 @@ async def probe_provider(provider: ProviderConfig) -> ProbeResult:
     done, _ = await asyncio.wait({communicate}, timeout=health.timeout_seconds)
     if communicate not in done:
         await _terminate_process_tree(process)
-        stdout, stderr = await communicate
+        try:
+            stdout, stderr = await asyncio.wait_for(communicate, timeout=2.0)
+        except asyncio.TimeoutError:
+            communicate.cancel()
+            await asyncio.gather(communicate, return_exceptions=True)
+            stdout, stderr = b"", b"health probe process did not close pipes"
         detail = (stdout + stderr).decode("utf-8", errors="replace")[-4096:]
         return ProbeResult("timeout", detail)
 

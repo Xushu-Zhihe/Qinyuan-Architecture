@@ -824,11 +824,21 @@ class ProjectSupervisor:
         finally:
             await planning_logs.close()
         if planning.status != "success":
+            planning_detail = worker_failure_detail(planning)
+            planning_category = classify_worker_failure(
+                planning,
+                planning_detail,
+                get_provider_adapter(provider.name),
+            )
             await self._finish_planning_attempt(
                 planning_attempt_id,
                 planning.status,
                 planning.cancel_reason
-                or f"provider process status was {planning.status}",
+                or summarize_failure(
+                    planning_category,
+                    planning.status,
+                    planning_detail,
+                ),
                 planning,
             )
             if planning.status == "cancelled":
@@ -1297,12 +1307,23 @@ class ProjectSupervisor:
         finally:
             await execution_logs.close()
         if result.status != "success":
+            result_detail = worker_failure_detail(result)
+            result_category = classify_worker_failure(
+                result,
+                result_detail,
+                get_provider_adapter(provider.name),
+            )
+            failure_message = summarize_failure(
+                result_category,
+                result.status,
+                result_detail,
+            )
             async with self.write_lock:
                 sequence = int(self.store.snapshot()["sequence"])
                 self.store.fail_execution(
                     execution.id,
                     result.status,
-                    f"provider process status was {result.status}",
+                    failure_message,
                     result.exit_code,
                     queue_seconds=result.queue_seconds,
                     duration_seconds=result.duration_seconds,

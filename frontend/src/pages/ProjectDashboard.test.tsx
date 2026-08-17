@@ -33,9 +33,36 @@ const projects: ProjectSummary[] = [
     updated_at: '2026-07-12',
     last_opened_at: '2026-07-12',
   },
+  {
+    id: 'project-starting',
+    name: 'Starting Agent',
+    mode: 'run',
+    status: 'idle',
+    challenge_path: null,
+    providers: ['qinyuan-agent'],
+    agent_limit: 1,
+    created_at: '2026-07-12',
+    updated_at: '2026-07-12',
+    last_opened_at: '2026-07-12',
+  },
 ]
 
 describe('ProjectDashboard', () => {
+  it('does not label a run-mode project waiting for health as manual', () => {
+    render(
+      <ProjectDashboard
+        projects={[projects[2]]}
+        runtime={null}
+        onOpen={() => {}}
+        onCreate={() => {}}
+        onDelete={async () => {}}
+        onOpenAutopilot={() => {}}
+      />,
+    )
+
+    expect(screen.getByText('启动中')).toBeInTheDocument()
+  })
+
   it('filters running projects and opens the selected project', async () => {
     const onOpen = vi.fn()
     render(

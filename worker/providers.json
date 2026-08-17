@@ -131,11 +131,9 @@
       "command": [
         "q-subagent",
         "--execution-mode",
-        "approval",
+        "unrestricted",
         "exec",
         "--auto-resume",
-        "--execution-backend",
-        "auto",
         "--work-dir",
         "{work_dir}",
         "--challenge-dir",

@@ -92,6 +92,8 @@ def main() -> int:
     try:
         text = args.file.read_text(encoding="utf-8") if args.file else sys.stdin.read()
         payload = json.loads(text.strip())
+        if isinstance(payload, dict) and payload.get("protocol_version") == 2 and not args.goal_node_id:
+            raise ValueError("--goal-node-id is required for protocol v2")
         nodes = dict(_pair(value, "existing node") for value in args.existing_node)
         for node_id in args.existing_node_id:
             nodes.setdefault(node_id, "unknown")

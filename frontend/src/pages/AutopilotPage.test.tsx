@@ -68,6 +68,7 @@ describe('AutopilotPage', () => {
           max_output_tokens: null,
           reasoning_effort: null,
           extra_headers: {},
+          extra_body: {},
         },
       },
       platform: { prompt: 'platform instructions' },

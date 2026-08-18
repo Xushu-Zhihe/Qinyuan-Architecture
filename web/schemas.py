@@ -5,6 +5,11 @@ from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
 
+from autopilot.models import (
+    CONTROLLER_EXTRA_BODY_FIELDS,
+    CONTROLLER_RESERVED_BODY_FIELDS,
+)
+
 
 class ProjectCreate(BaseModel):
     name: str = Field(min_length=1, max_length=120)
@@ -26,6 +31,19 @@ class ControllerAdvanced(BaseModel):
     max_output_tokens: int | None = Field(default=None, ge=1, le=200000)
     reasoning_effort: str | None = Field(default=None, min_length=1, max_length=40)
     extra_headers: dict[str, str] = Field(default_factory=dict)
+    extra_body: dict[str, object] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def allowed_extra_body(self):
+        unknown = sorted(set(self.extra_body) - CONTROLLER_EXTRA_BODY_FIELDS)
+        if unknown:
+            raise ValueError(f"unsupported controller extra_body fields: {unknown}")
+        reserved = sorted(set(self.extra_body) & CONTROLLER_RESERVED_BODY_FIELDS)
+        if reserved:
+            raise ValueError(
+                f"controller extra_body cannot override request fields: {reserved}"
+            )
+        return self
 
 
 class ControllerPayload(BaseModel):
@@ -33,7 +51,11 @@ class ControllerPayload(BaseModel):
 
     api_key: SecretStr = Field(min_length=1)
     base_url: str = Field(min_length=1, max_length=500)
-    model: str = Field(min_length=1, max_length=200)
+    model: str = Field(
+        min_length=1,
+        max_length=200,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$",
+    )
     advanced: ControllerAdvanced = Field(default_factory=ControllerAdvanced)
 
     @model_validator(mode="after")
@@ -169,9 +191,13 @@ class AutoCommon(BaseModel):
 
     @model_validator(mode="after")
     def unique_providers(self):
-        if len(set(self.solver_providers)) != len(self.solver_providers):
+        providers = [provider.strip() for provider in self.solver_providers]
+        if any(not provider for provider in providers):
+            raise ValueError("solver_providers must contain non-empty names")
+        self.solver_providers = providers
+        if len(set(providers)) != len(providers):
             raise ValueError("solver_providers must be unique")
-        if self.agent_limit > len(self.solver_providers):
+        if self.agent_limit > len(providers):
             raise ValueError("agent_limit cannot exceed solver provider count")
         return self
 
@@ -193,6 +219,21 @@ class StructuredAutoStart(AutoCommon):
     mode: Literal["structured"]
     platform: StructuredPlatformPayload
 
+    @model_validator(mode="after")
+    def skip_capability(self):
+        if (
+            (
+                self.rejected_action == "skip"
+                or self.solver_failure_action == "skip"
+                or self.stop_active_task_action == "skip"
+            )
+            and self.platform.skip_task is None
+        ):
+            raise ValueError(
+                "skip policies require a structured platform skip_task endpoint"
+            )
+        return self
+
 
 ModernAutoStart = Annotated[
     Union[PromptAutoStart, StructuredAutoStart], Field(discriminator="mode")
@@ -208,7 +249,7 @@ class LegacyAutoStart(BaseModel):
     agent_limit: int = Field(default=2, ge=1, le=16)
     max_tasks: int = Field(default=10, ge=1, le=1000)
     task_timeout_minutes: float = Field(default=60, gt=0, le=1440)
-    controller_timeout_seconds: float = Field(default=300, gt=0, le=3600)
+    controller_timeout_seconds: float = Field(default=300, gt=0, le=1800)
 
 
 AutoStart = Union[ModernAutoStart, LegacyAutoStart]

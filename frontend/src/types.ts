@@ -312,6 +312,7 @@ export interface ControllerAdvancedInput {
   max_output_tokens: number | null
   reasoning_effort: string | null
   extra_headers: Record<string, string>
+  extra_body: Record<string, unknown>
 }
 
 export interface ControllerInput {

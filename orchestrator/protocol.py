@@ -362,6 +362,10 @@ def parse_result(
     try:
         payload = _last_payload(stdout, RESULT_PREFIX)
         protocol_version = payload.get("protocol_version", 1)
+        if isinstance(protocol_version, bool) or not isinstance(protocol_version, int):
+            raise ValueError("protocol_version must be an integer")
+        if protocol_version not in {1, 2}:
+            raise ValueError(f"unsupported result protocol version: {protocol_version}")
         if protocol_version == 2:
             _require_fields(payload, V2_RESULT_FIELDS, "result")
         else:
@@ -394,6 +398,12 @@ def parse_result(
         if protocol_version != 2 and achieved and not legacy_result and answer_key is None:
             raise ValueError("goal_achieved requires answer_key")
         if protocol_version == 2:
+            if node_types is None or current_goal_node_id is None or existing_addresses is None:
+                raise ValueError(
+                    "protocol v2 parsing requires node_types, current_goal_node_id, and existing_addresses"
+                )
+            if set(existing_node_ids) - set(node_types):
+                raise ValueError("node_types must describe every existing node")
             if achieved and (not isinstance(goal_result_ref, str) or not goal_result_ref.strip()):
                 raise ValueError("goal_achieved requires goal_result_ref")
             if not achieved and goal_result_ref is not None:
@@ -434,19 +444,22 @@ def parse_result(
             result_type = (node_types or {}).get(goal_result_ref)
             if goal_result_ref not in refs and result_type != "fact":
                 raise ValueError("goal_result_ref must reference a Fact")
-            if current_goal_node_id:
-                if current_goal_node_id not in existing_node_ids:
-                    raise ValueError("current goal node is unknown")
-                addresses = existing_addresses or set()
-                if goal_result_ref not in refs and (goal_result_ref, current_goal_node_id) in addresses:
-                    pass
-                elif not any(
-                    edge.type == "addresses"
-                    and edge.from_ref == goal_result_ref
-                    and edge.to_ref == current_goal_node_id
-                    for edge in edges
-                ):
-                    raise ValueError("goal result must address the current Goal")
+            assert current_goal_node_id is not None
+            assert node_types is not None
+            if current_goal_node_id not in existing_node_ids:
+                raise ValueError("current goal node is unknown")
+            if node_types.get(current_goal_node_id) != "goal":
+                raise ValueError("current goal node must be a Goal")
+            addresses = existing_addresses or set()
+            if goal_result_ref not in refs and (goal_result_ref, current_goal_node_id) in addresses:
+                pass
+            elif not any(
+                edge.type == "addresses"
+                and edge.from_ref == goal_result_ref
+                and edge.to_ref == current_goal_node_id
+                for edge in edges
+            ):
+                raise ValueError("goal result must address the current Goal")
 
         return ResultParseResult(
             status="valid",

@@ -37,16 +37,33 @@ _BEARER_PATTERN = re.compile(r"(?i)\bbearer\s+([^\s,;]+)")
 
 TASK_TRANSITIONS = {
     None: {"queued"},
-    "queued": {"fetched", "waiting", "finished", "retry_wait", "failed"},
-    "fetched": {"solving", "skipped", "failed"},
+    "queued": {"fetched", "waiting", "finished", "retry_wait", "failed", "stopped"},
+    "fetched": {"solving", "skipped", "failed", "stopped"},
     "solving": {"solver_achieved", "skipped", "failed", "stopped"},
-    "solver_achieved": {"submit_pending", "failed"},
-    "submit_pending": {"accepted", "rejected", "retry_wait", "failed"},
-    "rejected": {"replanning", "skipped", "failed"},
-    "replanning": {"submit_pending", "skipped", "failed"},
+    "solver_achieved": {"submit_pending", "failed", "stopped"},
+    "submit_pending": {"accepted", "rejected", "retry_wait", "failed", "stopped"},
+    "rejected": {"replanning", "skipped", "failed", "stopped"},
+    "replanning": {"submit_pending", "skipped", "failed", "stopped"},
     "retry_wait": {"queued", "submit_pending", "failed", "stopped"},
     "waiting": {"queued", "failed", "stopped"},
 }
+
+TASK_REASON_CODES = frozenset(
+    {
+        "platform_wait",
+        "platform_transport",
+        "platform_rejected",
+        "platform_retry_exhausted",
+        "platform_submission_failed",
+        "solver_timeout",
+        "solver_degraded",
+        "result_conflict",
+        "task_info_skip_required",
+        "skip_failed",
+        "skipped",
+        "user_stopped",
+    }
+)
 
 
 def _scrub_text(value: str, platform_prompt: str) -> str:
@@ -192,6 +209,14 @@ class AutoManager:
                 return self._snapshot_locked()
             if session.status not in {"finished", "failed", "stopped"}:
                 session.status = "stopping"
+                if session.current_external_id is not None:
+                    if session.current_task_status in TASK_TRANSITIONS and session.current_task_status != "stopped":
+                        try:
+                            self._transition(session, "stopped", "user_stopped")
+                        except AutoManagerError:
+                            session.current_task_status = "stopped"
+                            session.current_reason_code = "user_stopped"
+                    self._append_stopped_history(session)
             if cancel_event is not None:
                 cancel_event.set()
             project_id = session.current_project_id
@@ -213,6 +238,9 @@ class AutoManager:
                 "failed",
             }:
                 self._session.status = "stopped"
+                if self._session.current_task_status is not None:
+                    self._session.current_task_status = "stopped"
+                    self._session.current_reason_code = "user_stopped"
                 self._clear_prompt(self._session)
             return self._snapshot_locked()
 
@@ -401,7 +429,15 @@ class AutoManager:
                     raise
                 goal_result = self.service.get_goal_result(session.current_project_id or "")
                 if goal_result is None:
-                    raise AutoManagerError("solver project achieved without a Goal result Fact")
+                    project_id = session.current_project_id or ""
+                    conflict_checker = getattr(self.service, "goal_result_conflict", None)
+                    if project_id and callable(conflict_checker) and conflict_checker(project_id):
+                        raise AutoManagerError(
+                            "result_conflict: solver providers produced multiple qualifying result groups"
+                        )
+                    raise AutoManagerError(
+                        "solver project achieved without a Goal result Fact"
+                    )
                 self._transition(session, "solver_achieved")
                 session.current_result_ref = goal_result.result_ref
                 session.current_result_fact_id = goal_result.fact.id
@@ -452,12 +488,17 @@ class AutoManager:
                     )
                     raise AutoManagerError("platform rejected the Goal result")
                 if submission.status != "accepted":
+                    reason_code = str(
+                        submission.metadata.get("reason_code", "platform_submission_failed")
+                    )
+                    if reason_code not in TASK_REASON_CODES:
+                        reason_code = "platform_submission_failed"
                     self._append_terminal_history(
                         session,
                         task,
                         "failed",
                         submission.message,
-                        "platform_submission_failed",
+                        reason_code,
                         attempt_records,
                     )
                     raise AutoManagerError(submission.message or "platform submission failed")
@@ -487,19 +528,17 @@ class AutoManager:
                 session.processed_tasks += 1
                 self._clear_current_task(session)
             if session.status not in {"finished", "failed", "stopped"}:
-                session.status = "finished"
+                self._set_session_terminal(session, "finished")
                 session.last_message = "maximum task limit reached"
         except asyncio.CancelledError:
-            session.status = "stopped"
-            session.current_task_status = "stopped"
+            self._set_session_terminal(session, "stopped", "user_stopped")
             session.last_message = "automatic session stopped"
         except (AutoManagerError, DirectControllerError) as exc:
-            session.status = "failed"
-            session.current_task_status = "failed"
+            reason_code = self._reason_code_for_error(str(exc))
+            self._set_session_terminal(session, "failed", reason_code)
             session.last_error = str(exc)
         except Exception as exc:
-            session.status = "failed"
-            session.current_task_status = "failed"
+            self._set_session_terminal(session, "failed", "platform_submission_failed")
             session.last_error = f"automatic session failed: {type(exc).__name__}"
         finally:
             await self._dispose_modern_runtime()
@@ -536,7 +575,7 @@ class AutoManager:
             result = await self._fetch_modern(session)
             if result.status != "retryable_error":
                 return result
-        raise AutoManagerError("platform fetch transport retries exhausted")
+        raise AutoManagerError("platform_retry_exhausted: platform fetch transport retries exhausted")
 
     async def _submit_modern(
         self,
@@ -586,7 +625,9 @@ class AutoManager:
         assert result is not None
         return (
             PlatformResult(
-                "fatal_error", message="submission transport retries exhausted"
+                "fatal_error",
+                message="submission transport retries exhausted",
+                metadata={"reason_code": "platform_retry_exhausted"},
             ),
             attempts,
         )
@@ -636,17 +677,35 @@ class AutoManager:
         else:
             raise AutoManagerError("skip adapter is unavailable")
         if result.status != "skipped":
-            raise AutoManagerError(result.message or "platform skip failed")
-        if session.current_task_status == "rejected":
-            self._transition(session, "skipped")
-        elif session.current_task_status in {"fetched", "solving"}:
-            self._transition(session, "skipped")
+            if session.current_task_status in TASK_TRANSITIONS and session.current_task_status not in {
+                None,
+                "failed",
+                "stopped",
+            }:
+                self._transition(session, "failed", "skip_failed")
+            self._append_terminal_history(
+                session,
+                task,
+                "failed",
+                result.message or "platform skip failed",
+                "skip_failed",
+                attempts or [],
+            )
+            raise AutoManagerError(
+                f"skip_failed: {result.message or 'platform skip failed'}"
+            )
+        if session.current_task_status in {"fetched", "solving", "rejected", "replanning"}:
+            self._transition(
+                session,
+                "skipped",
+                self._reason_code_for_error(reason, default="skipped"),
+            )
         self._append_terminal_history(
             session,
             task,
             "skipped",
             reason,
-            "skipped",
+            self._reason_code_for_error(reason, default="skipped"),
             attempts or [],
         )
         session.processed_tasks += 1
@@ -685,10 +744,87 @@ class AutoManager:
         )
 
     @staticmethod
+    def _append_stopped_history(session: AutoSession) -> None:
+        if session.current_external_id is None:
+            return
+        if session.history and session.history[-1].external_id == session.current_external_id and session.history[-1].status == "stopped":
+            return
+        session.history.append(
+            AutoHistoryEntry(
+                external_id=session.current_external_id,
+                name=session.current_task_name or session.current_external_id,
+                project_id=session.current_project_id or "",
+                answer="",
+                status="stopped",
+                message="automatic session stopped",
+                reason_code="user_stopped",
+                finished_at=_timestamp(),
+            )
+        )
+
+    @staticmethod
+    def _set_session_terminal(
+        session: AutoSession,
+        status: str,
+        reason_code: str | None = None,
+    ) -> None:
+        if status not in {"finished", "failed", "stopped"}:
+            raise AutoManagerError(f"unsupported terminal session status: {status}")
+        current = session.current_task_status
+        if current is not None and status in TASK_TRANSITIONS.get(current, set()):
+            AutoManager._transition(session, status, reason_code)
+            AutoManager._ensure_terminal_history(session, status, reason_code)
+            return
+        session.status = status
+        if current is not None and status in {"failed", "stopped"}:
+            session.current_task_status = status
+            session.current_reason_code = reason_code
+            AutoManager._ensure_terminal_history(session, status, reason_code)
+
+    @staticmethod
+    def _ensure_terminal_history(
+        session: AutoSession,
+        status: str,
+        reason_code: str | None,
+    ) -> None:
+        if status not in {"failed", "stopped"} or session.current_external_id is None:
+            return
+        if any(
+            entry.external_id == session.current_external_id and entry.status == status
+            for entry in session.history
+        ):
+            return
+        session.history.append(
+            AutoHistoryEntry(
+                external_id=session.current_external_id,
+                name=session.current_task_name or session.current_external_id,
+                project_id=session.current_project_id or "",
+                answer="",
+                status=status,
+                message=session.last_error,
+                reason_code=reason_code or "platform_submission_failed",
+                finished_at=_timestamp(),
+            )
+        )
+
+    @staticmethod
+    def _reason_code_for_error(
+        message: str,
+        *,
+        default: str = "platform_submission_failed",
+    ) -> str:
+        for reason_code in TASK_REASON_CODES:
+            if reason_code in message:
+                return reason_code
+        return default
+
+    @staticmethod
     def _transition(session: AutoSession, status: str, reason_code: str | None = None) -> None:
         allowed = TASK_TRANSITIONS.get(session.current_task_status, set())
         if status not in allowed:
             raise AutoManagerError(f"invalid automatic task transition: {session.current_task_status} -> {status}")
+        if reason_code is not None and reason_code not in TASK_REASON_CODES:
+            raise AutoManagerError(f"unknown automatic task reason code: {reason_code}")
         session.current_task_status = status
         session.current_reason_code = reason_code
         session.status = status
@@ -792,10 +928,10 @@ class AutoManager:
                 if status == "achieved":
                     return
                 if status in {"degraded", "stopped"}:
-                    raise AutoManagerError(f"solver project ended with {status}")
+                    raise AutoManagerError(f"solver_degraded: solver project ended with {status}")
                 if asyncio.get_running_loop().time() >= deadline:
                     await self.service.stop_project(project.id)
-                    raise AutoManagerError("solver project timed out")
+                    raise AutoManagerError("solver_timeout: solver project timed out")
                 await self._sleep_or_cancel(
                     session.config.poll_interval_seconds, cancel_event
                 )

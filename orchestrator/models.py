@@ -1,6 +1,11 @@
 from dataclasses import dataclass
 
 
+MAX_RESULT_FACT_CONTENT_LENGTH = 1_000_000
+MAX_SUPPORTING_FACTS = 20
+MAX_SUPPORTING_FACT_CONTENT_LENGTH = 20_000
+
+
 NODE_TYPES = frozenset({"goal", "origin", "fact", "hint"})
 AGENT_NODE_TYPES = frozenset({"fact"})
 RELATION_EDGE_TYPES = frozenset(
@@ -146,6 +151,14 @@ class GoalResultFact:
     produced_by_intent_id: str | None = None
     produced_by_execution_id: str | None = None
 
+    def __post_init__(self) -> None:
+        if not isinstance(self.id, str) or not self.id.strip():
+            raise ValueError("Goal result Fact id must be non-empty")
+        if not isinstance(self.content, str) or not self.content.strip():
+            raise ValueError("Goal result Fact content must be non-empty")
+        if len(self.content) > MAX_RESULT_FACT_CONTENT_LENGTH:
+            raise ValueError("Goal result Fact content exceeds the domain limit")
+
 
 @dataclass(frozen=True, slots=True)
 class GoalResult:
@@ -157,3 +170,21 @@ class GoalResult:
     supporting_facts: tuple[GoalResultFact, ...] = ()
     supporting_providers: tuple[str, ...] = ()
     completion_threshold: int = 1
+
+    def __post_init__(self) -> None:
+        if not self.project_id.strip() or not self.goal_node_id.strip():
+            raise ValueError("GoalResult project_id and goal_node_id must be non-empty")
+        if self.goal_version < 1:
+            raise ValueError("GoalResult goal_version must be positive")
+        expected_ref = f"{self.project_id}:{self.goal_version}:{self.fact.id}"
+        if self.result_ref != expected_ref:
+            raise ValueError("GoalResult result_ref does not match project, version, and Fact")
+        if len(self.supporting_facts) > MAX_SUPPORTING_FACTS:
+            raise ValueError("too many supporting Facts")
+        supporting_ids = [fact.id for fact in self.supporting_facts]
+        if len(set(supporting_ids)) != len(supporting_ids) or self.fact.id in supporting_ids:
+            raise ValueError("supporting Facts must be distinct from the result Fact")
+        if any(len(fact.content) > MAX_SUPPORTING_FACT_CONTENT_LENGTH for fact in self.supporting_facts):
+            raise ValueError("supporting Fact content exceeds the domain limit")
+        if self.completion_threshold < 1:
+            raise ValueError("completion_threshold must be positive")

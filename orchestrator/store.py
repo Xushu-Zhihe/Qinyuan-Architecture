@@ -13,6 +13,7 @@ from orchestrator.migrations import apply_migrations, stamp_new_schema
 from orchestrator.models import (
     GoalResult,
     GoalResultFact,
+    MAX_SUPPORTING_FACT_CONTENT_LENGTH,
     IntentProposal,
     RELATION_EDGE_TYPES,
 )
@@ -1604,6 +1605,8 @@ class BlackboardStore:
             if update.goal_achieved:
                 if getattr(update, "protocol_version", 1) == 2:
                     result_ref = getattr(update, "goal_result_ref", None)
+                    if not isinstance(result_ref, str) or not result_ref.strip():
+                        raise ValueError("goal completion requires one goal_result_ref")
                     result_node_id = refs.get(result_ref or "", result_ref or "")
                     result = self.connection.execute(
                         "SELECT type FROM nodes WHERE id = ? AND project_id = ?",
@@ -1638,6 +1641,12 @@ class BlackboardStore:
                             (self.project_id,),
                         ).fetchone()[0]
                     )
+                    existing_claim = self.connection.execute(
+                        "SELECT 1 FROM goal_completion_claims WHERE execution_id = ? LIMIT 1",
+                        (execution_id,),
+                    ).fetchone()
+                    if existing_claim is not None:
+                        raise ValueError("an execution may declare only one Goal result")
                     self.connection.execute(
                         """
                         INSERT INTO goal_completion_claims(
@@ -2043,7 +2052,8 @@ class BlackboardStore:
         ).fetchall()
         supporting_by_id = {
             str(row["id"]): GoalResultFact(
-                id=str(row["id"]), content=str(row["content"])
+                id=str(row["id"]),
+                content=str(row["content"])[:MAX_SUPPORTING_FACT_CONTENT_LENGTH],
             )
             for row in supporting_rows
             if str(row["id"]) != fact_id
@@ -2057,7 +2067,10 @@ class BlackboardStore:
             ).fetchall():
                 supporting_by_id.setdefault(
                     str(row["id"]),
-                    GoalResultFact(id=str(row["id"]), content=str(row["content"])),
+                    GoalResultFact(
+                        id=str(row["id"]),
+                        content=str(row["content"])[:MAX_SUPPORTING_FACT_CONTENT_LENGTH],
+                    ),
                 )
         with self.connection:
             self.connection.execute(

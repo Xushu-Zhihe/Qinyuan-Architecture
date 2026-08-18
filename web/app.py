@@ -73,6 +73,7 @@ def _controller_config(payload: ControllerPayload) -> ControllerConfig:
         max_output_tokens=advanced.max_output_tokens,
         reasoning_effort=advanced.reasoning_effort,
         extra_headers=tuple(advanced.extra_headers.items()),
+        extra_body=dict(advanced.extra_body),
     )
 
 

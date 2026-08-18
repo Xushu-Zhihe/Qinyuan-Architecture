@@ -18,6 +18,7 @@ class BlackboardResultSkillTests(unittest.TestCase):
         self,
         payload: object,
         existing_node_ids: tuple[str, ...] = ("goal-1",),
+        goal_node_id: str | None = None,
     ) -> subprocess.CompletedProcess[str]:
         with tempfile.TemporaryDirectory() as directory:
             payload_path = Path(directory) / "result.json"
@@ -31,6 +32,8 @@ class BlackboardResultSkillTests(unittest.TestCase):
                 "--intent-id",
                 "intent-1",
             ]
+            if goal_node_id is not None:
+                command.extend(("--goal-node-id", goal_node_id))
             for node_id in existing_node_ids:
                 command.extend(("--existing-node-id", node_id))
             command.extend(("--file", str(payload_path)))
@@ -125,6 +128,21 @@ class BlackboardResultSkillTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 1)
         self.assertIn("unknown node reference", result.stderr)
+
+    def test_v2_requires_explicit_goal_context(self) -> None:
+        payload = {
+            "protocol_version": 2,
+            "intent_id": "intent-1",
+            "facts": [{"ref": "result", "content": "complete"}],
+            "edges": [{"type": "addresses", "from": "result", "to": "goal-1"}],
+            "goal_achieved": True,
+            "goal_result_ref": "result",
+        }
+        missing_goal = self.run_validator(payload)
+        self.assertEqual(missing_goal.returncode, 1)
+        self.assertIn("--goal-node-id is required", missing_goal.stderr)
+        valid = self.run_validator(payload, goal_node_id="goal-1")
+        self.assertEqual(valid.returncode, 0, valid.stderr)
 
 
 if __name__ == "__main__":

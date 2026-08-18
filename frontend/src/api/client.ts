@@ -118,6 +118,11 @@ export const api = {
       method: 'POST',
       body: JSON.stringify(payload),
     }),
+  validateAutopilotPrompt: (controller: ControllerInput, prompt: string) =>
+    request<ValidationResult>('/api/autopilot/validate-prompt', {
+      method: 'POST',
+      body: JSON.stringify({ controller, prompt }),
+    }),
   testAutopilotPlatformHealth: (platform: StructuredPlatformInput) =>
     request<ValidationResult>('/api/autopilot/test-platform-health', {
       method: 'POST',

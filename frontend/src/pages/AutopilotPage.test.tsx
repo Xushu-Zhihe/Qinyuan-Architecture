@@ -13,6 +13,7 @@ vi.mock('../api/client', () => ({
     stopAutopilot: vi.fn(),
     testAutopilotController: vi.fn(),
     validateAutopilotPlatform: vi.fn(),
+    validateAutopilotPrompt: vi.fn(),
   },
 }))
 

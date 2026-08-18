@@ -66,6 +66,13 @@ class ControllerPayload(BaseModel):
         return self
 
 
+class PromptCompletenessPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    controller: ControllerPayload
+    prompt: str = Field(min_length=1, max_length=200000)
+
+
 class AuthPayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

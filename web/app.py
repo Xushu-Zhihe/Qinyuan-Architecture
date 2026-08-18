@@ -48,6 +48,7 @@ from web.schemas import (
     ProjectCreate,
     AutoStart as AutoStartConfigPayload,
     ControllerPayload,
+    PromptCompletenessPayload,
     LegacyAutoStart,
     PromptAutoStart,
     PlatformValidation,
@@ -356,6 +357,22 @@ def create_app(
                     "field": "controller",
                     "message": str(exc),
                 },
+            ) from exc
+        finally:
+            secret.clear()
+            await controller.close()
+
+    @app.post("/api/autopilot/validate-prompt")
+    async def validate_autopilot_prompt(payload: PromptCompletenessPayload):
+        secret = RuntimeControllerSecret(payload.controller.api_key.get_secret_value())
+        controller = DirectLLMController(_controller_config(payload.controller), secret)
+        try:
+            result = await controller.validate_prompt(payload.prompt)
+            return {"ok": True, "category": "platform_prompt", **result}
+        except DirectControllerError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail={"ok": False, "status": "invalid", "category": "platform_prompt", "message": str(exc)},
             ) from exc
         finally:
             secret.clear()

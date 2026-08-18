@@ -405,4 +405,5 @@ export interface ValidationResult {
   category: string
   model?: string
   warnings?: string[]
+  missing?: string[]
 }

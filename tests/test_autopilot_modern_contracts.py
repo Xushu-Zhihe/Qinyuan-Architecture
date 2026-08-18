@@ -22,7 +22,7 @@ def _endpoint(method: str, path: str, **kwargs) -> EndpointConfig:
 
 
 def _platform_config(**kwargs) -> StructuredPlatformConfig:
-    return StructuredPlatformConfig(
+    values = dict(
         base_url="https://platform.example/api",
         auth=AuthConfig(),
         fetch_task=_endpoint("GET", "/tasks", timeout_seconds=2),
@@ -35,12 +35,22 @@ def _platform_config(**kwargs) -> StructuredPlatformConfig:
             submit_accepted=OutcomeCondition(path="accepted", equals=True),
             submit_rejected=OutcomeCondition(path="accepted", equals=False),
             skip_succeeded=OutcomeCondition(path="skipped", equals=True),
-        ),
-        **kwargs,
+            ),
     )
+    values.update(kwargs)
+    return StructuredPlatformConfig(**values)
 
 
 class ModernContractTests(unittest.IsolatedAsyncioTestCase):
+    def test_structured_config_rejects_absolute_paths_and_duplicate_auth(self) -> None:
+        with self.assertRaises(ValueError):
+            _endpoint("GET", "https://other.example/tasks")
+        with self.assertRaises(ValueError):
+            _platform_config(
+                auth=AuthConfig(type="bearer"),
+                fetch_task=_endpoint("GET", "/tasks", headers={"Authorization": "Bearer fixed"}),
+            )
+
     async def test_structured_fetch_array_cursor_submit_skip_and_health(self) -> None:
         calls: list[tuple[str, str, object]] = []
 
@@ -121,6 +131,44 @@ class ModernContractTests(unittest.IsolatedAsyncioTestCase):
             result = await adapter.fetch_task()
             self.assertEqual(result.status, "skip_required")
             self.assertEqual(result.task.external_id, "one")
+        finally:
+            await adapter.close()
+            await client.aclose()
+
+    async def test_structured_duplicate_task_id_and_attachment_shape_fail_visibly(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={"items": [{"id": "one", "name": "One", "goal": "Goal", "origin": "Origin"}], "next": None},
+                request=request,
+            )
+
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        adapter = StructuredPlatformAdapter(_platform_config(), client=client)
+        try:
+            first = await adapter.fetch_task()
+            second = await adapter.fetch_task()
+            self.assertEqual(first.status, "task")
+            self.assertEqual(second.status, "fatal_error")
+            attachment_config = _platform_config(
+                mapping=FieldMapping(task_list_path="items", attachments_path="attachments")
+            )
+            attachment_client = httpx.AsyncClient(
+                transport=httpx.MockTransport(
+                    lambda request: httpx.Response(
+                        200,
+                        json={"items": [{"id": "one", "name": "One", "goal": "Goal", "origin": "Origin", "attachments": [3]}], "next": None},
+                        request=request,
+                    )
+                )
+            )
+            attachment_adapter = StructuredPlatformAdapter(attachment_config, client=attachment_client)
+            try:
+                result = await attachment_adapter.fetch_task()
+                self.assertEqual(result.status, "fatal_error")
+            finally:
+                await attachment_adapter.close()
+                await attachment_client.aclose()
         finally:
             await adapter.close()
             await client.aclose()

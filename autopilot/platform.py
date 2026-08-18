@@ -118,11 +118,13 @@ class StructuredPlatformAdapter:
         self._pending_items: list[object] = []
         self._cursor = config.initial_cursor
         self._terminal_tasks: dict[str, str] = {}
+        self._seen_task_ids: set[str] = set()
 
     async def close(self) -> None:
         if self._owns_client:
             await self.client.aclose()
         self._pending_items.clear()
+        self._seen_task_ids.clear()
 
     def _headers_and_query(self, endpoint: EndpointConfig, context: Mapping[str, object]) -> tuple[dict[str, str], dict[str, object]]:
         headers = dict(
@@ -231,6 +233,13 @@ class StructuredPlatformAdapter:
             if self.config.task_info is None:
                 return PlatformResult("fatal_error", message=f"task mapping failed: {exc}")
             task = None
+        if task is not None:
+            if task.external_id in self._seen_task_ids:
+                return PlatformResult(
+                    "fatal_error",
+                    message=f"duplicate task external_id: {task.external_id}",
+                )
+            self._seen_task_ids.add(task.external_id)
         if self.config.task_info is None:
             return PlatformResult("task", task=task, metadata={"cursor": self._cursor})
         if task is not None and self.config.task_info_mode == "when_incomplete":
@@ -376,6 +385,19 @@ class StructuredPlatformAdapter:
                 attachments = []
             if not isinstance(attachments, list):
                 raise TypeError("attachments must be an array")
+            for attachment in attachments:
+                if isinstance(attachment, str):
+                    if not attachment.strip():
+                        raise ValueError("attachment path must be non-empty")
+                elif isinstance(attachment, Mapping):
+                    url = attachment.get("url")
+                    name = attachment.get("name")
+                    if not isinstance(url, str) or not url.strip():
+                        raise TypeError("attachment object url must be a non-empty string")
+                    if name is not None and (not isinstance(name, str) or not name.strip()):
+                        raise TypeError("attachment object name must be a non-empty string")
+                else:
+                    raise TypeError("attachments must contain strings or {url, name} objects")
             metadata["_attachments"] = attachments
         return AutoTask(
             external_id=text(

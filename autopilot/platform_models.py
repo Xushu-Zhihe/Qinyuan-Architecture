@@ -86,7 +86,8 @@ class EndpointConfig:
             raise ValueError(f"unsupported HTTP method: {self.method}")
         if not self.path.strip():
             raise ValueError("endpoint path must be non-empty")
-        if "://" in self.path:
+        parsed_path = urlsplit(self.path.strip())
+        if parsed_path.scheme or parsed_path.netloc or self.path.strip().startswith("//"):
             raise ValueError("endpoint path must be relative to platform base_url")
         if self.timeout_seconds <= 0 or self.timeout_seconds > 300:
             raise ValueError("endpoint timeout_seconds must be between 0 and 300")
@@ -165,10 +166,20 @@ class StructuredPlatformConfig:
         }:
             raise ValueError("invalid task_info_failure_action")
         auth_header = self.auth.header_name.casefold()
-        if self.auth.type in {"bearer", "header"} and any(
-            key.casefold() == auth_header for key in self.default_headers
+        endpoints = (self.fetch_task, self.submit_result, self.task_info, self.skip_task, self.health_check)
+        if self.auth.type in {"bearer", "header"}:
+            if any(key.casefold() == auth_header for key in self.default_headers):
+                raise ValueError("authorization header must not be configured twice")
+            if any(
+                endpoint is not None and any(key.casefold() == auth_header for key in endpoint.headers)
+                for endpoint in endpoints
+            ):
+                raise ValueError("endpoint authorization header must not be configured twice")
+        if self.auth.type == "query" and any(
+            endpoint is not None and self.auth.parameter_name in endpoint.query
+            for endpoint in endpoints
         ):
-            raise ValueError("authorization header must not be configured twice")
+            raise ValueError("endpoint auth query parameter must not be configured twice")
         object.__setattr__(self, "base_url", base)
 
 

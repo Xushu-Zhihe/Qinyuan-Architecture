@@ -251,6 +251,28 @@ export interface AutoHistoryEntry {
   result_fact_id?: string | null
   reason_code?: string | null
   attempt_count?: number
+  accepted_at?: string | null
+  finished_at?: string | null
+  attempts?: Array<Record<string, unknown>>
+}
+
+export interface ControllerSummary {
+  configured: boolean
+  base_url: string
+  model: string
+}
+
+export interface PlatformTaskSnapshot {
+  external_id: string | null
+  name: string | null
+  status: string | null
+  project_id: string | null
+}
+
+export interface GoalResultSnapshot {
+  result_ref: string | null
+  fact_id: string | null
+  preview: string | null
 }
 
 export interface ProviderCapability {
@@ -271,7 +293,7 @@ export interface AutoSession {
   status: string
   mode?: 'prompt' | 'structured'
   controller_provider?: string | null
-  controller?: { base_url: string; model: string } | null
+  controller?: ControllerSummary | null
   solver_providers: string[]
   available_providers: string[]
   agent_limit: number
@@ -285,11 +307,7 @@ export interface AutoSession {
   last_error: string | null
   current_task_status?: string | null
   reason_code?: string | null
-  current_goal_result?: {
-    result_ref: string | null
-    fact_id: string | null
-    preview: string | null
-  } | null
+  current_goal_result?: GoalResultSnapshot | null
   current_attempt?: {
     phase: string | null
     retry_count: number
@@ -303,6 +321,7 @@ export interface AutopilotSnapshot {
   session: AutoSession | null
   providers: string[]
   provider_capabilities?: Record<string, ProviderCapability>
+  controller_health?: { status: string; last_error: string | null; checked_at: string | null; model: string | null }
 }
 
 export interface ControllerAdvancedInput {

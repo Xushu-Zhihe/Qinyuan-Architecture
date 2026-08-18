@@ -29,7 +29,7 @@ describe('AutopilotPage', () => {
         status: 'running',
         mode: 'prompt',
         controller_provider: null,
-        controller: { base_url: 'https://controller.example/v1', model: 'controller-model' },
+        controller: { configured: true, base_url: 'https://controller.example/v1', model: 'controller-model' },
         solver_providers: ['fake'],
         available_providers: ['fake'],
         agent_limit: 1,

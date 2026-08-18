@@ -187,7 +187,7 @@ Vite 默认地址为 `http://127.0.0.1:5173`，并将 `/api` 和 `/ws` 代理到
 自动模式有两种接入方式：
 
 - Prompt：输入平台说明 prompt，由独立的 Direct LLM Controller 使用当前阶段允许的 HTTP 工具取题、提交和放弃。
-- 结构化 API：填写平台 URL/token、fetch/info/submit/skip/health endpoint、字段映射、游标、结果判断、超时与重试；取题和响应判定由 `StructuredPlatformAdapter` 确定性执行。
+- 结构化 API：填写平台 URL/token、current/fetch/info/submit/skip/health endpoint、字段映射、游标、结果判断、超时与重试；取题和响应判定由 `StructuredPlatformAdapter` 确定性执行。可选的 current endpoint 由“查看当前题目”按钮只读调用，不领取下一题、不创建 solver 项目，也不修改平台 lease。
 
 两种模式都单独填写 controller LLM 的 API key、base URL、model 和高级选项；controller 不占用 solver provider。solver provider 仍由现有 `ProjectService`/`Supervisor` 创建独立黑板项目。solver 完成后必须产生协议 v2 的 Goal Result Fact，controller 根据完整 Fact 和有限支持 Fact 生成 `SubmissionPlan`，支持 text、JSON 和 form 结果；平台明确返回 `accepted` 后才进入下一题。业务 `rejected` 只会按 `replan`、`skip` 或 `fail` 处理，429/5xx/网络错误只重试同一个 plan。
 
@@ -195,7 +195,7 @@ Vite 默认地址为 `http://127.0.0.1:5173`，并将 `/api` 和 `/ws` 代理到
 
 controller key、平台 token 和完整 prompt 只存在于当前 React state/运行时 session；启动后输入立即清空，snapshot/history/SQLite 不包含凭据。服务重启不会恢复自动 session 或平台 lease。首版不支持 controller streaming、并行题目或结果 artifact/文件上传。
 
-对应接口为 `GET /api/autopilot`、`POST /api/autopilot/start`、`POST /api/autopilot/stop`、`POST /api/autopilot/test-controller`、`POST /api/autopilot/validate-platform` 和结构化模式的 `POST /api/autopilot/test-platform-health`。health 测试只调用用户显式配置的 health endpoint，不会取题或消耗 lease。
+对应接口为 `GET /api/autopilot`、`POST /api/autopilot/start`、`POST /api/autopilot/stop`、`POST /api/autopilot/test-controller`、`POST /api/autopilot/validate-platform`，以及结构化模式的 `POST /api/autopilot/current-task` 和 `POST /api/autopilot/test-platform-health`。current/health 查询只调用用户显式配置的对应 endpoint，不会取题或消耗 lease。
 
 ### 删除项目
 

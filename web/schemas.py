@@ -169,6 +169,7 @@ class StructuredPlatformPayload(BaseModel):
     auth: AuthPayload = Field(default_factory=AuthPayload)
     default_headers: dict[str, str] = Field(default_factory=dict)
     fetch_task: EndpointPayload
+    current_task: EndpointPayload | None = None
     task_info: EndpointPayload | None = None
     submit_result: EndpointPayload
     skip_task: EndpointPayload | None = None

@@ -1,4 +1,5 @@
 import type { EndpointInput, StructuredPlatformInput } from '../types'
+import { JsonTextarea } from './JsonTextarea'
 
 function EndpointFields({
   title,
@@ -15,22 +16,6 @@ function EndpointFields({
 }) {
   const enabled = value !== null
   const endpoint = value ?? { method: 'GET', path: '', query: {}, headers: {}, body: null, form: null, timeout_seconds: 30, max_retries: 0, retry_status_codes: [429, 500, 502, 503, 504] }
-  const updateJson = (field: 'query' | 'headers' | 'body' | 'form', raw: string) => {
-    if (!raw.trim()) {
-      onChange({ ...endpoint, [field]: field === 'form' ? null : field === 'body' ? null : {} } as EndpointInput)
-      return
-    }
-    try {
-      const parsed = JSON.parse(raw)
-      if (field === 'query' || field === 'headers' || field === 'form') {
-        if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return
-      }
-      onChange({ ...endpoint, [field]: parsed } as EndpointInput)
-    } catch {
-      // Keep the last valid value until the JSON is complete.
-    }
-  }
-  const jsonText = (field: 'query' | 'headers' | 'body' | 'form') => JSON.stringify(endpoint[field] ?? {}, null, 2)
   return (
     <fieldset className="endpoint-fields">
       <legend>{title}</legend>
@@ -43,10 +28,10 @@ function EndpointFields({
         <label className="auto-field"><span>超时（秒）</span><input type="number" min={1} max={300} value={endpoint.timeout_seconds} onChange={event => onChange({ ...endpoint, timeout_seconds: Number(event.target.value) })} disabled={disabled} /></label>
         <label className="auto-field"><span>传输重试次数</span><input type="number" min={0} max={10} value={endpoint.max_retries} onChange={event => onChange({ ...endpoint, max_retries: Number(event.target.value) })} disabled={disabled} /></label>
         <label className="auto-field auto-field--wide"><span>重试状态码（逗号分隔）</span><input value={endpoint.retry_status_codes.join(',')} onChange={event => onChange({ ...endpoint, retry_status_codes: event.target.value.split(',').map(item => Number(item.trim())).filter(Number.isFinite) })} disabled={disabled} /></label>
-        <label className="auto-field"><span>查询参数 JSON</span><textarea value={jsonText('query')} onChange={event => updateJson('query', event.target.value)} disabled={disabled} rows={3} /></label>
-        <label className="auto-field"><span>请求头 JSON</span><textarea value={jsonText('headers')} onChange={event => updateJson('headers', event.target.value)} disabled={disabled} rows={3} /></label>
-        <label className="auto-field"><span>请求体 JSON</span><textarea value={jsonText('body')} onChange={event => updateJson('body', event.target.value)} disabled={disabled} rows={3} /></label>
-        <label className="auto-field"><span>Form JSON</span><textarea value={jsonText('form')} onChange={event => updateJson('form', event.target.value)} disabled={disabled} rows={3} /></label>
+        <JsonTextarea label="查询参数 JSON" value={endpoint.query} emptyValue={{}} objectOnly disabled={disabled} onChange={query => onChange({ ...endpoint, query })} />
+        <JsonTextarea label="请求头 JSON" value={endpoint.headers} emptyValue={{}} objectOnly disabled={disabled} onChange={headers => onChange({ ...endpoint, headers })} />
+        <JsonTextarea label="请求体 JSON" value={endpoint.body} emptyValue={null} disabled={disabled} onChange={body => onChange({ ...endpoint, body })} />
+        <JsonTextarea label="Form JSON" value={endpoint.form} emptyValue={null} objectOnly disabled={disabled} onChange={form => onChange({ ...endpoint, form })} />
       </div>}
     </fieldset>
   )
@@ -63,9 +48,10 @@ export function StructuredPlatformForm({ value, disabled, onChange }: { value: S
         <label className="auto-field"><span>认证 header name</span><input value={value.auth.header_name} onChange={event => update({ auth: { ...value.auth, header_name: event.target.value } })} disabled={disabled} /></label>
         <label className="auto-field"><span>认证 prefix</span><input value={value.auth.prefix} onChange={event => update({ auth: { ...value.auth, prefix: event.target.value } })} disabled={disabled} /></label>
         <label className="auto-field"><span>认证参数名</span><input value={value.auth.parameter_name} onChange={event => update({ auth: { ...value.auth, parameter_name: event.target.value } })} disabled={disabled} /></label>
-        <label className="auto-field auto-field--full"><span>默认 headers JSON</span><textarea rows={3} value={JSON.stringify(value.default_headers, null, 2)} onChange={event => { try { const parsed = JSON.parse(event.target.value); if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) update({ default_headers: parsed }) } catch { /* keep last valid object */ } }} disabled={disabled} /></label>
+        <JsonTextarea label="默认 headers JSON" value={value.default_headers} emptyValue={{}} objectOnly className="auto-field--full" disabled={disabled} onChange={default_headers => update({ default_headers })} />
       </div>
       <div className="endpoint-grid">
+        <EndpointFields title="查看当前题目" value={value.current_task} optional disabled={disabled} onChange={current_task => update({ current_task })} />
         <EndpointFields title="获取题目" value={value.fetch_task} disabled={disabled} onChange={endpoint => endpoint && update({ fetch_task: endpoint })} />
         <EndpointFields title="题目信息" value={value.task_info} optional disabled={disabled} onChange={task_info => update({ task_info })} />
         <EndpointFields title="提交结果" value={value.submit_result} disabled={disabled} onChange={endpoint => endpoint && update({ submit_result: endpoint })} />

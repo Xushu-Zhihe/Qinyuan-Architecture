@@ -70,6 +70,22 @@ class ModernContractTests(unittest.IsolatedAsyncioTestCase):
                     },
                     request=request,
                 )
+            if request.url.path.endswith("/current"):
+                return httpx.Response(
+                    200,
+                    json={
+                        "items": [
+                            {
+                                "id": "current",
+                                "name": "Current",
+                                "goal": "Current goal",
+                                "origin": "Current origin",
+                                "hints": [],
+                            }
+                        ]
+                    },
+                    request=request,
+                )
             if request.url.path.endswith("/submit"):
                 return httpx.Response(200, json={"accepted": True}, request=request)
             if request.url.path.endswith("/skip"):
@@ -79,13 +95,17 @@ class ModernContractTests(unittest.IsolatedAsyncioTestCase):
             return httpx.Response(404, request=request)
 
         config = _platform_config(
+            current_task=_endpoint("GET", "/current"),
             health_check=_endpoint("GET", "/health"),
         )
         client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
         adapter = StructuredPlatformAdapter(config, secret=RuntimePlatformSecret(token="platform-token"), client=client)
         try:
+            current = await adapter.inspect_current_task()
             first = await adapter.fetch_task()
             second = await adapter.fetch_task()
+            self.assertEqual(current.status, "task")
+            self.assertEqual(current.task.external_id, "current")
             self.assertEqual(first.status, "task")
             self.assertEqual(second.status, "task")
             self.assertEqual(first.task.external_id, "one")
@@ -107,6 +127,7 @@ class ModernContractTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(skipped.status, "skipped")
             health = await adapter.health_check()
             self.assertEqual(health.status, "healthy")
+            self.assertTrue(any(path.endswith("/current") for _, path, _ in calls))
             self.assertTrue(any(path.endswith("/health") for _, path, _ in calls))
         finally:
             await adapter.close()

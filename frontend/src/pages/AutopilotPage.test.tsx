@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from '@testing-library/react'
+import { render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
@@ -14,6 +14,8 @@ vi.mock('../api/client', () => ({
     testAutopilotController: vi.fn(),
     validateAutopilotPlatform: vi.fn(),
     validateAutopilotPrompt: vi.fn(),
+    testAutopilotPlatformHealth: vi.fn(),
+    getAutopilotCurrentTask: vi.fn(),
   },
 }))
 
@@ -21,6 +23,7 @@ const empty: AutopilotSnapshot = { session: null, providers: ['fake'] }
 
 describe('AutopilotPage', () => {
   beforeEach(() => {
+    vi.clearAllMocks()
     vi.mocked(api.getAutopilot).mockResolvedValue(empty)
     vi.mocked(api.startAutopilot).mockResolvedValue({
       ...empty,
@@ -41,6 +44,19 @@ describe('AutopilotPage', () => {
         last_message: null,
         last_error: null,
         history: [],
+      },
+    })
+    vi.mocked(api.getAutopilotCurrentTask).mockResolvedValue({
+      ok: true,
+      status: 'valid',
+      category: 'platform_current_task',
+      task: {
+        external_id: 'attempt-1',
+        name: 'Current challenge',
+        goal: 'Recover the flag',
+        origin: 'Challenge statement',
+        hints: ['Inspect the response'],
+        lease_id: 'lease-1',
       },
     })
   })
@@ -89,5 +105,27 @@ describe('AutopilotPage', () => {
       expect(screen.getByLabelText('API key')).toHaveValue('')
       expect(screen.getByRole('textbox', { name: '平台说明 prompt' })).toHaveValue('')
     })
+  })
+
+  it('queries and displays the configured current task without starting a session', async () => {
+    render(<AutopilotPage onBack={() => {}} onOpenProject={() => {}} />)
+
+    await screen.findByText('连接配置')
+    await userEvent.click(screen.getByRole('button', { name: '结构化 API' }))
+    await userEvent.type(screen.getByLabelText('平台 Base URL'), 'https://platform.example/api')
+    const currentEndpoint = screen.getByRole('group', { name: '查看当前题目' })
+    await userEvent.click(within(currentEndpoint).getByRole('checkbox', { name: '启用' }))
+    await userEvent.type(within(currentEndpoint).getByLabelText('路径'), '/current')
+    await userEvent.click(screen.getByRole('button', { name: '查看当前题目' }))
+
+    expect(api.getAutopilotCurrentTask).toHaveBeenCalledWith(
+      expect.objectContaining({
+        base_url: 'https://platform.example/api',
+        current_task: expect.objectContaining({ method: 'GET', path: '/current' }),
+      }),
+    )
+    expect(await screen.findByText('Current challenge')).toBeInTheDocument()
+    expect(screen.getByText('attempt-1')).toBeInTheDocument()
+    expect(api.startAutopilot).not.toHaveBeenCalled()
   })
 })

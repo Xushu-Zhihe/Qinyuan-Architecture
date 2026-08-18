@@ -7,6 +7,7 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 
 from web.app import create_app
+from autopilot.models import AutoTask
 from autopilot.platform_models import PlatformResult
 from worker.models import ProviderCapabilities, ProviderConfig, WorkerResult
 
@@ -208,6 +209,59 @@ class AutopilotWebTests(unittest.TestCase):
                 self.assertEqual(healthy.status_code, 200, healthy.text)
                 self.assertEqual(calls, ["/health"])
                 self.assertNotIn("platform-secret", healthy.text)
+
+    def test_current_task_requires_endpoint_and_returns_mapped_task(self) -> None:
+        calls: list[str] = []
+
+        class FakeCurrentTaskAdapter:
+            def __init__(self, config, **_kwargs):
+                calls.append(config.current_task.path if config.current_task else "")
+
+            async def inspect_current_task(self):
+                return PlatformResult(
+                    "task",
+                    task=AutoTask(
+                        external_id="attempt-1",
+                        name="Current challenge",
+                        goal="Recover the flag",
+                        origin="Challenge statement",
+                        hints=("Inspect the response",),
+                        lease_id="lease-1",
+                    ),
+                )
+
+            async def close(self):
+                return None
+
+        base_platform = {
+            "base_url": "https://platform.example/api",
+            "auth": {"token": "platform-secret"},
+            "fetch_task": {"method": "POST", "path": "/next"},
+            "submit_result": {"method": "POST", "path": "/submit"},
+        }
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "web.app.StructuredPlatformAdapter", FakeCurrentTaskAdapter
+        ):
+            with TestClient(create_app(Path(directory))) as client:
+                missing = client.post(
+                    "/api/autopilot/current-task",
+                    json={"mode": "structured", "platform": base_platform},
+                )
+                self.assertEqual(missing.status_code, 400)
+                current = client.post(
+                    "/api/autopilot/current-task",
+                    json={
+                        "mode": "structured",
+                        "platform": {
+                            **base_platform,
+                            "current_task": {"method": "GET", "path": "/current"},
+                        },
+                    },
+                )
+                self.assertEqual(current.status_code, 200, current.text)
+                self.assertEqual(current.json()["task"]["external_id"], "attempt-1")
+                self.assertEqual(calls, ["/current"])
+                self.assertNotIn("platform-secret", current.text)
 
 
 if __name__ == "__main__":

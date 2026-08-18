@@ -256,6 +256,62 @@ class StructuredPlatformAdapter:
         except (KeyError, IndexError, TypeError, ValueError) as exc:
             return PlatformResult("fatal_error", message=f"task mapping failed: {exc}")
 
+    async def inspect_current_task(self) -> PlatformResult:
+        if self.config.current_task is None:
+            return PlatformResult(
+                "fatal_error", message="current task endpoint is not configured"
+            )
+        response, payload, error = await self._request(
+            self.config.current_task,
+            {"cursor": self._cursor or ""},
+        )
+        if error:
+            return error
+        assert response is not None
+        if response.status_code in RETRYABLE_STATUS_CODES:
+            return PlatformResult(
+                "retryable_error",
+                message=f"current task endpoint HTTP {response.status_code}",
+                retry_after_seconds=_retry_delay(response, 0),
+            )
+        outcomes = self.config.outcomes
+        finished = _condition_matches(
+            outcomes.fetch_finished, response.status_code, payload
+        )
+        empty = _condition_matches(
+            outcomes.fetch_empty, response.status_code, payload
+        )
+        if finished and empty:
+            return PlatformResult(
+                "fatal_error",
+                message="current task response matched conflicting outcomes",
+            )
+        if finished:
+            return PlatformResult("finished", message="platform queue finished")
+        if empty:
+            return PlatformResult("wait", message="no current task")
+        if response.is_error:
+            return PlatformResult(
+                "fatal_error",
+                message=f"current task endpoint HTTP {response.status_code}",
+            )
+        try:
+            item = _extract(payload, self.config.mapping.task_list_path)
+            if isinstance(item, list):
+                if not item:
+                    return PlatformResult("wait", message="no current task")
+                item = item[0]
+            task = self._map_task(item)
+        except (KeyError, IndexError, TypeError, ValueError) as exc:
+            return PlatformResult(
+                "fatal_error", message=f"current task mapping failed: {exc}"
+            )
+        return PlatformResult(
+            "task",
+            task=task,
+            metadata={"http_status": response.status_code},
+        )
+
     async def _task_result(self, item: object) -> PlatformResult:
         try:
             task = self._map_task(item)

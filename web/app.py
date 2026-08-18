@@ -18,6 +18,7 @@ from autopilot.manager import AutoManager, AutoManagerError
 from autopilot.direct_controller import DirectControllerError, DirectLLMController
 from autopilot.platform import StructuredPlatformAdapter
 from autopilot.models import (
+    AutoTask,
     AutoStartConfig,
     ControllerConfig,
     PromptPlatformConfig,
@@ -115,6 +116,11 @@ def _structured_config(payload: StructuredPlatformPayload) -> StructuredPlatform
         ),
         default_headers=payload.default_headers,
         fetch_task=_endpoint_config(payload.fetch_task),
+        current_task=(
+            _endpoint_config(payload.current_task)
+            if payload.current_task is not None
+            else None
+        ),
         task_info=(
             _endpoint_config(payload.task_info) if payload.task_info is not None else None
         ),
@@ -453,6 +459,56 @@ def create_app(
                 "category": "platform_health",
                 "latency": None,
             }
+        finally:
+            secret.clear()
+            await adapter.close()
+
+    @app.post("/api/autopilot/current-task")
+    async def get_autopilot_current_task(payload: StructuredPlatformValidation):
+        config = _structured_config(payload.platform)
+        if config.current_task is None:
+            raise HTTPException(
+                status_code=400, detail="current task endpoint is not configured"
+            )
+        secret = RuntimePlatformSecret(
+            token=payload.platform.auth.token.get_secret_value()
+        )
+        adapter = StructuredPlatformAdapter(config, secret=secret)
+        try:
+            result = await adapter.inspect_current_task()
+            if result.status == "task" and isinstance(result.task, AutoTask):
+                task = result.task
+                return {
+                    "ok": True,
+                    "status": "valid",
+                    "category": "platform_current_task",
+                    "message": result.message,
+                    "task": {
+                        "external_id": task.external_id,
+                        "name": task.name,
+                        "goal": task.goal,
+                        "origin": task.origin,
+                        "hints": list(task.hints),
+                        "lease_id": task.lease_id,
+                    },
+                }
+            if result.status in {"wait", "finished"}:
+                return {
+                    "ok": True,
+                    "status": "warning",
+                    "category": "platform_current_task",
+                    "message": result.message or "no current task",
+                    "task": None,
+                }
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "ok": False,
+                    "status": "invalid",
+                    "category": "platform_current_task",
+                    "message": result.message or result.status,
+                },
+            )
         finally:
             secret.clear()
             await adapter.close()

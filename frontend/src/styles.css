@@ -102,6 +102,15 @@ button { color: inherit; }
 .secret-input input { border-radius: 5px 0 0 5px; }
 .secret-input .icon-button { border: 1px solid #bfc6c0; border-left: 0; border-radius: 0 5px 5px 0; background: #fff; }
 .auto-field textarea { width: 100%; padding: 10px; resize: vertical; border: 1px solid #bfc6c0; border-radius: 5px; background: #fff; line-height: 1.5; }
+.auto-field textarea[aria-invalid="true"] { border-color: #a55248; outline-color: #a55248; }
+.json-field-error { color: #843b34; font-size: 11px; }
+.current-task-preview { margin-top: 14px; padding-top: 14px; border-top: 1px solid #d9ddd9; }
+.current-task-preview > div { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+.current-task-preview strong { font-size: 14px; }
+.current-task-preview small, .current-task-preview dt { color: #68706d; font-size: 10px; }
+.current-task-preview dl { display: grid; gap: 10px; margin: 12px 0 0; }
+.current-task-preview dl div { display: grid; gap: 3px; }
+.current-task-preview dd { margin: 0; overflow-wrap: anywhere; line-height: 1.45; }
 .auto-advanced { margin-top: 14px; }
 .auto-advanced summary { color: #59615d; font-size: 12px; font-weight: 700; cursor: pointer; }
 .validation-state { margin: 12px 0 0; padding: 8px 10px; border-left: 3px solid #6b8e7b; background: #edf2ee; color: #40594c; font-size: 12px; }

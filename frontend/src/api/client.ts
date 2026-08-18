@@ -11,6 +11,7 @@ import type {
   AutopilotSnapshot,
   AutopilotStartPayload,
   ControllerInput,
+  CurrentTaskResult,
   PlatformValidationPayload,
   StructuredPlatformInput,
   ValidationResult,
@@ -125,6 +126,11 @@ export const api = {
     }),
   testAutopilotPlatformHealth: (platform: StructuredPlatformInput) =>
     request<ValidationResult>('/api/autopilot/test-platform-health', {
+      method: 'POST',
+      body: JSON.stringify({ mode: 'structured', platform }),
+    }),
+  getAutopilotCurrentTask: (platform: StructuredPlatformInput) =>
+    request<CurrentTaskResult>('/api/autopilot/current-task', {
       method: 'POST',
       body: JSON.stringify({ mode: 'structured', platform }),
     }),

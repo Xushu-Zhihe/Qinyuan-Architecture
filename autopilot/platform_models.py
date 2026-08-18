@@ -143,6 +143,7 @@ class StructuredPlatformConfig:
     outcomes: OutcomeConfig = field(default_factory=OutcomeConfig)
     auth: AuthConfig = field(default_factory=AuthConfig)
     default_headers: Mapping[str, str] = field(default_factory=dict)
+    current_task: EndpointConfig | None = None
     task_info: EndpointConfig | None = None
     skip_task: EndpointConfig | None = None
     health_check: EndpointConfig | None = None
@@ -166,7 +167,14 @@ class StructuredPlatformConfig:
         }:
             raise ValueError("invalid task_info_failure_action")
         auth_header = self.auth.header_name.casefold()
-        endpoints = (self.fetch_task, self.submit_result, self.task_info, self.skip_task, self.health_check)
+        endpoints = (
+            self.fetch_task,
+            self.submit_result,
+            self.current_task,
+            self.task_info,
+            self.skip_task,
+            self.health_check,
+        )
         if self.auth.type in {"bearer", "header"}:
             if any(key.casefold() == auth_header for key in self.default_headers):
                 raise ValueError("authorization header must not be configured twice")

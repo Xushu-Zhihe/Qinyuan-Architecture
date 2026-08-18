@@ -371,6 +371,7 @@ export interface StructuredPlatformInput {
   }
   default_headers: Record<string, string>
   fetch_task: EndpointInput
+  current_task: EndpointInput | null
   task_info: EndpointInput | null
   submit_result: EndpointInput
   skip_task: EndpointInput | null
@@ -427,4 +428,16 @@ export interface ValidationResult {
   warnings?: string[]
   missing?: string[]
   mapping_preview?: { status: string; errors?: string[]; task?: Record<string, unknown>; configured_outcomes?: Record<string, boolean> }
+}
+
+export interface CurrentTaskResult extends ValidationResult {
+  message?: string | null
+  task: {
+    external_id: string
+    name: string
+    goal: string
+    origin: string
+    hints: string[]
+    lease_id: string | null
+  } | null
 }

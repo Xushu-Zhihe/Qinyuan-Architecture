@@ -2,6 +2,7 @@ import { Eye, EyeOff, PlugZap } from 'lucide-react'
 import { useState } from 'react'
 
 import type { ControllerInput, ValidationResult } from '../types'
+import { JsonTextarea } from './JsonTextarea'
 
 export function AutopilotControllerFields({
   value,
@@ -46,8 +47,8 @@ export function AutopilotControllerFields({
           <label className="auto-field"><span>Temperature</span><input type="number" min={0} max={2} step={0.1} value={advanced.temperature ?? ''} onChange={event => updateAdvanced({ temperature: event.target.value === '' ? null : Number(event.target.value) })} disabled={disabled} /></label>
           <label className="auto-field"><span>最大输出 tokens</span><input type="number" min={1} value={advanced.max_output_tokens ?? ''} onChange={event => updateAdvanced({ max_output_tokens: event.target.value === '' ? null : Number(event.target.value) })} disabled={disabled} /></label>
           <label className="auto-field"><span>Reasoning effort</span><input value={advanced.reasoning_effort ?? ''} onChange={event => updateAdvanced({ reasoning_effort: event.target.value || null })} disabled={disabled} /></label>
-          <label className="auto-field auto-field--full"><span>额外 headers JSON</span><textarea rows={3} value={JSON.stringify(advanced.extra_headers, null, 2)} onChange={event => { try { const parsed = JSON.parse(event.target.value); if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) updateAdvanced({ extra_headers: parsed }) } catch { /* keep last valid object */ } }} disabled={disabled} /></label>
-          <label className="auto-field auto-field--full"><span>额外 body JSON</span><textarea rows={3} value={JSON.stringify(advanced.extra_body, null, 2)} onChange={event => { try { const parsed = JSON.parse(event.target.value); if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) updateAdvanced({ extra_body: parsed }) } catch { /* keep last valid object */ } }} disabled={disabled} /></label>
+          <JsonTextarea label="额外 headers JSON" value={advanced.extra_headers} emptyValue={{}} objectOnly className="auto-field--full" disabled={disabled} onChange={extra_headers => updateAdvanced({ extra_headers })} />
+          <JsonTextarea label="额外 body JSON" value={advanced.extra_body} emptyValue={{}} objectOnly className="auto-field--full" disabled={disabled} onChange={extra_body => updateAdvanced({ extra_body })} />
         </div>
       </details>
     </section>

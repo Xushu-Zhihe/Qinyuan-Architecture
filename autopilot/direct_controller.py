@@ -10,7 +10,7 @@ from typing import Awaitable, Callable, Mapping
 import httpx
 
 from autopilot.controller_tools import PHASE_TOOLS
-from autopilot.models import AutoTask, ControllerConfig, RuntimeControllerSecret
+from autopilot.models import AutoTask, ControllerConfig, ControllerDecision, RuntimeControllerSecret
 from autopilot.platform_models import PlatformResult
 from autopilot.solver_result import SubmissionPlan
 
@@ -61,6 +61,8 @@ class DirectLLMController:
         self.client = client or httpx.AsyncClient(timeout=config.timeout_seconds)
         self._owns_client = client is None
         self._runtime_root: Path | None = None
+        self._last_request_id: str | None = None
+        self._cleanup_failures = 0
 
     def set_runtime_root(self, runtime_root: Path) -> None:
         self._runtime_root = runtime_root.resolve()
@@ -72,10 +74,12 @@ class DirectLLMController:
         call_root.mkdir(parents=True, exist_ok=False)
         return call_root
 
-    @staticmethod
-    def _remove_call_root(call_root: Path | None) -> None:
+    def _remove_call_root(self, call_root: Path | None) -> None:
         if call_root is not None:
-            shutil.rmtree(call_root, ignore_errors=True)
+            try:
+                shutil.rmtree(call_root)
+            except OSError:
+                self._cleanup_failures += 1
 
     async def close(self) -> None:
         if self._owns_client:
@@ -174,6 +178,7 @@ class DirectLLMController:
             unknown = set(payload) - _ACTION_FIELDS[action]
             if unknown:
                 raise ValueError(f"unknown action fields: {sorted(unknown)}")
+            task: AutoTask | None = None
             if action == "task":
                 raw = payload.get("task")
                 if not isinstance(raw, dict):
@@ -197,7 +202,14 @@ class DirectLLMController:
                 )
                 if not task.external_id or not task.name or not task.goal or not task.origin:
                     raise ValueError("task fields must be non-empty")
-                return PlatformResult("task", task=task, message=payload.get("message"))
+                decision = ControllerDecision(
+                    protocol_version=2,
+                    phase=phase,
+                    action=action,
+                    task=task,
+                    message=payload.get("message"),
+                )
+                return PlatformResult("task", task=decision.task, message=decision.message)
             if phase == "submit" and action in {"accepted", "rejected", "retryable_error", "fatal_error"} and "submit_platform_result" not in tool_results:
                 raise ValueError("submission outcome requires submit_platform_result tool call")
             if action in {"skipped", "skip_failed"} and "skip_platform_task" not in tool_results:
@@ -217,9 +229,23 @@ class DirectLLMController:
                 delay = float(delay)
                 if not 0.1 <= delay <= 300:
                     raise ValueError("retry_after_seconds must be between 0.1 and 300")
-            return PlatformResult(action, message=payload.get("message"), retry_after_seconds=delay)
+            decision = ControllerDecision(
+                protocol_version=2,
+                phase=phase,
+                action=action,
+                message=payload.get("message"),
+                retry_after_seconds=delay,
+            )
+            return PlatformResult(
+                decision.action,
+                message=decision.message,
+                retry_after_seconds=decision.retry_after_seconds,
+            )
         except (json.JSONDecodeError, TypeError, ValueError) as exc:
-            raise DirectControllerError(f"invalid controller action: {exc}") from exc
+            request_id = self._last_request_id or "unknown"
+            raise DirectControllerError(
+                f"controller action parse failed ({request_id}): {exc}"
+            ) from exc
 
     async def plan_submission(self, task: AutoTask, goal_result, *, rejection: str | None = None, cancel_event: asyncio.Event | None = None) -> SubmissionPlan:
         instruction = {
@@ -327,6 +353,7 @@ class DirectLLMController:
 
     async def _completion(self, messages, tools, *, cancel_event: asyncio.Event | None = None, call_root: Path | None = None) -> dict[str, object]:
         request_id = f"controller-{uuid4().hex}"
+        self._last_request_id = request_id
         headers = {
             "Authorization": f"Bearer {self.secret.api_key}",
             "Content-Type": "application/json",
@@ -347,7 +374,7 @@ class DirectLLMController:
             payload["reasoning_effort"] = self.config.reasoning_effort
         last_error: Exception | None = None
         data = None
-        for attempt in range(3):
+        for attempt in range(self.config.max_transport_retries + 1):
             try:
                 request_task = asyncio.create_task(
                     self.client.post(self.config.chat_completions_url, headers=headers, json=payload)
@@ -375,7 +402,7 @@ class DirectLLMController:
                 retryable = not isinstance(exc, httpx.HTTPStatusError) or (
                     exc.response.status_code == 429 or exc.response.status_code >= 500
                 )
-                if attempt < 2 and retryable:
+                if attempt < self.config.max_transport_retries and retryable:
                     delay = 0.25 * (2**attempt)
                     if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code == 429:
                         try:

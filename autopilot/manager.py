@@ -126,6 +126,7 @@ class AutoManager:
         self._adapter: PromptPlatformAdapter | StructuredPlatformAdapter | None = None
         self._controller_secret: RuntimeControllerSecret | None = None
         self._platform_secret: RuntimePlatformSecret | None = None
+        self._cleanup_failures = 0
         self._controller_health: dict[str, object] = {
             "status": "unknown",
             "last_error": None,
@@ -242,7 +243,7 @@ class AutoManager:
             except Exception:
                 if not config.is_legacy:
                     await self._dispose_modern_runtime()
-                shutil.rmtree(runtime_root, ignore_errors=True)
+                self._remove_runtime_root(runtime_root)
                 raise
 
     async def stop(self) -> dict[str, object]:
@@ -719,7 +720,7 @@ class AutoManager:
             await self._dispose_modern_runtime()
             self._clear_runtime_platform_secret(session)
             self._persist_session(session)
-            shutil.rmtree(session.runtime_root, ignore_errors=True)
+            self._remove_runtime_root(session.runtime_root)
 
     async def _fetch_modern(self, session: AutoSession) -> PlatformResult:
         if isinstance(self._adapter, StructuredPlatformAdapter):
@@ -1141,6 +1142,12 @@ class AutoManager:
                 for hint in task.hints
             ),
         )
+
+    def _remove_runtime_root(self, runtime_root) -> None:
+        try:
+            shutil.rmtree(runtime_root)
+        except OSError:
+            self._cleanup_failures += 1
 
     async def _dispose_modern_runtime(self) -> None:
         controller = self._controller

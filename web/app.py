@@ -70,6 +70,7 @@ def _controller_config(payload: ControllerPayload) -> ControllerConfig:
         model=payload.model,
         timeout_seconds=advanced.timeout_seconds,
         max_rounds=advanced.max_rounds,
+        max_transport_retries=advanced.max_transport_retries,
         temperature=advanced.temperature,
         max_output_tokens=advanced.max_output_tokens,
         reasoning_effort=advanced.reasoning_effort,

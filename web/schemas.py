@@ -27,6 +27,7 @@ class ControllerAdvanced(BaseModel):
 
     timeout_seconds: float = Field(default=300, gt=0, le=1800)
     max_rounds: int = Field(default=20, ge=1, le=50)
+    max_transport_retries: int = Field(default=2, ge=0, le=10)
     temperature: float | None = Field(default=None, ge=0, le=2)
     max_output_tokens: int | None = Field(default=None, ge=1, le=200000)
     reasoning_effort: str | None = Field(default=None, min_length=1, max_length=40)

@@ -65,6 +65,7 @@ describe('AutopilotPage', () => {
         advanced: {
           timeout_seconds: 300,
           max_rounds: 20,
+          max_transport_retries: 2,
           temperature: null,
           max_output_tokens: null,
           reasoning_effort: null,

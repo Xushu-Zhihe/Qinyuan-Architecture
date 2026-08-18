@@ -327,6 +327,7 @@ export interface AutopilotSnapshot {
 export interface ControllerAdvancedInput {
   timeout_seconds: number
   max_rounds: number
+  max_transport_retries: number
   temperature: number | null
   max_output_tokens: number | null
   reasoning_effort: string | null

@@ -14,7 +14,7 @@ const statusLabel: Record<string, string> = {
 
 const defaultController: ControllerInput = {
   api_key: '', base_url: 'https://api.openai.com/v1', model: '',
-  advanced: { timeout_seconds: 300, max_rounds: 20, temperature: null, max_output_tokens: null, reasoning_effort: null, extra_headers: {}, extra_body: {} },
+  advanced: { timeout_seconds: 300, max_rounds: 20, max_transport_retries: 2, temperature: null, max_output_tokens: null, reasoning_effort: null, extra_headers: {}, extra_body: {} },
 }
 
 const endpoint = (method: 'GET' | 'POST', path: string, body: unknown = null) => ({ method, path, query: {}, headers: {}, body, form: null, timeout_seconds: 30, max_retries: 0, retry_status_codes: [429, 500, 502, 503, 504] })

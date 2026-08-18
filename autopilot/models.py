@@ -42,6 +42,7 @@ class ControllerConfig:
     model: str
     timeout_seconds: float = 300.0
     max_rounds: int = 20
+    max_transport_retries: int = 2
     temperature: float | None = None
     max_output_tokens: int | None = None
     reasoning_effort: str | None = None
@@ -66,6 +67,10 @@ class ControllerConfig:
             raise ValueError("controller timeout_seconds must be between 0 and 1800")
         if self.max_rounds < 1 or self.max_rounds > 50:
             raise ValueError("controller max_rounds must be between 1 and 50")
+        if self.max_transport_retries < 0 or self.max_transport_retries > MAX_RETRY_COUNT:
+            raise ValueError(
+                f"controller max_transport_retries must be between 0 and {MAX_RETRY_COUNT}"
+            )
         if self.temperature is not None and not 0 <= self.temperature <= 2:
             raise ValueError("controller temperature must be between 0 and 2")
         if self.max_output_tokens is not None and not 1 <= self.max_output_tokens <= 200000:
@@ -329,6 +334,35 @@ class AutoHistoryEntry:
         }
 
 
+@dataclass(frozen=True, slots=True)
+class ControllerDecision:
+    """Validated modern controller output before manager-specific handling."""
+
+    protocol_version: int
+    phase: Literal["fetch", "plan", "submit", "skip"]
+    action: str
+    task: AutoTask | None = None
+    message: str | None = None
+    retry_after_seconds: float | None = None
+    submission_plan: object | None = None
+
+    def __post_init__(self) -> None:
+        if self.protocol_version != 2:
+            raise ValueError("controller protocol_version must be 2")
+        if self.action not in {
+            "task",
+            "wait",
+            "finished",
+            "accepted",
+            "rejected",
+            "retryable_error",
+            "fatal_error",
+            "skipped",
+            "skip_failed",
+        }:
+            raise ValueError("unsupported controller action")
+        if self.retry_after_seconds is not None and not 0.1 <= self.retry_after_seconds <= 300:
+            raise ValueError("retry_after_seconds must be between 0.1 and 300")
 @dataclass(slots=True)
 class AutoSession:
     id: str

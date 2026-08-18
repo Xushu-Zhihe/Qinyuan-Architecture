@@ -64,8 +64,17 @@ TASK_REASON_CODES = frozenset(
         "skip_failed",
         "skipped",
         "user_stopped",
+        "platform_empty_queue_exhausted",
+        "platform_error_exhausted",
+        "platform_duplicate_id_exhausted",
+        "lease_release_failed",
+        "service_restarted",
     }
 )
+
+MAX_CONSECUTIVE_EMPTY_FETCHES = 20
+MAX_CONSECUTIVE_FETCH_ERRORS = 5
+MAX_CONSECUTIVE_DUPLICATE_IDS = 3
 
 
 def _scrub_text(value: str, platform_prompt: str) -> str:
@@ -114,6 +123,8 @@ class AutoManager:
         self._adapter: PromptPlatformAdapter | StructuredPlatformAdapter | None = None
         self._controller_secret: RuntimeControllerSecret | None = None
         self._platform_secret: RuntimePlatformSecret | None = None
+        self._session_state_root = (self.service.registry.data_root / "autopilot-sessions").resolve()
+        self._recovered_session_snapshot: dict[str, object] | None = self._recover_session_snapshot()
         self._provider_capabilities = {
             name: static_capability_snapshot(provider)
             for name, provider in self.providers.items()
@@ -196,6 +207,8 @@ class AutoManager:
                 runtime_root.mkdir(parents=True, exist_ok=False)
                 session = AutoSession(session_id, config, runtime_root)
                 self._session = session
+                self._recovered_session_snapshot = None
+                self._persist_session(session)
                 if self._controller is not None and hasattr(self._controller, "set_runtime_root"):
                     self._controller.set_runtime_root(runtime_root)
                 if isinstance(self._adapter, PromptPlatformAdapter):
@@ -220,6 +233,9 @@ class AutoManager:
                 return self._snapshot_locked()
             if session.status not in {"finished", "failed", "stopped"}:
                 session.status = "stopping"
+                if session.current_task is not None and session.current_external_id is None:
+                    session.current_external_id = session.current_task.external_id
+                    session.current_task_name = session.current_task.name
                 if session.current_external_id is not None:
                     if session.current_task_status in TASK_TRANSITIONS and session.current_task_status != "stopped":
                         try:
@@ -228,9 +244,19 @@ class AutoManager:
                             session.current_task_status = "stopped"
                             session.current_reason_code = "user_stopped"
                     self._append_stopped_history(session)
-            if cancel_event is not None:
-                cancel_event.set()
+            release_task = session.current_task
+            release_requested = (
+                release_task is not None
+                and session.config.stop_active_task_action == "skip"
+                and not session.stop_release_attempted
+            )
+            session.stop_release_attempted = True
             project_id = session.current_project_id
+
+        if release_requested:
+            await self._release_on_stop(session, release_task)
+        if cancel_event is not None:
+            cancel_event.set()
 
         if project_id is not None:
             try:
@@ -253,6 +279,7 @@ class AutoManager:
                     self._session.current_task_status = "stopped"
                     self._session.current_reason_code = "user_stopped"
                 self._clear_prompt(self._session)
+                self._persist_session(self._session)
             return self._snapshot_locked()
 
     async def aclose(self) -> None:
@@ -270,7 +297,7 @@ class AutoManager:
 
     def _snapshot_locked(self) -> dict[str, object]:
         providers = tuple(self.providers)
-        return {
+        result = {
             "session": (
                 self._session.snapshot(providers) if self._session is not None else None
             ),
@@ -280,6 +307,51 @@ class AutoManager:
                 for name in self.providers
             },
         }
+        if result["session"] is None:
+            result["session"] = self._recovered_session_snapshot
+        return result
+
+    def _persist_session(self, session: AutoSession) -> None:
+        try:
+            self._session_state_root.mkdir(parents=True, exist_ok=True)
+            payload = {"updated_at": _timestamp(), "session": session.snapshot(tuple(self.providers))}
+            target = self._session_state_root / f"{session.id}.json"
+            temporary = target.with_suffix(".json.tmp")
+            temporary.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+            temporary.replace(target)
+        except (OSError, TypeError, ValueError):
+            # Session persistence must not change the automation outcome.
+            return
+
+    def _recover_session_snapshot(self) -> dict[str, object] | None:
+        try:
+            self._session_state_root.mkdir(parents=True, exist_ok=True)
+            candidates = sorted(self._session_state_root.glob("*.json"), key=lambda path: path.stat().st_mtime)
+        except OSError:
+            return None
+        recovered: dict[str, object] | None = None
+        for path in candidates:
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                snapshot = payload.get("session") if isinstance(payload, dict) else None
+                if not isinstance(snapshot, dict):
+                    continue
+                status = str(snapshot.get("status", ""))
+                if status not in {"finished", "failed", "stopped"}:
+                    snapshot = dict(snapshot)
+                    snapshot["status"] = "stopped"
+                    snapshot["reason_code"] = "service_restarted"
+                    snapshot["last_message"] = "automatic session stopped after service restart"
+                    if snapshot.get("current_task_status") not in {None, "finished", "failed", "stopped"}:
+                        snapshot["current_task_status"] = "stopped"
+                    path.write_text(
+                        json.dumps({"updated_at": _timestamp(), "session": snapshot}, ensure_ascii=False),
+                        encoding="utf-8",
+                    )
+                recovered = snapshot
+            except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                continue
+        return recovered
 
     def _is_active(self) -> bool:
         return self._runner is not None and not self._runner.done()
@@ -395,6 +467,7 @@ class AutoManager:
         finally:
             if session.status in {"finished", "failed", "stopped"}:
                 self._clear_prompt(session)
+            self._persist_session(session)
 
     async def _run_modern(self, session: AutoSession, cancel_event: asyncio.Event) -> None:
         seen_ids: set[str] = set()
@@ -405,8 +478,19 @@ class AutoManager:
                 self._transition(session, "queued")
                 fetched = await self._fetch_modern(session)
                 if fetched.status == "retryable_error":
+                    session.consecutive_fetch_errors += 1
+                    if session.consecutive_fetch_errors >= MAX_CONSECUTIVE_FETCH_ERRORS:
+                        raise AutoManagerError(
+                            "platform_error_exhausted: consecutive platform fetch errors exhausted"
+                        )
                     fetched = await self._retry_fetch(session, fetched, cancel_event)
                 if fetched.status == "wait":
+                    session.consecutive_empty_fetches += 1
+                    session.consecutive_fetch_errors = 0
+                    if session.consecutive_empty_fetches >= MAX_CONSECUTIVE_EMPTY_FETCHES:
+                        raise AutoManagerError(
+                            "platform_empty_queue_exhausted: consecutive empty queue limit exhausted"
+                        )
                     self._transition(session, "waiting", "platform_wait")
                     wait_seconds = max(
                         0.1,
@@ -416,7 +500,6 @@ class AutoManager:
                         ),
                     )
                     await self._sleep_or_cancel(wait_seconds, cancel_event)
-                    self._transition(session, "queued")
                     continue
                 if fetched.status == "finished":
                     self._transition(session, "finished")
@@ -433,8 +516,21 @@ class AutoManager:
                 if fetched.status != "task" or not isinstance(fetched.task, AutoTask):
                     raise AutoManagerError(fetched.message or "platform fetch failed")
                 task = fetched.task
+                session.consecutive_empty_fetches = 0
+                session.consecutive_fetch_errors = 0
                 if task.external_id in seen_ids:
-                    raise AutoManagerError("platform returned a duplicate external_id")
+                    session.consecutive_duplicate_ids += 1
+                    if session.consecutive_duplicate_ids >= MAX_CONSECUTIVE_DUPLICATE_IDS:
+                        raise AutoManagerError(
+                            "platform_duplicate_id_exhausted: consecutive duplicate task IDs exhausted"
+                        )
+                    self._transition(session, "waiting", "platform_wait")
+                    await self._sleep_or_cancel(
+                        min(2 ** session.consecutive_duplicate_ids, 30), cancel_event
+                    )
+                    continue
+                session.consecutive_duplicate_ids = 0
+                session.current_task = task
                 seen_ids.add(task.external_id)
                 if isinstance(self._adapter, PromptPlatformAdapter):
                     attachment_paths = task.raw_metadata.get("attachment_paths", ())
@@ -577,6 +673,7 @@ class AutoManager:
         finally:
             await self._dispose_modern_runtime()
             self._clear_runtime_platform_secret(session)
+            self._persist_session(session)
             shutil.rmtree(session.runtime_root, ignore_errors=True)
 
     async def _fetch_modern(self, session: AutoSession) -> PlatformResult:
@@ -751,22 +848,7 @@ class AutoManager:
         *,
         attempts: list[dict[str, object]] | None = None,
     ) -> None:
-        if isinstance(self._adapter, StructuredPlatformAdapter):
-            result = await self._adapter.skip_task(task, reason)
-        elif isinstance(self._adapter, PromptPlatformAdapter) and self._controller is not None:
-            async def handler(name, arguments):
-                if name != "skip_platform_task":
-                    raise ValueError("tool is unavailable in skip phase")
-                return await self._adapter.platform_http_request(arguments)
-            prompt = self._runtime_platform_prompt()
-            result = await self._controller.prompt_phase(
-                "skip",
-                prompt + f"\nRelease task {task.external_id}. Return skipped only after confirmation.",
-                handler,
-                cancel_event=self._cancel_event,
-            )
-        else:
-            raise AutoManagerError("skip adapter is unavailable")
+        result = await self._platform_skip_result(task, reason)
         if result.status != "skipped":
             if session.current_task_status in TASK_TRANSITIONS and session.current_task_status not in {
                 None,
@@ -801,6 +883,43 @@ class AutoManager:
         )
         session.processed_tasks += 1
         self._clear_current_task(session)
+
+    async def _platform_skip_result(self, task: AutoTask, reason: str) -> PlatformResult:
+        if isinstance(self._adapter, StructuredPlatformAdapter):
+            return await self._adapter.skip_task(task, reason)
+        if isinstance(self._adapter, PromptPlatformAdapter) and self._controller is not None:
+            async def handler(name, arguments):
+                if name != "skip_platform_task":
+                    raise ValueError("tool is unavailable in skip phase")
+                return await self._adapter.platform_http_request(arguments)
+            prompt = self._runtime_platform_prompt()
+            return await self._controller.prompt_phase(
+                "skip",
+                prompt + f"\nRelease task {task.external_id}. Return skipped only after confirmation.",
+                handler,
+                cancel_event=self._cancel_event,
+            )
+        raise AutoManagerError("skip adapter is unavailable")
+
+    async def _release_on_stop(self, session: AutoSession, task: AutoTask) -> None:
+        try:
+            result = await self._platform_skip_result(task, "user stopped")
+        except Exception as exc:
+            result = PlatformResult("skip_failed", message=str(exc))
+        if result.status == "skipped":
+            return
+        entry = next(
+            (item for item in reversed(session.history)
+             if item.external_id == task.external_id and item.status == "stopped"),
+            None,
+        )
+        if entry is not None:
+            entry.reason_code = "lease_release_failed"
+            entry.message = "lease release failed"
+            entry.attempts = tuple(entry.attempts) + (
+                {"lease_release_failed": True, "reason_code": "lease_release_failed"},
+            )
+        session.last_error = "lease_release_failed: platform lease release failed"
 
     @staticmethod
     def _append_terminal_history(
@@ -922,6 +1041,7 @@ class AutoManager:
 
     @staticmethod
     def _clear_current_task(session: AutoSession) -> None:
+        session.current_task = None
         session.current_external_id = None
         session.current_task_name = None
         session.current_project_id = None

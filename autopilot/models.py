@@ -352,6 +352,11 @@ class AutoSession:
     current_retry_count: int = 0
     current_replan_count: int = 0
     current_plan_fingerprint: str | None = None
+    current_task: AutoTask | None = None
+    consecutive_empty_fetches: int = 0
+    consecutive_fetch_errors: int = 0
+    consecutive_duplicate_ids: int = 0
+    stop_release_attempted: bool = False
 
     def snapshot(self, providers: tuple[str, ...]) -> dict[str, object]:
         result = {

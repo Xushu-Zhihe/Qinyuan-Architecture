@@ -126,7 +126,7 @@
         "validates_result_locally": true,
         "supports_result_fact": true,
         "schema_version": "2",
-        "fixture_digest": "sha256:aaee17602c77b77de5c955131472fa4510275c5f82ced1073247c0e0955e43e7"
+        "fixture_digest": "sha256:916cb6308fe2ce645a632a452bc309c330407f126165d09b0bef65bb80a5dcc6"
       },
       "capability_probe": {
         "command": ["qinyuan-agent", "--capabilities", "--json"],
@@ -179,7 +179,7 @@
         "validates_result_locally": true,
         "supports_result_fact": true,
         "schema_version": "2",
-        "fixture_digest": "sha256:aaee17602c77b77de5c955131472fa4510275c5f82ced1073247c0e0955e43e7"
+        "fixture_digest": "sha256:916cb6308fe2ce645a632a452bc309c330407f126165d09b0bef65bb80a5dcc6"
       },
       "capability_probe": {
         "command": ["q-subagent", "capabilities", "--json"],

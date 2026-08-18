@@ -1,4 +1,5 @@
 import json
+import hashlib
 import subprocess
 import sys
 import tempfile
@@ -14,6 +15,30 @@ VALIDATOR = SKILL_ROOT / "scripts" / "validate_result.py"
 
 
 class BlackboardResultSkillTests(unittest.TestCase):
+    def test_conformance_fixture_manifest_is_complete(self) -> None:
+        fixture_root = SKILL_ROOT / "fixtures"
+        required = {
+            "valid-text.json",
+            "valid-structured.json",
+            "valid-evidence.json",
+            "valid-partial.json",
+            "invalid-result-ref.json",
+            "invalid-node-type.json",
+            "invalid-goal-version.json",
+            "invalid-missing-address.json",
+        }
+        fixtures = {path.name: path for path in fixture_root.glob("*.json")}
+        self.assertEqual(set(fixtures), required)
+        encoded = b"".join(
+            name.encode("utf-8")
+            + b"\0"
+            + fixtures[name].read_text(encoding="utf-8").strip().encode("utf-8")
+            + b"\n"
+            for name in sorted(fixtures)
+        )
+        manifest = json.loads((SKILL_ROOT / "manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual(manifest["fixture_digest"], "sha256:" + hashlib.sha256(encoded).hexdigest())
+
     def run_validator(
         self,
         payload: object,

@@ -77,10 +77,13 @@ MAX_CONSECUTIVE_FETCH_ERRORS = 5
 MAX_CONSECUTIVE_DUPLICATE_IDS = 3
 
 
-def _scrub_text(value: str, platform_prompt: str) -> str:
-    scrubbed = value.replace(platform_prompt, "[redacted]")
+def _scrub_text(value: str, platform_prompt: str, *secret_values: str) -> str:
+    scrubbed = value
+    if platform_prompt:
+        scrubbed = scrubbed.replace(platform_prompt, "[redacted]")
     values = [match.group(1) for match in _CREDENTIAL_PATTERN.finditer(platform_prompt)]
     values.extend(match.group(1) for match in _BEARER_PATTERN.finditer(platform_prompt))
+    values.extend(secret for secret in secret_values if secret)
     for credential in values:
         if len(credential) >= 4:
             scrubbed = scrubbed.replace(credential, "[redacted]")
@@ -522,19 +525,28 @@ class AutoManager:
                     continue
                 if fetched.status == "finished":
                     self._transition(session, "finished")
-                    session.last_message = fetched.message or "platform queue finished"
+                    session.last_message = self._scrub_runtime_text(
+                        session, fetched.message or "platform queue finished"
+                    )
                     break
                 if fetched.status == "skip_required" and isinstance(fetched.task, AutoTask):
                     self._transition(session, "fetched", "task_info_skip_required")
                     await self._skip_modern(
                         session,
                         fetched.task,
-                        fetched.message or "task info failed",
+                        self._scrub_runtime_text(
+                            session, fetched.message or "task info failed"
+                        )
+                        or "task info failed",
                     )
                     continue
                 if fetched.status != "task" or not isinstance(fetched.task, AutoTask):
-                    raise AutoManagerError(fetched.message or "platform fetch failed")
-                task = fetched.task
+                    raise AutoManagerError(
+                        self._scrub_runtime_text(
+                            session, fetched.message or "platform fetch failed"
+                        )
+                    )
+                task = self._scrub_task(session, fetched.task)
                 session.consecutive_empty_fetches = 0
                 session.consecutive_fetch_errors = 0
                 if task.external_id in seen_ids:
@@ -566,7 +578,11 @@ class AutoManager:
                     await self._solve_task(session, task, cancel_event)
                 except AutoManagerError as exc:
                     if session.config.solver_failure_action == "skip":
-                        await self._skip_modern(session, task, str(exc))
+                        await self._skip_modern(
+                            session,
+                            task,
+                            self._scrub_runtime_text(session, str(exc)) or "solver failed",
+                        )
                         continue
                     raise
                 goal_result = self.service.get_goal_result(session.current_project_id or "")
@@ -583,7 +599,9 @@ class AutoManager:
                 self._transition(session, "solver_achieved")
                 session.current_result_ref = goal_result.result_ref
                 session.current_result_fact_id = goal_result.fact.id
-                session.current_result_preview = goal_result.fact.content[:500]
+                session.current_result_preview = self._scrub_runtime_text(
+                    session, goal_result.fact.content[:500]
+                )
                 assert self._controller is not None
                 plan = await self._controller.plan_submission(
                     task, goal_result, cancel_event=cancel_event
@@ -602,7 +620,10 @@ class AutoManager:
                     plan = await self._controller.plan_submission(
                         task,
                         goal_result,
-                        rejection=submission.message or "rejected",
+                        rejection=(
+                            self._scrub_runtime_text(session, submission.message)
+                            or "rejected"
+                        ),
                         cancel_event=cancel_event,
                     )
                     if plan.fingerprint == previous_fingerprint:
@@ -623,7 +644,8 @@ class AutoManager:
                         await self._skip_modern(
                             session,
                             task,
-                            submission.message or "rejected",
+                            self._scrub_runtime_text(session, submission.message)
+                            or "rejected",
                             attempts=attempt_records,
                         )
                         continue
@@ -631,7 +653,7 @@ class AutoManager:
                         session,
                         task,
                         "rejected",
-                        submission.message,
+                        self._scrub_runtime_text(session, submission.message),
                         "platform_rejected",
                         attempt_records,
                     )
@@ -646,11 +668,15 @@ class AutoManager:
                         session,
                         task,
                         "failed",
-                        submission.message,
+                        self._scrub_runtime_text(session, submission.message),
                         reason_code,
                         attempt_records,
                     )
-                    raise AutoManagerError(submission.message or "platform submission failed")
+                    raise AutoManagerError(
+                        self._scrub_runtime_text(
+                            session, submission.message or "platform submission failed"
+                        )
+                    )
                 self._transition(session, "accepted")
                 finished_at = _timestamp()
                 session.history.append(AutoHistoryEntry(
@@ -659,7 +685,7 @@ class AutoManager:
                     project_id=session.current_project_id or "",
                     answer="",
                     status="accepted",
-                    message=submission.message,
+                    message=self._scrub_runtime_text(session, submission.message),
                     result_ref=goal_result.result_ref,
                     result_fact_id=goal_result.fact.id,
                     attempt_count=len(attempt_records),
@@ -685,7 +711,7 @@ class AutoManager:
         except (AutoManagerError, DirectControllerError) as exc:
             reason_code = self._reason_code_for_error(str(exc))
             self._set_session_terminal(session, "failed", reason_code)
-            session.last_error = str(exc)
+            session.last_error = self._scrub_runtime_text(session, str(exc))
         except Exception as exc:
             self._set_session_terminal(session, "failed", "platform_submission_failed")
             session.last_error = f"automatic session failed: {type(exc).__name__}"
@@ -867,7 +893,9 @@ class AutoManager:
         *,
         attempts: list[dict[str, object]] | None = None,
     ) -> None:
+        reason = self._scrub_runtime_text(session, reason) or "task skipped"
         result = await self._platform_skip_result(task, reason)
+        result_message = self._scrub_runtime_text(session, result.message)
         if result.status != "skipped":
             if session.current_task_status in TASK_TRANSITIONS and session.current_task_status not in {
                 None,
@@ -879,12 +907,12 @@ class AutoManager:
                 session,
                 task,
                 "failed",
-                result.message or "platform skip failed",
+                result_message or "platform skip failed",
                 "skip_failed",
                 attempts or [],
             )
             raise AutoManagerError(
-                f"skip_failed: {result.message or 'platform skip failed'}"
+                f"skip_failed: {result_message or 'platform skip failed'}"
             )
         if session.current_task_status in {"fetched", "solving", "rejected", "replanning"}:
             self._transition(
@@ -1086,6 +1114,33 @@ class AutoManager:
 
     def _runtime_platform_prompt(self) -> str:
         return self._platform_secret.prompt if self._platform_secret is not None else ""
+
+    def _scrub_runtime_text(self, session: AutoSession, value: str | None) -> str | None:
+        if value is None:
+            return None
+        prompt = (
+            self._runtime_platform_prompt()
+            if not session.config.is_legacy
+            else session.config.platform_prompt
+        )
+        secrets = []
+        if self._controller_secret is not None:
+            secrets.append(self._controller_secret.api_key)
+        if self._platform_secret is not None:
+            secrets.append(self._platform_secret.token)
+        return _scrub_text(value, prompt, *secrets)
+
+    def _scrub_task(self, session: AutoSession, task: AutoTask) -> AutoTask:
+        return replace(
+            task,
+            name=self._scrub_runtime_text(session, task.name) or "",
+            goal=self._scrub_runtime_text(session, task.goal) or "",
+            origin=self._scrub_runtime_text(session, task.origin) or "",
+            hints=tuple(
+                self._scrub_runtime_text(session, hint) or ""
+                for hint in task.hints
+            ),
+        )
 
     async def _dispose_modern_runtime(self) -> None:
         controller = self._controller

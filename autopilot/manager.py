@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import shutil
 from dataclasses import replace
 from datetime import datetime, timezone
 from uuid import uuid4
@@ -95,12 +96,16 @@ class AutoManager:
         execute=None,
         audit_config: AuditConfig | None = None,
         poll_interval_seconds: float = 1.0,
+        controller_factory=None,
+        platform_adapter_factory=None,
     ) -> None:
         self.service = service
         self.providers = {provider.name: provider for provider in provider_configs}
         self.execute = execute
         self.audit_config = audit_config
         self.default_poll_interval_seconds = poll_interval_seconds
+        self.controller_factory = controller_factory
+        self.platform_adapter_factory = platform_adapter_factory
         self._session: AutoSession | None = None
         self._runner: asyncio.Task[None] | None = None
         self._cancel_event: asyncio.Event | None = None
@@ -146,14 +151,14 @@ class AutoManager:
                         raise AutoManagerError("platform prompt is required")
                     if isinstance(config.platform, PromptPlatformConfig):
                         object.__setattr__(config.platform, "prompt", "")
-                    self._controller = DirectLLMController(config.controller, controller_secret)
-                    if isinstance(config.platform, PromptPlatformConfig):
+                    controller_factory = self.controller_factory or DirectLLMController
+                    self._controller = controller_factory(config.controller, controller_secret)
+                    if self.platform_adapter_factory is not None:
+                        self._adapter = self.platform_adapter_factory(config.platform, platform_secret)
+                    elif isinstance(config.platform, PromptPlatformConfig):
                         self._adapter = PromptPlatformAdapter(config.platform)
                     elif isinstance(config.platform, StructuredPlatformConfig):
-                        self._adapter = StructuredPlatformAdapter(
-                            config.platform,
-                            secret=platform_secret,
-                        )
+                        self._adapter = StructuredPlatformAdapter(config.platform, secret=platform_secret)
                     else:
                         raise AutoManagerError("platform configuration does not match mode")
                     probed = await asyncio.gather(
@@ -203,6 +208,7 @@ class AutoManager:
             except Exception:
                 if not config.is_legacy:
                     await self._dispose_modern_runtime()
+                shutil.rmtree(runtime_root, ignore_errors=True)
                 raise
 
     async def stop(self) -> dict[str, object]:
@@ -402,7 +408,14 @@ class AutoManager:
                     fetched = await self._retry_fetch(session, fetched, cancel_event)
                 if fetched.status == "wait":
                     self._transition(session, "waiting", "platform_wait")
-                    await self._sleep_or_cancel(fetched.retry_after_seconds or session.config.poll_interval_seconds, cancel_event)
+                    wait_seconds = max(
+                        0.1,
+                        min(
+                            fetched.retry_after_seconds or session.config.poll_interval_seconds,
+                            300.0,
+                        ),
+                    )
+                    await self._sleep_or_cancel(wait_seconds, cancel_event)
                     self._transition(session, "queued")
                     continue
                 if fetched.status == "finished":
@@ -564,6 +577,7 @@ class AutoManager:
         finally:
             await self._dispose_modern_runtime()
             self._clear_runtime_platform_secret(session)
+            shutil.rmtree(session.runtime_root, ignore_errors=True)
 
     async def _fetch_modern(self, session: AutoSession) -> PlatformResult:
         if isinstance(self._adapter, StructuredPlatformAdapter):
@@ -625,6 +639,10 @@ class AutoManager:
                     "attempt": attempt_number,
                     "phase": "transport",
                     "status": result.status,
+                    "external_id": task.external_id,
+                    "project_id": session.current_project_id,
+                    "goal_version": goal_result.goal_version,
+                    "fact_id": goal_result.fact.id,
                     "plan_fingerprint": plan.fingerprint,
                     "result_ref": goal_result.result_ref,
                     "source_fact_ids": list(plan.source_fact_ids),

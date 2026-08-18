@@ -15,9 +15,23 @@ PROBE_FIELDS = {
 }
 
 
+def _readiness_status(provider: ProviderConfig, auto_ready: bool) -> str:
+    if auto_ready:
+        return "auto-ready"
+    capabilities = provider.capabilities
+    if (
+        capabilities.skill_mode == "required"
+        and "blackboard-result-protocol" not in capabilities.available_skills
+    ):
+        return "skill-missing"
+    if 2 not in capabilities.result_protocol_versions or not capabilities.supports_result_fact:
+        return "legacy-only"
+    return "protocol-mismatch"
+
+
 def static_capability_snapshot(provider: ProviderConfig) -> dict[str, object]:
     payload = asdict(provider.capabilities)
-    payload["auto_ready"] = (
+    auto_ready = (
         2 in provider.capabilities.result_protocol_versions
         and provider.capabilities.supports_result_fact
         and (
@@ -25,7 +39,8 @@ def static_capability_snapshot(provider: ProviderConfig) -> dict[str, object]:
             or "blackboard-result-protocol" in provider.capabilities.available_skills
         )
     )
-    payload["status"] = "auto-ready" if payload["auto_ready"] else "legacy-only"
+    payload["auto_ready"] = auto_ready
+    payload["status"] = _readiness_status(provider, auto_ready)
     return payload
 
 
@@ -54,6 +69,16 @@ async def probe_provider_capabilities(provider: ProviderConfig) -> dict[str, obj
             raise ValueError("capability probe must return an object")
     except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
         return {"provider": provider.name, **static, "auto_ready": False, "status": "protocol-mismatch", "error": str(exc)}
+    missing = sorted(PROBE_FIELDS - set(runtime))
+    if missing:
+        return {
+            "provider": provider.name,
+            **static,
+            "auto_ready": False,
+            "status": "protocol-mismatch",
+            "source": "probe",
+            "error": f"capability probe missing fields: {', '.join(missing)}",
+        }
     compared = {
         "request_protocol_versions": list(provider.capabilities.request_protocol_versions),
         "result_protocol_versions": list(provider.capabilities.result_protocol_versions),

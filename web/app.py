@@ -326,7 +326,14 @@ def create_app(
                 platform_secret=platform_secret,
             )
         except AutoManagerError as exc:
-            code = 409 if "already running" in str(exc) else 400
+            message = str(exc)
+            code = (
+                409
+                if "already running" in message
+                else 503
+                if any(marker in message.lower() for marker in ("preflight", "capability probe", "unavailable", "no execution backend"))
+                else 400
+            )
             raise HTTPException(status_code=code, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -346,6 +353,7 @@ def create_app(
                 "status": "valid",
                 "category": "controller",
                 "model": result.get("model", payload.model),
+                "latency": None,
             }
         except DirectControllerError as exc:
             raise HTTPException(
@@ -442,7 +450,7 @@ def create_app(
                 "ok": True,
                 "status": "valid",
                 "category": "platform_health",
-                "http_status": result.metadata.get("http_status"),
+                "latency": None,
             }
         finally:
             secret.clear()

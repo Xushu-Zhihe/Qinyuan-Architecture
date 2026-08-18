@@ -123,6 +123,12 @@ class AutoManager:
         self._adapter: PromptPlatformAdapter | StructuredPlatformAdapter | None = None
         self._controller_secret: RuntimeControllerSecret | None = None
         self._platform_secret: RuntimePlatformSecret | None = None
+        self._controller_health: dict[str, object] = {
+            "status": "unknown",
+            "last_error": None,
+            "checked_at": None,
+            "model": None,
+        }
         self._session_state_root = (self.service.registry.data_root / "autopilot-sessions").resolve()
         self._recovered_session_snapshot: dict[str, object] | None = self._recover_session_snapshot()
         self._provider_capabilities = {
@@ -191,11 +197,23 @@ class AutoManager:
                             f"solver provider capability probe failed: {incompatible}"
                         )
                     await self._controller.preflight()
+                    self._controller_health = {
+                        "status": "healthy",
+                        "last_error": None,
+                        "checked_at": _timestamp(),
+                        "model": config.controller.model,
+                    }
                 except asyncio.CancelledError:
                     await self._dispose_modern_runtime()
                     self._clear_config_platform_secret(config)
                     raise
                 except Exception as exc:
+                    self._controller_health = {
+                        "status": "unavailable",
+                        "last_error": f"controller preflight failed: {type(exc).__name__}",
+                        "checked_at": _timestamp(),
+                        "model": config.controller.model,
+                    }
                     await self._dispose_modern_runtime()
                     self._clear_config_platform_secret(config)
                     raise AutoManagerError(str(exc)) from exc
@@ -306,6 +324,7 @@ class AutoManager:
                 name: self._provider_capabilities[name]
                 for name in self.providers
             },
+            "controller_health": dict(self._controller_health),
         }
         if result["session"] is None:
             result["session"] = self._recovered_session_snapshot

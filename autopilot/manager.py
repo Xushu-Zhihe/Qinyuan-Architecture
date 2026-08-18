@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+from dataclasses import replace
 from datetime import datetime, timezone
 from uuid import uuid4
 
@@ -190,6 +191,8 @@ class AutoManager:
                 runtime_root.mkdir(parents=True, exist_ok=False)
                 session = AutoSession(session_id, config, runtime_root)
                 self._session = session
+                if isinstance(self._adapter, PromptPlatformAdapter):
+                    self._adapter.set_runtime_root(runtime_root)
                 self._cancel_event = asyncio.Event()
                 self._runner = asyncio.create_task(
                     self._run(session, self._cancel_event)
@@ -418,6 +421,15 @@ class AutoManager:
                 if task.external_id in seen_ids:
                     raise AutoManagerError("platform returned a duplicate external_id")
                 seen_ids.add(task.external_id)
+                if isinstance(self._adapter, PromptPlatformAdapter):
+                    attachment_paths = task.raw_metadata.get("attachment_paths", ())
+                    promoted = self._adapter.promote_attachments(task.external_id, attachment_paths)
+                    if promoted:
+                        task = replace(
+                            task,
+                            challenge_path=promoted[0],
+                            raw_metadata={**dict(task.raw_metadata), "attachment_paths": tuple(str(path.relative_to(session.runtime_root)) for path in promoted)},
+                        )
                 self._transition(session, "fetched")
                 self._transition(session, "solving")
                 try:
@@ -443,7 +455,9 @@ class AutoManager:
                 session.current_result_fact_id = goal_result.fact.id
                 session.current_result_preview = goal_result.fact.content[:500]
                 assert self._controller is not None
-                plan = await self._controller.plan_submission(task, goal_result)
+                plan = await self._controller.plan_submission(
+                    task, goal_result, cancel_event=cancel_event
+                )
                 session.current_plan_fingerprint = plan.fingerprint
                 session.current_attempt_phase = "submit"
                 self._transition(session, "submit_pending")
@@ -455,7 +469,12 @@ class AutoManager:
                     self._transition(session, "rejected", "platform_rejected")
                     self._transition(session, "replanning")
                     previous_fingerprint = plan.fingerprint
-                    plan = await self._controller.plan_submission(task, goal_result, rejection=submission.message or "rejected")
+                    plan = await self._controller.plan_submission(
+                        task,
+                        goal_result,
+                        rejection=submission.message or "rejected",
+                        cancel_event=cancel_event,
+                    )
                     if plan.fingerprint == previous_fingerprint:
                         raise AutoManagerError(
                             "submission replan did not change the frozen plan"
@@ -551,15 +570,20 @@ class AutoManager:
             raise AutoManagerError("prompt platform adapter is unavailable")
 
         async def handler(name, arguments):
-            if name != "platform_http_request":
-                raise ValueError("tool is unavailable in fetch phase")
-            return await self._adapter.platform_http_request(arguments)
+            if name == "platform_http_request":
+                return await self._adapter.platform_http_request(arguments)
+            if name == "download_attachment":
+                return await self._adapter.download_attachment(arguments)
+            if name == "extract_task_fields":
+                return await self._adapter.extract_task_fields(arguments)
+            raise ValueError("tool is unavailable in fetch phase")
 
         prompt = self._runtime_platform_prompt()
         return await self._controller.prompt_phase(
             "fetch",
             prompt + "\nFetch exactly one task. Return protocol_version 2 action JSON.",
             handler,
+            cancel_event=self._cancel_event,
         )
 
     async def _retry_fetch(
@@ -655,7 +679,12 @@ class AutoManager:
             "submission_plan": plan.to_dict(),
             "instruction": "Preview and submit this frozen plan once, then return accepted, rejected, retryable_error, or fatal_error action JSON.",
         }
-        return await self._controller.prompt_phase("submit", json.dumps(instruction, ensure_ascii=False), handler)
+        return await self._controller.prompt_phase(
+            "submit",
+            json.dumps(instruction, ensure_ascii=False),
+            handler,
+            cancel_event=self._cancel_event,
+        )
 
     async def _skip_modern(
         self,
@@ -673,7 +702,12 @@ class AutoManager:
                     raise ValueError("tool is unavailable in skip phase")
                 return await self._adapter.platform_http_request(arguments)
             prompt = self._runtime_platform_prompt()
-            result = await self._controller.prompt_phase("skip", prompt + f"\nRelease task {task.external_id}. Return skipped only after confirmation.", handler)
+            result = await self._controller.prompt_phase(
+                "skip",
+                prompt + f"\nRelease task {task.external_id}. Return skipped only after confirmation.",
+                handler,
+                cancel_event=self._cancel_event,
+            )
         else:
             raise AutoManagerError("skip adapter is unavailable")
         if result.status != "skipped":

@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import tempfile
 import unittest
+from pathlib import Path
 
 import httpx
 
 from autopilot.direct_controller import DirectControllerError, DirectLLMController
-from autopilot.models import AutoTask, ControllerConfig, RuntimeControllerSecret, RuntimePlatformSecret
-from autopilot.platform import StructuredPlatformAdapter
+from autopilot.models import AutoTask, ControllerConfig, PromptPlatformConfig, RuntimeControllerSecret, RuntimePlatformSecret
+from autopilot.platform import PromptPlatformAdapter, StructuredPlatformAdapter
 from autopilot.platform_models import (
     AuthConfig,
     EndpointConfig,
@@ -240,6 +242,34 @@ class ModernContractTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await controller.close()
             await client.aclose()
+
+    async def test_prompt_attachment_staging_returns_relative_path(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            client = httpx.AsyncClient(
+                transport=httpx.MockTransport(
+                    lambda request: httpx.Response(
+                        200,
+                        content=b"attachment",
+                        headers={"Content-Type": "text/plain"},
+                        request=request,
+                    )
+                )
+            )
+            adapter = PromptPlatformAdapter(PromptPlatformConfig("platform"), client=client)
+            runtime_root = Path(directory) / "session"
+            adapter.set_runtime_root(runtime_root)
+            try:
+                result = await adapter.download_attachment(
+                    {"url_or_path": "https://platform.example/file", "destination_relative_path": "one/input.txt"}
+                )
+                self.assertEqual(result["status"], "downloaded")
+                self.assertEqual(result["relative_path"], "one/input.txt")
+                promoted = adapter.promote_attachments("task-1", ("one/input.txt",))
+                self.assertEqual(len(promoted), 1)
+                self.assertTrue(promoted[0].is_file())
+            finally:
+                await adapter.close()
+                await client.aclose()
 
         responses = [{"choices": [{"message": {"tool_calls": [{"function": {"name": "platform_http_request", "arguments": "{}"}}]}}]}]
         client = httpx.AsyncClient(

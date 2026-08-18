@@ -20,6 +20,41 @@ PLATFORM_HTTP_TOOL = {
     },
 }
 
+DOWNLOAD_ATTACHMENT_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "download_attachment",
+        "description": "Download one platform attachment into backend staging.",
+        "parameters": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["url_or_path", "destination_relative_path"],
+            "properties": {
+                "url_or_path": {"type": "string"},
+                "destination_relative_path": {"type": "string"},
+                "headers": {"type": ["object", "null"]},
+            },
+        },
+    },
+}
+
+EXTRACT_TASK_FIELDS_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "extract_task_fields",
+        "description": "Extract task fields from a response using JSON paths.",
+        "parameters": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["response", "mapping"],
+            "properties": {
+                "response": {"type": "object"},
+                "mapping": {"type": "object"},
+            },
+        },
+    },
+}
+
 PREVIEW_SUBMISSION_TOOL = {
     "type": "function",
     "function": {
@@ -58,7 +93,7 @@ SKIP_TOOL = {
 }
 
 PHASE_TOOLS = {
-    "fetch": (PLATFORM_HTTP_TOOL,),
+    "fetch": (PLATFORM_HTTP_TOOL, DOWNLOAD_ATTACHMENT_TOOL, EXTRACT_TASK_FIELDS_TOOL),
     "submit": (PREVIEW_SUBMISSION_TOOL, SUBMIT_RESULT_TOOL),
     "skip": (SKIP_TOOL,),
     "plan": (),

@@ -3,7 +3,9 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import shutil
 from dataclasses import dataclass
+from pathlib import Path, PurePosixPath
 from typing import Mapping
 from urllib.parse import urljoin
 
@@ -515,11 +517,87 @@ class PromptPlatformAdapter:
         self.client = client or httpx.AsyncClient(timeout=30.0, follow_redirects=True)
         self._owns_client = client is None
         self._frozen_requests: dict[str, dict[str, object]] = {}
+        self._runtime_root: Path | None = None
+
+    def set_runtime_root(self, runtime_root: Path) -> None:
+        self._runtime_root = runtime_root.resolve()
+        (self._runtime_root / "staging").mkdir(parents=True, exist_ok=True)
+
+    def _relative_staging_path(self, value: object) -> PurePosixPath:
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("destination_relative_path is required")
+        relative = PurePosixPath(value.replace("\\", "/"))
+        if relative.is_absolute() or ".." in relative.parts:
+            raise ValueError("attachment destination must stay in staging")
+        return relative
 
     async def close(self) -> None:
         if self._owns_client:
             await self.client.aclose()
         self._frozen_requests.clear()
+        if self._runtime_root is not None:
+            shutil.rmtree(self._runtime_root / "staging", ignore_errors=True)
+
+    async def download_attachment(self, arguments: Mapping[str, object]) -> dict[str, object]:
+        if self._runtime_root is None:
+            raise ValueError("prompt runtime root is not configured")
+        relative = self._relative_staging_path(arguments.get("destination_relative_path"))
+        target = self._runtime_root / "staging" / Path(*relative.parts)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            response = await self.client.get(
+                str(arguments.get("url_or_path", "")),
+                headers=arguments.get("headers"),
+                timeout=120,
+            )
+            response.raise_for_status()
+            target.write_bytes(response.content)
+        except (httpx.HTTPError, OSError, ValueError) as exc:
+            return {"status": "retryable_error", "category": "attachment_error", "message": type(exc).__name__}
+        return {
+            "status": "downloaded",
+            "relative_path": relative.as_posix(),
+            "size_bytes": target.stat().st_size,
+            "content_type": response.headers.get("Content-Type", "application/octet-stream"),
+        }
+
+    async def extract_task_fields(self, arguments: Mapping[str, object]) -> dict[str, object]:
+        response = arguments.get("response")
+        mapping = arguments.get("mapping")
+        if not isinstance(response, Mapping) or not isinstance(mapping, Mapping):
+            raise ValueError("response and mapping must be objects")
+        def read(path: object, default: object = None) -> object:
+            if path is None:
+                return default
+            return _extract(response, str(path))
+        try:
+            return {
+                "status": "ok",
+                "external_id": read(mapping.get("external_id_path", "id")),
+                "name": read(mapping.get("name_path", "name")),
+                "goal": read(mapping.get("goal_path", "goal")),
+                "origin": read(mapping.get("origin_path", "origin")),
+                "hints": read(mapping.get("hints_path", "hints"), []),
+                "metadata": dict(response),
+            }
+        except (KeyError, IndexError, TypeError, ValueError) as exc:
+            return {"status": "fatal_error", "message": f"task field extraction failed: {exc}"}
+
+    def promote_attachments(self, external_id: str, paths: object) -> tuple[Path, ...]:
+        if self._runtime_root is None or not isinstance(paths, (list, tuple)):
+            return ()
+        destination = self._runtime_root / "tasks" / external_id
+        promoted: list[Path] = []
+        for item in paths:
+            relative = self._relative_staging_path(item)
+            source = self._runtime_root / "staging" / Path(*relative.parts)
+            if not source.is_file():
+                continue
+            target = destination / Path(*relative.parts)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(source), str(target))
+            promoted.append(target)
+        return tuple(promoted)
 
     async def platform_http_request(self, arguments: Mapping[str, object]) -> dict[str, object]:
         try:

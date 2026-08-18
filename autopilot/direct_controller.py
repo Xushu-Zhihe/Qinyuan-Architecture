@@ -63,7 +63,7 @@ class DirectLLMController:
         if self._owns_client:
             await self.client.aclose()
 
-    async def preflight(self) -> dict[str, object]:
+    async def preflight(self, *, cancel_event: asyncio.Event | None = None) -> dict[str, object]:
         readiness_tool = {
             "type": "function",
             "function": {
@@ -82,6 +82,7 @@ class DirectLLMController:
                 {"role": "user", "content": "Check tool-call support."},
             ],
             (readiness_tool,),
+            cancel_event=cancel_event,
         )
         try:
             message = payload["choices"][0]["message"]
@@ -94,7 +95,7 @@ class DirectLLMController:
             raise DirectControllerError("controller API does not support required tools/tool_calls")
         return {"status": "valid", "model": payload.get("model", self.config.model)}
 
-    async def validate_prompt(self, prompt: str) -> dict[str, object]:
+    async def validate_prompt(self, prompt: str, *, cancel_event: asyncio.Event | None = None) -> dict[str, object]:
         """Assess a platform contract without exposing any platform tools."""
         if not isinstance(prompt, str) or not prompt.strip():
             raise DirectControllerError("platform prompt is required")
@@ -113,6 +114,7 @@ class DirectLLMController:
                 {"role": "user", "content": prompt},
             ],
             (),
+            cancel_event=cancel_event,
         )
         try:
             message = response["choices"][0]["message"]
@@ -130,8 +132,8 @@ class DirectLLMController:
         except (KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError) as exc:
             raise DirectControllerError(f"invalid prompt completeness response: {exc}") from exc
 
-    async def prompt_phase(self, phase: str, instruction: str, handler: Callable[[str, Mapping[str, object]], Awaitable[object]]) -> PlatformResult:
-        content, tool_results = await self._tool_loop(phase, instruction, handler)
+    async def prompt_phase(self, phase: str, instruction: str, handler: Callable[[str, Mapping[str, object]], Awaitable[object]], *, cancel_event: asyncio.Event | None = None) -> PlatformResult:
+        content, tool_results = await self._tool_loop(phase, instruction, handler, cancel_event=cancel_event)
         try:
             payload = json.loads(content)
             if not isinstance(payload, dict) or payload.get("protocol_version") != 2:
@@ -191,7 +193,7 @@ class DirectLLMController:
         except (json.JSONDecodeError, TypeError, ValueError) as exc:
             raise DirectControllerError(f"invalid controller action: {exc}") from exc
 
-    async def plan_submission(self, task: AutoTask, goal_result, *, rejection: str | None = None) -> SubmissionPlan:
+    async def plan_submission(self, task: AutoTask, goal_result, *, rejection: str | None = None, cancel_event: asyncio.Event | None = None) -> SubmissionPlan:
         instruction = {
             "phase": "plan_submission",
             "task": {"external_id": task.external_id, "name": task.name},
@@ -207,7 +209,7 @@ class DirectLLMController:
                 "json_value": None, "named_values": {}, "form_fields": [],
             },
         }
-        content, _called_tools = await self._tool_loop("plan", json.dumps(instruction, ensure_ascii=False), self._no_tools)
+        content, _called_tools = await self._tool_loop("plan", json.dumps(instruction, ensure_ascii=False), self._no_tools, cancel_event=cancel_event)
         try:
             plan = SubmissionPlan.from_dict(json.loads(content))
         except (json.JSONDecodeError, TypeError, ValueError) as exc:
@@ -223,7 +225,7 @@ class DirectLLMController:
     async def _no_tools(_name: str, _arguments: Mapping[str, object]) -> object:
         raise DirectControllerError("tools are unavailable in this phase")
 
-    async def _tool_loop(self, phase: str, instruction: str, handler) -> tuple[str, dict[str, list[dict[str, object]]]]:
+    async def _tool_loop(self, phase: str, instruction: str, handler, *, cancel_event: asyncio.Event | None = None) -> tuple[str, dict[str, list[dict[str, object]]]]:
         if phase not in PHASE_TOOLS:
             raise DirectControllerError("unknown controller phase")
         messages: list[dict[str, object]] = [
@@ -238,7 +240,7 @@ class DirectLLMController:
         }
         tool_results: dict[str, list[dict[str, object]]] = {}
         for _ in range(self.config.max_rounds):
-            response = await self._completion(messages, tools)
+            response = await self._completion(messages, tools, cancel_event=cancel_event)
             choices = response.get("choices")
             if not isinstance(choices, list) or not choices:
                 raise DirectControllerError("controller response has no choices")
@@ -291,7 +293,7 @@ class DirectLLMController:
                 parts.append(text)
         return "\n".join(parts).strip()
 
-    async def _completion(self, messages, tools) -> dict[str, object]:
+    async def _completion(self, messages, tools, *, cancel_event: asyncio.Event | None = None) -> dict[str, object]:
         request_id = f"controller-{uuid4().hex}"
         headers = {
             "Authorization": f"Bearer {self.secret.api_key}",
@@ -313,7 +315,24 @@ class DirectLLMController:
         data = None
         for attempt in range(3):
             try:
-                response = await self.client.post(self.config.chat_completions_url, headers=headers, json=payload)
+                request_task = asyncio.create_task(
+                    self.client.post(self.config.chat_completions_url, headers=headers, json=payload)
+                )
+                if cancel_event is None:
+                    response = await request_task
+                else:
+                    cancel_task = asyncio.create_task(cancel_event.wait())
+                    done, _ = await asyncio.wait(
+                        {request_task, cancel_task},
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    if cancel_task in done and cancel_event.is_set():
+                        request_task.cancel()
+                        await asyncio.gather(request_task, return_exceptions=True)
+                        raise asyncio.CancelledError
+                    cancel_task.cancel()
+                    await asyncio.gather(cancel_task, return_exceptions=True)
+                    response = await request_task
                 response.raise_for_status()
                 data = response.json()
                 break

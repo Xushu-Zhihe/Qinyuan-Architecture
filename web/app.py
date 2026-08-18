@@ -405,12 +405,19 @@ def create_app(
             warnings.append("skip endpoint is not configured")
         if config.outcomes.submit_accepted is None:
             warnings.append("submit accepted outcome is not configured")
-        return {
+        result = {
             "ok": True,
             "status": "warning" if warnings else "valid",
             "category": "structured_platform",
             "warnings": warnings,
         }
+        if payload.sample_response is not None:
+            result["mapping_preview"] = StructuredPlatformAdapter.preview_mapping(
+                config, payload.sample_response
+            )
+            if result["mapping_preview"]["status"] == "invalid":
+                result["status"] = "invalid"
+        return result
 
     @app.post("/api/autopilot/test-platform-health")
     async def test_autopilot_platform_health(payload: StructuredPlatformValidation):

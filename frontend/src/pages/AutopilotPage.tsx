@@ -4,7 +4,7 @@ import { useEffect, useMemo, useState } from 'react'
 import { api } from '../api/client'
 import { AutopilotControllerFields } from '../components/AutopilotControllerFields'
 import { StructuredPlatformForm } from '../components/StructuredPlatformForm'
-import type { AutopilotSnapshot, AutopilotStartPayload, ControllerInput, StructuredPlatformInput, ValidationResult } from '../types'
+import type { AutopilotSnapshot, AutopilotStartPayload, ControllerInput, PlatformValidationPayload, StructuredPlatformInput, ValidationResult } from '../types'
 
 const statusLabel: Record<string, string> = {
   starting: '启动中', queued: '等待取题', fetched: '已取题', solving: '解题中', solver_achieved: '已生成结果',
@@ -35,6 +35,7 @@ export function AutopilotPage({ onBack, onOpenProject }: { onBack: () => void; o
   const [controller, setController] = useState(defaultController)
   const [prompt, setPrompt] = useState('')
   const [structured, setStructured] = useState(defaultStructured)
+  const [sampleResponse, setSampleResponse] = useState('')
   const [solvers, setSolvers] = useState<string[]>([])
   const [agentLimit, setAgentLimit] = useState(1)
   const [maxTasks, setMaxTasks] = useState(10)
@@ -80,9 +81,20 @@ export function AutopilotPage({ onBack, onOpenProject }: { onBack: () => void; o
   async function validatePlatform() {
     try {
       setBusy(true)
+      let structuredValidation: PlatformValidationPayload | null = null
+      if (mode === 'structured') {
+        structuredValidation = { mode, platform: structured }
+        if (sampleResponse.trim()) {
+          try {
+            structuredValidation.sample_response = JSON.parse(sampleResponse)
+          } catch {
+            throw new Error('样例响应必须是有效 JSON')
+          }
+        }
+      }
       setPlatformValidation(mode === 'prompt'
         ? await api.validateAutopilotPrompt(controller, prompt)
-        : await api.validateAutopilotPlatform({ mode, platform: structured }))
+        : await api.validateAutopilotPlatform(structuredValidation!))
       setError(null)
     } catch (caught) { setPlatformValidation(null); setError(caught instanceof Error ? caught.message : String(caught)) }
     finally { setBusy(false) }
@@ -130,7 +142,7 @@ export function AutopilotPage({ onBack, onOpenProject }: { onBack: () => void; o
       <section className="auto-panel auto-config-panel">
         <div className="auto-panel-heading"><div><span className="auto-panel-kicker">CONNECTION</span><h2>连接配置</h2></div><div className="mode-segments" role="group" aria-label="平台接入模式"><button className={mode === 'prompt' ? 'is-active' : ''} onClick={() => setMode('prompt')} disabled={active}><MessageSquareText size={15} /> Prompt</button><button className={mode === 'structured' ? 'is-active' : ''} onClick={() => setMode('structured')} disabled={active}><FileJson2 size={15} /> 结构化 API</button></div></div>
         <AutopilotControllerFields value={controller} disabled={active || busy} validation={controllerValidation} onChange={value => { setController(value); setControllerValidation(null) }} onTest={() => void testController()} />
-        <section className="auto-config-section"><div className="auto-section-heading"><h3>平台</h3><div className="auto-inline-actions"><button className="secondary-button" type="button" onClick={() => void validatePlatform()} disabled={active || busy || !platformReady}>验证配置</button>{mode === 'structured' && structured.health_check !== null && <button className="secondary-button" type="button" onClick={() => void testPlatformHealth()} disabled={active || busy || !structured.base_url.trim()}>测试健康接口</button>}</div></div>{mode === 'prompt' ? <label className="auto-field auto-field--full"><span>平台说明 prompt</span><textarea value={prompt} onChange={event => { setPrompt(event.target.value); setPlatformValidation(null) }} placeholder="平台协议说明：URL、认证、取题、提交、结果判断与放弃规则" rows={9} disabled={active} /></label> : <StructuredPlatformForm value={structured} disabled={active} onChange={value => { setStructured(value); setPlatformValidation(null) }} />}{platformValidation && <p className={`validation-state validation-state--${platformValidation.status}`}>{platformValidation.status === 'valid' ? '配置有效' : [...(platformValidation.missing ?? []).map(item => `缺少：${item}`), ...(platformValidation.warnings ?? [])].join('；')}</p>}</section>
+        <section className="auto-config-section"><div className="auto-section-heading"><h3>平台</h3><div className="auto-inline-actions"><button className="secondary-button" type="button" onClick={() => void validatePlatform()} disabled={active || busy || !platformReady}>验证配置</button>{mode === 'structured' && structured.health_check !== null && <button className="secondary-button" type="button" onClick={() => void testPlatformHealth()} disabled={active || busy || !structured.base_url.trim()}>测试健康接口</button>}</div></div>{mode === 'prompt' ? <label className="auto-field auto-field--full"><span>平台说明 prompt</span><textarea value={prompt} onChange={event => { setPrompt(event.target.value); setPlatformValidation(null) }} placeholder="平台协议说明：URL、认证、取题、提交、结果判断与放弃规则" rows={9} disabled={active} /></label> : <><StructuredPlatformForm value={structured} disabled={active} onChange={value => { setStructured(value); setPlatformValidation(null) }} /><label className="auto-field auto-field--full"><span>样例响应 JSON（可选）</span><textarea value={sampleResponse} onChange={event => { setSampleResponse(event.target.value); setPlatformValidation(null) }} placeholder="粘贴不含 token 的 fetch 样例响应" rows={6} disabled={active} /></label></>}{platformValidation && <p className={`validation-state validation-state--${platformValidation.status}`}>{platformValidation.status === 'valid' ? (platformValidation.mapping_preview ? '配置与样例映射有效' : '配置有效') : [...(platformValidation.missing ?? []).map(item => `缺少：${item}`), ...(platformValidation.warnings ?? []), ...(platformValidation.mapping_preview?.errors ?? [])].join('；')}</p>}</section>
         <section className="auto-config-section"><div className="auto-fields-grid"><label className="auto-field"><span>每题超时（分钟）</span><input type="number" min={1} max={1440} value={timeoutMinutes} onChange={event => setTimeoutMinutes(Number(event.target.value))} disabled={active} /></label><label className="auto-field"><span>最多题数</span><input type="number" min={1} max={1000} value={maxTasks} onChange={event => setMaxTasks(Number(event.target.value))} disabled={active} /></label><label className="auto-field"><span>平台拒绝后</span><select value={rejectedAction} onChange={event => setRejectedAction(event.target.value as typeof rejectedAction)} disabled={active}><option value="fail">终止</option><option value="replan">重新规划</option><option value="skip">跳过</option></select></label></div><fieldset className="auto-provider-choices"><legend>Solver providers</legend>{available.map(provider => { const capability = snapshot?.provider_capabilities?.[provider]; const ready = capability?.auto_ready ?? true; return <label key={provider} className="choice-row"><input type="checkbox" checked={solvers.includes(provider)} onChange={() => toggleSolver(provider)} disabled={active || !ready} /><span>{provider}</span>{!ready && <small>{capability?.status ?? 'legacy-only'}</small>}</label> })}</fieldset><label className="auto-field"><span>每题 Agent 数量</span><input type="number" min={1} max={Math.max(1, solvers.length)} value={selectedLimit} onChange={event => setAgentLimit(Number(event.target.value))} disabled={active || solvers.length === 0} /></label></section>
         <div className="auto-actions"><button className="primary-button" onClick={() => void start()} disabled={!canStart}>{busy ? '处理中...' : '启动全自动'}</button><button className="danger-button" onClick={() => void stop()} disabled={!active || busy}><Square size={16} /> 停止</button></div>
       </section>

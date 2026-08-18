@@ -270,6 +270,7 @@ class PromptPlatformValidation(BaseModel):
 class StructuredPlatformValidation(BaseModel):
     mode: Literal["structured"]
     platform: StructuredPlatformPayload
+    sample_response: object | None = None
 
 
 PlatformValidation = Annotated[

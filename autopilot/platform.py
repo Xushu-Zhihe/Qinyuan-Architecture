@@ -122,6 +122,34 @@ class StructuredPlatformAdapter:
         self._terminal_tasks: dict[str, str] = {}
         self._seen_task_ids: set[str] = set()
 
+    @staticmethod
+    def preview_mapping(config: StructuredPlatformConfig, sample_response: object) -> dict[str, object]:
+        adapter = object.__new__(StructuredPlatformAdapter)
+        adapter.config = config
+        try:
+            task = adapter._map_task(sample_response)
+        except (KeyError, IndexError, TypeError, ValueError) as exc:
+            return {"status": "invalid", "errors": [str(exc)]}
+        outcomes = config.outcomes
+        return {
+            "status": "valid",
+            "task": {
+                "external_id": task.external_id,
+                "name": task.name,
+                "goal": task.goal,
+                "origin": task.origin,
+                "hints": list(task.hints),
+                "lease_id": task.lease_id,
+            },
+            "configured_outcomes": {
+                "fetch_finished": outcomes.fetch_finished is not None,
+                "fetch_empty": outcomes.fetch_empty is not None,
+                "submit_accepted": outcomes.submit_accepted is not None,
+                "submit_rejected": outcomes.submit_rejected is not None,
+                "skip_succeeded": outcomes.skip_succeeded is not None,
+            },
+        }
+
     async def close(self) -> None:
         if self._owns_client:
             await self.client.aclose()

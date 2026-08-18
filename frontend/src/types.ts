@@ -397,7 +397,7 @@ export type AutopilotStartPayload =
 
 export type PlatformValidationPayload =
   | { mode: 'prompt'; platform: { prompt: string } }
-  | { mode: 'structured'; platform: StructuredPlatformInput }
+  | { mode: 'structured'; platform: StructuredPlatformInput; sample_response?: unknown }
 
 export interface ValidationResult {
   ok: boolean
@@ -406,4 +406,5 @@ export interface ValidationResult {
   model?: string
   warnings?: string[]
   missing?: string[]
+  mapping_preview?: { status: string; errors?: string[]; task?: Record<string, unknown>; configured_outcomes?: Record<string, boolean> }
 }

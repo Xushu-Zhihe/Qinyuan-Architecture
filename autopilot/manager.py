@@ -191,6 +191,8 @@ class AutoManager:
                 runtime_root.mkdir(parents=True, exist_ok=False)
                 session = AutoSession(session_id, config, runtime_root)
                 self._session = session
+                if self._controller is not None and hasattr(self._controller, "set_runtime_root"):
+                    self._controller.set_runtime_root(runtime_root)
                 if isinstance(self._adapter, PromptPlatformAdapter):
                     self._adapter.set_runtime_root(runtime_root)
                 self._cancel_event = asyncio.Event()
@@ -678,11 +680,26 @@ class AutoManager:
                 if str(arguments.get("project_id", "")) != str(session.current_project_id or ""):
                     raise ValueError("project_id is not the current solver project")
                 limit = max(1, min(int(arguments.get("limit", 20)), 50))
+                relation = arguments.get("relation")
+                if relation not in {None, "", "supports_goal", "goal_result"}:
+                    raise ValueError("unsupported fact relation")
+                cursor_value = arguments.get("cursor")
+                try:
+                    start = max(0, int(cursor_value or 0))
+                except (TypeError, ValueError) as exc:
+                    raise ValueError("invalid fact cursor") from exc
                 facts = [
-                    {"id": fact.id, "content": fact.content, "relation": "supports_goal"}
-                    for fact in goal_result.supporting_facts
+                    {"id": goal_result.fact.id, "content": goal_result.fact.content, "relation": "goal_result"},
+                    *[
+                        {"id": fact.id, "content": fact.content, "relation": "supports_goal"}
+                        for fact in goal_result.supporting_facts
+                    ],
                 ]
-                return {"status": "ready", "facts": facts[:limit], "next_cursor": None}
+                if relation:
+                    facts = [fact for fact in facts if fact["relation"] == relation]
+                page = facts[start : start + limit]
+                next_cursor = str(start + limit) if start + limit < len(facts) else None
+                return {"status": "ready", "facts": page, "next_cursor": next_cursor}
             if name == "preview_submission":
                 request = arguments.get("request")
                 if not isinstance(request, dict):

@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import shutil
 from uuid import uuid4
+from pathlib import Path
 from typing import Awaitable, Callable, Mapping
 
 import httpx
@@ -58,6 +60,22 @@ class DirectLLMController:
         self.secret = secret
         self.client = client or httpx.AsyncClient(timeout=config.timeout_seconds)
         self._owns_client = client is None
+        self._runtime_root: Path | None = None
+
+    def set_runtime_root(self, runtime_root: Path) -> None:
+        self._runtime_root = runtime_root.resolve()
+
+    def _create_call_root(self) -> Path | None:
+        if self._runtime_root is None:
+            return None
+        call_root = self._runtime_root / "calls" / f"controller-{uuid4().hex}"
+        call_root.mkdir(parents=True, exist_ok=False)
+        return call_root
+
+    @staticmethod
+    def _remove_call_root(call_root: Path | None) -> None:
+        if call_root is not None:
+            shutil.rmtree(call_root, ignore_errors=True)
 
     async def close(self) -> None:
         if self._owns_client:
@@ -76,14 +94,19 @@ class DirectLLMController:
                 },
             },
         }
-        payload = await self._completion(
-            [
-                {"role": "system", "content": "Call controller_readiness exactly once."},
-                {"role": "user", "content": "Check tool-call support."},
-            ],
-            (readiness_tool,),
-            cancel_event=cancel_event,
-        )
+        call_root = self._create_call_root()
+        try:
+            payload = await self._completion(
+                [
+                    {"role": "system", "content": "Call controller_readiness exactly once."},
+                    {"role": "user", "content": "Check tool-call support."},
+                ],
+                (readiness_tool,),
+                cancel_event=cancel_event,
+                call_root=call_root,
+            )
+        finally:
+            self._remove_call_root(call_root)
         try:
             message = payload["choices"][0]["message"]
             calls = message["tool_calls"]
@@ -99,23 +122,28 @@ class DirectLLMController:
         """Assess a platform contract without exposing any platform tools."""
         if not isinstance(prompt, str) or not prompt.strip():
             raise DirectControllerError("platform prompt is required")
-        response = await self._completion(
-            [
-                {
-                    "role": "system",
-                    "content": (
-                        "Assess the supplied platform protocol description offline. "
-                        "Do not call tools or access the network. Return strict JSON "
-                        "with status (valid|warning|invalid), missing (string array), "
-                        "and warnings (string array). Check fetch, submit, outcome, "
-                        "and skip/release instructions."
-                    ),
-                },
-                {"role": "user", "content": prompt},
-            ],
-            (),
-            cancel_event=cancel_event,
-        )
+        call_root = self._create_call_root()
+        try:
+            response = await self._completion(
+                [
+                    {
+                        "role": "system",
+                        "content": (
+                            "Assess the supplied platform protocol description offline. "
+                            "Do not call tools or access the network. Return strict JSON "
+                            "with status (valid|warning|invalid), missing (string array), "
+                            "and warnings (string array). Check fetch, submit, outcome, "
+                            "and skip/release instructions."
+                        ),
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                (),
+                cancel_event=cancel_event,
+                call_root=call_root,
+            )
+        finally:
+            self._remove_call_root(call_root)
         try:
             message = response["choices"][0]["message"]
             result = json.loads(self._message_text(message.get("content")))
@@ -228,55 +256,59 @@ class DirectLLMController:
     async def _tool_loop(self, phase: str, instruction: str, handler, *, cancel_event: asyncio.Event | None = None) -> tuple[str, dict[str, list[dict[str, object]]]]:
         if phase not in PHASE_TOOLS:
             raise DirectControllerError("unknown controller phase")
-        messages: list[dict[str, object]] = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": instruction},
-        ]
-        tools = PHASE_TOOLS[phase]
-        allowed_tools = {
-            item.get("function", {}).get("name")
-            for item in tools
-            if isinstance(item, dict)
-        }
-        tool_results: dict[str, list[dict[str, object]]] = {}
-        for _ in range(self.config.max_rounds):
-            response = await self._completion(messages, tools, cancel_event=cancel_event)
-            choices = response.get("choices")
-            if not isinstance(choices, list) or not choices:
-                raise DirectControllerError("controller response has no choices")
-            message = choices[0].get("message")
-            if not isinstance(message, dict):
-                raise DirectControllerError("controller response message is invalid")
-            tool_calls = message.get("tool_calls") or []
-            messages.append(message)
-            if not tool_calls:
-                content = self._message_text(message.get("content"))
-                if not content:
-                    raise DirectControllerError("controller returned no action")
-                return content, tool_results
-            if not tools:
-                raise DirectControllerError("controller API attempted a tool call in a tool-free phase")
-            for call in tool_calls:
-                if not isinstance(call, Mapping) or not str(call.get("id", "")).strip():
-                    raise DirectControllerError("tool call is missing tool_call_id")
-                function = call.get("function", {})
-                if not isinstance(function, Mapping):
-                    raise DirectControllerError("tool call function is invalid")
-                name = str(function.get("name", ""))
-                if name not in allowed_tools:
-                    raise DirectControllerError(f"controller requested unavailable tool: {name}")
-                try:
-                    arguments = json.loads(function.get("arguments", "{}"))
-                    if not isinstance(arguments, Mapping):
-                        raise ValueError("tool arguments must be a JSON object")
-                    result = await handler(name, arguments)
-                except Exception as exc:
-                    result = {"status": "tool_error", "message": str(exc)}
-                if not isinstance(result, Mapping):
-                    result = {"status": "tool_error", "message": "tool returned non-object"}
-                tool_results.setdefault(name, []).append(dict(result))
-                messages.append({"role": "tool", "tool_call_id": call["id"], "content": json.dumps(result, ensure_ascii=False)})
-        raise DirectControllerError("controller exceeded max_rounds")
+        call_root = self._create_call_root()
+        try:
+            messages: list[dict[str, object]] = [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": instruction},
+            ]
+            tools = PHASE_TOOLS[phase]
+            allowed_tools = {
+                item.get("function", {}).get("name")
+                for item in tools
+                if isinstance(item, dict)
+            }
+            tool_results: dict[str, list[dict[str, object]]] = {}
+            for _ in range(self.config.max_rounds):
+                response = await self._completion(messages, tools, cancel_event=cancel_event, call_root=call_root)
+                choices = response.get("choices")
+                if not isinstance(choices, list) or not choices:
+                    raise DirectControllerError("controller response has no choices")
+                message = choices[0].get("message")
+                if not isinstance(message, dict):
+                    raise DirectControllerError("controller response message is invalid")
+                tool_calls = message.get("tool_calls") or []
+                messages.append(message)
+                if not tool_calls:
+                    content = self._message_text(message.get("content"))
+                    if not content:
+                        raise DirectControllerError("controller returned no action")
+                    return content, tool_results
+                if not tools:
+                    raise DirectControllerError("controller API attempted a tool call in a tool-free phase")
+                for call in tool_calls:
+                    if not isinstance(call, Mapping) or not str(call.get("id", "")).strip():
+                        raise DirectControllerError("tool call is missing tool_call_id")
+                    function = call.get("function", {})
+                    if not isinstance(function, Mapping):
+                        raise DirectControllerError("tool call function is invalid")
+                    name = str(function.get("name", ""))
+                    if name not in allowed_tools:
+                        raise DirectControllerError(f"controller requested unavailable tool: {name}")
+                    try:
+                        arguments = json.loads(function.get("arguments", "{}"))
+                        if not isinstance(arguments, Mapping):
+                            raise ValueError("tool arguments must be a JSON object")
+                        result = await handler(name, arguments)
+                    except Exception as exc:
+                        result = {"status": "tool_error", "message": str(exc)}
+                    if not isinstance(result, Mapping):
+                        result = {"status": "tool_error", "message": "tool returned non-object"}
+                    tool_results.setdefault(name, []).append(dict(result))
+                    messages.append({"role": "tool", "tool_call_id": call["id"], "content": json.dumps(result, ensure_ascii=False)})
+            raise DirectControllerError("controller exceeded max_rounds")
+        finally:
+            self._remove_call_root(call_root)
 
     @staticmethod
     def _message_text(content: object) -> str:
@@ -293,7 +325,7 @@ class DirectLLMController:
                 parts.append(text)
         return "\n".join(parts).strip()
 
-    async def _completion(self, messages, tools, *, cancel_event: asyncio.Event | None = None) -> dict[str, object]:
+    async def _completion(self, messages, tools, *, cancel_event: asyncio.Event | None = None, call_root: Path | None = None) -> dict[str, object]:
         request_id = f"controller-{uuid4().hex}"
         headers = {
             "Authorization": f"Bearer {self.secret.api_key}",
@@ -302,6 +334,8 @@ class DirectLLMController:
             **dict(self.config.extra_headers),
         }
         payload: dict[str, object] = {"model": self.config.model, "messages": messages, **self.config.extra_body}
+        if call_root is not None:
+            (call_root / "messages.json").write_text(json.dumps(messages, ensure_ascii=False), encoding="utf-8")
         if tools:
             payload["tools"] = list(tools)
             payload["tool_choice"] = "auto"

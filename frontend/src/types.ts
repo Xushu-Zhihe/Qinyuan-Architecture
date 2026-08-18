@@ -247,26 +247,161 @@ export interface AutoHistoryEntry {
   answer: string
   status: string
   message: string | null
+  result_ref?: string | null
+  result_fact_id?: string | null
+  reason_code?: string | null
+  attempt_count?: number
+}
+
+export interface ProviderCapability {
+  request_protocol_versions: number[]
+  result_protocol_versions: number[]
+  skill_mode: 'none' | 'inline' | 'required' | 'tool'
+  available_skills: string[]
+  validates_result_locally: boolean
+  supports_result_fact: boolean
+  schema_version: string | null
+  fixture_digest: string | null
+  auto_ready: boolean
+  status: string
 }
 
 export interface AutoSession {
   id: string
   status: string
-  controller_provider: string
+  mode?: 'prompt' | 'structured'
+  controller_provider?: string | null
+  controller?: { base_url: string; model: string } | null
   solver_providers: string[]
   available_providers: string[]
   agent_limit: number
   max_tasks: number
   completed_tasks: number
+  processed_tasks?: number
   current_external_id: string | null
   current_task_name: string | null
   current_project_id: string | null
   last_message: string | null
   last_error: string | null
+  current_task_status?: string | null
+  reason_code?: string | null
+  current_goal_result?: {
+    result_ref: string | null
+    fact_id: string | null
+    preview: string | null
+  } | null
+  current_attempt?: {
+    phase: string | null
+    retry_count: number
+    replan_count: number
+    plan_fingerprint: string | null
+  }
   history: AutoHistoryEntry[]
 }
 
 export interface AutopilotSnapshot {
   session: AutoSession | null
   providers: string[]
+  provider_capabilities?: Record<string, ProviderCapability>
+}
+
+export interface ControllerAdvancedInput {
+  timeout_seconds: number
+  max_rounds: number
+  temperature: number | null
+  max_output_tokens: number | null
+  reasoning_effort: string | null
+  extra_headers: Record<string, string>
+}
+
+export interface ControllerInput {
+  api_key: string
+  base_url: string
+  model: string
+  advanced: ControllerAdvancedInput
+}
+
+export interface EndpointInput {
+  method: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE'
+  path: string
+  query: Record<string, unknown>
+  headers: Record<string, string>
+  body: unknown
+  form: Record<string, string> | null
+  timeout_seconds: number
+  max_retries: number
+  retry_status_codes: number[]
+}
+
+export interface OutcomeConditionInput {
+  path?: string | null
+  equals?: unknown
+  status_codes?: number[]
+}
+
+export interface StructuredPlatformInput {
+  base_url: string
+  auth: {
+    type: 'bearer' | 'header' | 'query' | 'cookie'
+    token: string
+    header_name: string
+    prefix: string
+    parameter_name: string
+  }
+  default_headers: Record<string, string>
+  fetch_task: EndpointInput
+  task_info: EndpointInput | null
+  submit_result: EndpointInput
+  skip_task: EndpointInput | null
+  mapping: {
+    task_list_path: string | null
+    external_id_path: string
+    name_path: string
+    goal_path: string
+    origin_path: string
+    hints_path: string | null
+    hints_item_path: string | null
+    attachments_path: string | null
+    cursor_path: string | null
+    lease_id_path: string | null
+  }
+  outcomes: {
+    fetch: { finished: OutcomeConditionInput | null; empty: OutcomeConditionInput | null }
+    submit: { accepted: OutcomeConditionInput | null; rejected: OutcomeConditionInput | null; retryable: OutcomeConditionInput }
+    skip: { succeeded: OutcomeConditionInput | null }
+  }
+  health_check: EndpointInput | null
+  task_info_mode: 'always' | 'when_incomplete'
+  task_info_failure_action: 'fail_task' | 'use_fetch_payload' | 'skip_task'
+  initial_cursor: string | null
+}
+
+interface AutopilotStartCommon {
+  controller: ControllerInput
+  solver_providers: string[]
+  agent_limit: number
+  max_tasks: number
+  task_timeout_minutes: number
+  poll_interval_seconds: number
+  rejected_action: 'replan' | 'skip' | 'fail'
+  solver_failure_action: 'skip' | 'fail'
+  stop_active_task_action: 'leave' | 'skip'
+  max_replans_after_rejection: number
+  max_transport_retries: number
+}
+
+export type AutopilotStartPayload =
+  | (AutopilotStartCommon & { mode: 'prompt'; platform: { prompt: string } })
+  | (AutopilotStartCommon & { mode: 'structured'; platform: StructuredPlatformInput })
+
+export type PlatformValidationPayload =
+  | { mode: 'prompt'; platform: { prompt: string } }
+  | { mode: 'structured'; platform: StructuredPlatformInput }
+
+export interface ValidationResult {
+  ok: boolean
+  status: 'valid' | 'warning' | 'invalid'
+  category: string
+  model?: string
+  warnings?: string[]
 }

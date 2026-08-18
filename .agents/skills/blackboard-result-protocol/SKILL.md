@@ -1,53 +1,28 @@
 ---
 name: blackboard-result-protocol
-description: Use when executing a blackboard Intent, producing BLACKBOARD_RESULT output, or correcting protocol_error failures such as fact proposal must be an object.
+description: Use when executing a blackboard Intent and producing or correcting BLACKBOARD_RESULT v2 output.
 ---
 
-# Blackboard Result Protocol
+# Blackboard Result Protocol v2
 
-## Core Rule
+Finish with exactly one single-line `BLACKBOARD_RESULT: ` record followed by strict JSON. The object contains exactly `protocol_version`, `intent_id`, `facts`, `edges`, `goal_achieved`, and `goal_result_ref`.
 
-Finish with exactly one single-line `BLACKBOARD_RESULT: ` record whose suffix is strict JSON accepted by the project parser. Finding an answer does not bypass validation.
+Set `protocol_version` to `2`. Facts use `{"ref":"unique-ref","content":"non-empty fact"}`. Edges use `{"type":"addresses","from":"node-or-ref","to":"node-or-ref"}` and may use `supports`, `contradicts`, `derived_from`, `addresses`, `similar_to`, or `equivalent_to`.
 
-## Required Shape
+When the Goal is achieved, `goal_result_ref` identifies one self-contained Fact that fully answers the current Goal. That Fact must directly `addresses` the current Goal, either through an existing graph edge or an edge in this result. Evidence Facts may support it but must not be selected as the result. When the Goal is not achieved, set `goal_result_ref` to `null`.
 
-The JSON object must contain exactly:
+Before emitting the line, run:
 
-- `intent_id`: the assigned Intent ID.
-- `facts`: objects shaped `{"ref":"unique-temp-ref","content":"non-empty fact"}`.
-- `edges`: objects shaped `{"type":"supports","from":"node-or-ref","to":"node-or-ref"}`.
-- `goal_achieved`: JSON boolean.
-- `answer_key`: minimal canonical answer when achieved, otherwise string or null.
-- `final_answer`: non-empty string when achieved, otherwise string or null.
+`python <skill-directory>/scripts/validate_result.py --intent-id <id> --goal-node-id <goal-id> --existing-node <id>:<type> --existing-address <fact-id>:<goal-id> --file blackboard-result.json`
 
-`answer_key` is compared exactly across providers. Do not put explanation, Markdown,
-labels such as `Flag:`, or surrounding prose in it. Put those details in facts or
-`final_answer`.
-
-Allowed edge types: `supports`, `contradicts`, `derived_from`, `addresses`, `similar_to`, `equivalent_to`.
-
-Edges may reference existing graph node IDs or temporary fact refs declared in the same result. Use empty arrays when no facts or edges are needed.
-
-## Workflow
-
-1. Execute only the assigned Intent. Do not plan another Intent.
-2. Write the JSON object to `blackboard-result.json` without the protocol prefix.
-3. Run the bundled validator with the assigned Intent ID and every existing node ID referenced by an edge:
-
-   `python <skill-directory>/scripts/validate_result.py --intent-id <assigned-id> --existing-node-id <node-id> --file blackboard-result.json`
-
-4. Fix every validation error and rerun until it prints `valid`.
-5. Emit one final line: `BLACKBOARD_RESULT: ` followed by the compact JSON file content.
-
-## Valid Example
+Examples:
 
 ```text
-BLACKBOARD_RESULT: {"intent_id":"intent-1","facts":[{"ref":"flag-fact","content":"flag = flag{example}"}],"edges":[{"type":"supports","from":"flag-fact","to":"goal-1"}],"goal_achieved":true,"answer_key":"flag{example}","final_answer":"Flag: flag{example}"}
+BLACKBOARD_RESULT: {"protocol_version":2,"intent_id":"intent-1","facts":[{"ref":"result","content":"The requested explanation is ..."}],"edges":[{"type":"addresses","from":"result","to":"goal-1"}],"goal_achieved":true,"goal_result_ref":"result"}
+BLACKBOARD_RESULT: {"protocol_version":2,"intent_id":"intent-2","facts":[{"ref":"result","content":"{\"status\":\"complete\",\"count\":3}"}],"edges":[{"type":"addresses","from":"result","to":"goal-1"}],"goal_achieved":true,"goal_result_ref":"result"}
+BLACKBOARD_RESULT: {"protocol_version":2,"intent_id":"intent-3","facts":[{"ref":"result","content":"Final report"},{"ref":"evidence","content":"Verified observation"}],"edges":[{"type":"addresses","from":"result","to":"goal-1"},{"type":"supports","from":"evidence","to":"result"}],"goal_achieved":true,"goal_result_ref":"result"}
 ```
 
-## Invalid Forms
+Do not shorten the result to a flag or answer key. Do not wrap the protocol line in a Markdown fence.
 
-- `BLACKBOARD_RESULT: intent_id="intent-1" facts=[]` is key=value text, not JSON.
-- `"facts":["flag found"]` fails with `fact proposal must be an object`.
-- `"edges":[["fact-1","goal-1"]]` fails because every edge must be an object with `type`, `from`, and `to`.
-- Do not wrap the final protocol line in a Markdown fence.
+Validation failures use the same precise parser vocabulary, including `fact proposal must be an object`, `unknown node reference`, and rejection of Python `key=value` syntax.

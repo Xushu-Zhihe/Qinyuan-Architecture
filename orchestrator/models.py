@@ -62,6 +62,8 @@ class ExecutionUpdate:
     goal_achieved: bool
     final_answer: str | None
     answer_key: str | None = None
+    protocol_version: int = 1
+    goal_result_ref: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -134,3 +136,24 @@ class OrchestrationResult:
     @property
     def exit_code(self) -> int:
         return 0 if self.status == "achieved" else 1
+
+
+@dataclass(frozen=True, slots=True)
+class GoalResultFact:
+    id: str
+    content: str
+    sources: tuple[str, ...] = ()
+    produced_by_intent_id: str | None = None
+    produced_by_execution_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class GoalResult:
+    project_id: str
+    goal_version: int
+    goal_node_id: str
+    result_ref: str
+    fact: GoalResultFact
+    supporting_facts: tuple[GoalResultFact, ...] = ()
+    supporting_providers: tuple[str, ...] = ()
+    completion_threshold: int = 1

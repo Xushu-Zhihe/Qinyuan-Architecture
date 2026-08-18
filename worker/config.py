@@ -5,11 +5,13 @@ from string import Formatter
 
 from worker.models import (
     AuditConfig,
+    CapabilityProbeConfig,
     ContainerBackendConfig,
     CoordinatorConfig,
     ExecutionConfig,
     HealthCheckConfig,
     ProviderConfig,
+    ProviderCapabilities,
 )
 from worker.output_adapters import STREAM_FORMATS
 
@@ -122,6 +124,60 @@ def _parse_health_check(
     )
 
 
+def _parse_capability_probe(raw: object, provider_name: str) -> CapabilityProbeConfig | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ConfigError(f"provider {provider_name!r}.capability_probe must be an object")
+    command = raw.get("command")
+    if not isinstance(command, list) or not command or any(not isinstance(item, str) or not item for item in command):
+        raise ConfigError(f"provider {provider_name!r}.capability_probe.command must be a non-empty list of strings")
+    _validate_placeholders(provider_name, command)
+    return CapabilityProbeConfig(
+        command=tuple(command),
+        timeout_seconds=_positive_number(raw.get("timeout_seconds"), f"provider {provider_name!r}.capability_probe.timeout_seconds"),
+    )
+
+
+def _protocol_versions(value: object, field: str) -> tuple[int, ...]:
+    if not isinstance(value, list) or not value or any(not isinstance(item, int) or isinstance(item, bool) or item < 1 for item in value):
+        raise ConfigError(f"{field} must be a non-empty list of positive integers")
+    return tuple(dict.fromkeys(value))
+
+
+def _parse_capabilities(raw: object, provider_name: str) -> ProviderCapabilities:
+    if raw is None:
+        return ProviderCapabilities()
+    if not isinstance(raw, dict):
+        raise ConfigError(f"provider {provider_name!r}.capabilities must be an object")
+    prefix = f"provider {provider_name!r}.capabilities"
+    skill_mode = raw.get("skill_mode", "inline")
+    if skill_mode not in {"none", "inline", "required", "tool"}:
+        raise ConfigError(f"{prefix}.skill_mode is invalid")
+    skills = raw.get("available_skills", [])
+    if not isinstance(skills, list) or any(not isinstance(item, str) or not item.strip() for item in skills):
+        raise ConfigError(f"{prefix}.available_skills must be a list of non-empty strings")
+    validates = raw.get("validates_result_locally", False)
+    supports = raw.get("supports_result_fact", False)
+    if not isinstance(validates, bool) or not isinstance(supports, bool):
+        raise ConfigError(f"{prefix} boolean capability fields must be booleans")
+    schema_version = raw.get("schema_version")
+    fixture_digest = raw.get("fixture_digest")
+    for value, field in ((schema_version, "schema_version"), (fixture_digest, "fixture_digest")):
+        if value is not None and (not isinstance(value, str) or not value.strip()):
+            raise ConfigError(f"{prefix}.{field} must be a non-empty string")
+    return ProviderCapabilities(
+        request_protocol_versions=_protocol_versions(raw.get("request_protocol_versions", [1]), f"{prefix}.request_protocol_versions"),
+        result_protocol_versions=_protocol_versions(raw.get("result_protocol_versions", [1]), f"{prefix}.result_protocol_versions"),
+        skill_mode=skill_mode,
+        available_skills=tuple(item.strip() for item in skills),
+        validates_result_locally=validates,
+        supports_result_fact=supports,
+        schema_version=schema_version,
+        fixture_digest=fixture_digest,
+    )
+
+
 def _parse_provider(raw: object, index: int) -> ProviderConfig:
     if not isinstance(raw, dict):
         raise ConfigError(f"providers[{index}] must be an object")
@@ -130,6 +186,7 @@ def _parse_provider(raw: object, index: int) -> ProviderConfig:
     enabled = raw.get("enabled")
     priority = raw.get("priority")
     command = raw.get("command")
+    protocol_arguments = raw.get("protocol_arguments", [])
     timeout = raw.get("timeout_seconds")
 
     if not isinstance(name, str) or not name.strip():
@@ -150,6 +207,13 @@ def _parse_provider(raw: object, index: int) -> ProviderConfig:
     ):
         raise ConfigError(
             f"provider {name!r}.command must be a non-empty list of strings"
+        )
+    if not isinstance(protocol_arguments, list) or any(
+        not isinstance(argument, str) or not argument
+        for argument in protocol_arguments
+    ):
+        raise ConfigError(
+            f"provider {name!r}.protocol_arguments must be a list of strings"
         )
     timeout = _positive_number(timeout, f"provider {name!r}.timeout_seconds")
     planning_timeout = raw.get(
@@ -175,6 +239,7 @@ def _parse_provider(raw: object, index: int) -> ProviderConfig:
         )
 
     _validate_placeholders(name, command)
+    _validate_placeholders(name, protocol_arguments)
     container_image = raw.get("container_image")
     if container_image is not None and (
         not isinstance(container_image, str) or not container_image.strip()
@@ -223,6 +288,9 @@ def _parse_provider(raw: object, index: int) -> ProviderConfig:
         ),
         stream_format=str(stream_format),
         streaming_supported=streaming_supported,
+        capabilities=_parse_capabilities(raw.get("capabilities"), name),
+        capability_probe=_parse_capability_probe(raw.get("capability_probe"), name),
+        protocol_arguments=tuple(protocol_arguments),
     )
 
 

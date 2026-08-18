@@ -3,18 +3,27 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import re
+from datetime import datetime, timezone
 from uuid import uuid4
 
 from autopilot.controller import AutoController, AutoControllerError
+from autopilot.direct_controller import DirectControllerError, DirectLLMController
 from autopilot.models import (
     AutoHistoryEntry,
     AutoSession,
     AutoStartConfig,
     AutoTask,
+    PromptPlatformConfig,
+    RuntimeControllerSecret,
+    RuntimePlatformSecret,
 )
+from autopilot.platform import PromptPlatformAdapter, StructuredPlatformAdapter
+from autopilot.platform_models import PlatformResult, StructuredPlatformConfig
 from orchestrator.projects import ProjectService
 from worker.models import AuditConfig, ProviderConfig
+from worker.capabilities import probe_provider_capabilities, static_capability_snapshot
 
 
 class AutoManagerError(RuntimeError):
@@ -25,6 +34,19 @@ _CREDENTIAL_PATTERN = re.compile(
     r"(?i)\b(?:token|api[_-]?key|secret|password)\s*[:=]\s*([^\s,;]+)"
 )
 _BEARER_PATTERN = re.compile(r"(?i)\bbearer\s+([^\s,;]+)")
+
+TASK_TRANSITIONS = {
+    None: {"queued"},
+    "queued": {"fetched", "waiting", "finished", "retry_wait", "failed"},
+    "fetched": {"solving", "skipped", "failed"},
+    "solving": {"solver_achieved", "skipped", "failed", "stopped"},
+    "solver_achieved": {"submit_pending", "failed"},
+    "submit_pending": {"accepted", "rejected", "retry_wait", "failed"},
+    "rejected": {"replanning", "skipped", "failed"},
+    "replanning": {"submit_pending", "skipped", "failed"},
+    "retry_wait": {"queued", "submit_pending", "failed", "stopped"},
+    "waiting": {"queued", "failed", "stopped"},
+}
 
 
 def _scrub_text(value: str, platform_prompt: str) -> str:
@@ -40,6 +62,10 @@ def _scrub_text(value: str, platform_prompt: str) -> str:
         scrubbed,
     )
     return _BEARER_PATTERN.sub("Bearer [redacted]", scrubbed)
+
+
+def _timestamp() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 class AutoManager:
@@ -61,22 +87,101 @@ class AutoManager:
         self._runner: asyncio.Task[None] | None = None
         self._cancel_event: asyncio.Event | None = None
         self._lock = asyncio.Lock()
+        self._controller: DirectLLMController | None = None
+        self._adapter: PromptPlatformAdapter | StructuredPlatformAdapter | None = None
+        self._controller_secret: RuntimeControllerSecret | None = None
+        self._platform_secret: RuntimePlatformSecret | None = None
+        self._provider_capabilities = {
+            name: static_capability_snapshot(provider)
+            for name, provider in self.providers.items()
+        }
 
-    async def start(self, config: AutoStartConfig) -> dict[str, object]:
+    async def start(
+        self,
+        config: AutoStartConfig,
+        controller_secret: RuntimeControllerSecret | None = None,
+        platform_secret: RuntimePlatformSecret | None = None,
+    ) -> dict[str, object]:
         async with self._lock:
             if self._is_active():
                 raise AutoManagerError("an automatic session is already running")
             self._validate_config(config)
+            if not config.is_legacy:
+                if controller_secret is None or not controller_secret.api_key.strip():
+                    raise AutoManagerError("controller api key is required")
+                assert config.controller is not None
+                try:
+                    self._controller_secret = controller_secret
+                    if platform_secret is None:
+                        platform_secret = RuntimePlatformSecret(
+                            prompt=(
+                                config.platform.prompt
+                                if isinstance(config.platform, PromptPlatformConfig)
+                                else ""
+                            )
+                        )
+                    self._platform_secret = platform_secret
+                    if (
+                        isinstance(config.platform, PromptPlatformConfig)
+                        and not platform_secret.prompt.strip()
+                    ):
+                        raise AutoManagerError("platform prompt is required")
+                    if isinstance(config.platform, PromptPlatformConfig):
+                        object.__setattr__(config.platform, "prompt", "")
+                    self._controller = DirectLLMController(config.controller, controller_secret)
+                    if isinstance(config.platform, PromptPlatformConfig):
+                        self._adapter = PromptPlatformAdapter(config.platform)
+                    elif isinstance(config.platform, StructuredPlatformConfig):
+                        self._adapter = StructuredPlatformAdapter(
+                            config.platform,
+                            secret=platform_secret,
+                        )
+                    else:
+                        raise AutoManagerError("platform configuration does not match mode")
+                    probed = await asyncio.gather(
+                        *(
+                            probe_provider_capabilities(self.providers[name])
+                            for name in config.solver_providers
+                        )
+                    )
+                    self._provider_capabilities.update(
+                        {name: result for name, result in zip(config.solver_providers, probed)}
+                    )
+                    incompatible = [
+                        name
+                        for name in config.solver_providers
+                        if not self._provider_capabilities[name].get("auto_ready", False)
+                    ]
+                    if incompatible:
+                        raise AutoManagerError(
+                            f"solver provider capability probe failed: {incompatible}"
+                        )
+                    await self._controller.preflight()
+                except asyncio.CancelledError:
+                    await self._dispose_modern_runtime()
+                    self._clear_config_platform_secret(config)
+                    raise
+                except Exception as exc:
+                    await self._dispose_modern_runtime()
+                    self._clear_config_platform_secret(config)
+                    raise AutoManagerError(str(exc)) from exc
             session_id = f"auto-{uuid4().hex}"
             runtime_root = (
                 self.service.registry.data_root / "autopilot" / session_id
             ).resolve()
-            runtime_root.mkdir(parents=True, exist_ok=False)
-            session = AutoSession(session_id, config, runtime_root)
-            self._session = session
-            self._cancel_event = asyncio.Event()
-            self._runner = asyncio.create_task(self._run(session, self._cancel_event))
-            return self._snapshot_locked()
+            try:
+                runtime_root.mkdir(parents=True, exist_ok=False)
+                session = AutoSession(session_id, config, runtime_root)
+                self._session = session
+                self._cancel_event = asyncio.Event()
+                self._runner = asyncio.create_task(
+                    self._run(session, self._cancel_event)
+                )
+                return self._snapshot_locked()
+            except Exception:
+                if not config.is_legacy:
+                    await self._dispose_modern_runtime()
+                raise
 
     async def stop(self) -> dict[str, object]:
         async with self._lock:
@@ -98,6 +203,8 @@ class AutoManager:
                 # The runner will report a stable stopped state; do not leak
                 # provider or platform details from a cleanup failure.
                 pass
+        if runner is not None and not runner.done():
+            runner.cancel()
         if runner is not None and runner is not asyncio.current_task():
             await asyncio.gather(runner, return_exceptions=True)
         async with self._lock:
@@ -129,6 +236,10 @@ class AutoManager:
                 self._session.snapshot(providers) if self._session is not None else None
             ),
             "providers": list(providers),
+            "provider_capabilities": {
+                name: self._provider_capabilities[name]
+                for name in self.providers
+            },
         }
 
     def _is_active(self) -> bool:
@@ -138,14 +249,29 @@ class AutoManager:
         available = {
             name for name, provider in self.providers.items() if provider.enabled
         }
-        selected = {config.controller_provider, *config.solver_providers}
+        selected = set(config.solver_providers)
+        if config.is_legacy:
+            selected.add(config.controller_provider)
         unknown = sorted(selected - available)
         if unknown:
             raise AutoManagerError(f"unknown or disabled providers: {unknown}")
         if len(set(config.solver_providers)) != len(config.solver_providers):
             raise AutoManagerError("solver providers must be unique")
+        if not config.is_legacy:
+            incompatible = [
+                name for name in config.solver_providers
+                if not static_capability_snapshot(self.providers[name])["auto_ready"]
+            ]
+            if incompatible:
+                raise AutoManagerError(f"solver providers are not auto-ready: {incompatible}")
 
     async def _run(self, session: AutoSession, cancel_event: asyncio.Event) -> None:
+        if session.config.is_legacy:
+            await self._run_legacy(session, cancel_event)
+        else:
+            await self._run_modern(session, cancel_event)
+
+    async def _run_legacy(self, session: AutoSession, cancel_event: asyncio.Event) -> None:
         session.status = "running"
         completed: list[str] = []
         try:
@@ -230,6 +356,391 @@ class AutoManager:
         finally:
             if session.status in {"finished", "failed", "stopped"}:
                 self._clear_prompt(session)
+
+    async def _run_modern(self, session: AutoSession, cancel_event: asyncio.Event) -> None:
+        seen_ids: set[str] = set()
+        try:
+            while session.processed_tasks < session.config.max_tasks:
+                if cancel_event.is_set():
+                    raise asyncio.CancelledError
+                self._transition(session, "queued")
+                fetched = await self._fetch_modern(session)
+                if fetched.status == "retryable_error":
+                    fetched = await self._retry_fetch(session, fetched, cancel_event)
+                if fetched.status == "wait":
+                    self._transition(session, "waiting", "platform_wait")
+                    await self._sleep_or_cancel(fetched.retry_after_seconds or session.config.poll_interval_seconds, cancel_event)
+                    self._transition(session, "queued")
+                    continue
+                if fetched.status == "finished":
+                    self._transition(session, "finished")
+                    session.last_message = fetched.message or "platform queue finished"
+                    break
+                if fetched.status == "skip_required" and isinstance(fetched.task, AutoTask):
+                    self._transition(session, "fetched", "task_info_skip_required")
+                    await self._skip_modern(
+                        session,
+                        fetched.task,
+                        fetched.message or "task info failed",
+                    )
+                    continue
+                if fetched.status != "task" or not isinstance(fetched.task, AutoTask):
+                    raise AutoManagerError(fetched.message or "platform fetch failed")
+                task = fetched.task
+                if task.external_id in seen_ids:
+                    raise AutoManagerError("platform returned a duplicate external_id")
+                seen_ids.add(task.external_id)
+                self._transition(session, "fetched")
+                self._transition(session, "solving")
+                try:
+                    await self._solve_task(session, task, cancel_event)
+                except AutoManagerError as exc:
+                    if session.config.solver_failure_action == "skip":
+                        await self._skip_modern(session, task, str(exc))
+                        continue
+                    raise
+                goal_result = self.service.get_goal_result(session.current_project_id or "")
+                if goal_result is None:
+                    raise AutoManagerError("solver project achieved without a Goal result Fact")
+                self._transition(session, "solver_achieved")
+                session.current_result_ref = goal_result.result_ref
+                session.current_result_fact_id = goal_result.fact.id
+                session.current_result_preview = goal_result.fact.content[:500]
+                assert self._controller is not None
+                plan = await self._controller.plan_submission(task, goal_result)
+                session.current_plan_fingerprint = plan.fingerprint
+                session.current_attempt_phase = "submit"
+                self._transition(session, "submit_pending")
+                submission, attempt_records = await self._submit_modern(
+                    session, task, goal_result, plan, cancel_event
+                )
+                replans = 0
+                while submission.status == "rejected" and session.config.rejected_action == "replan" and replans < session.config.max_replans_after_rejection:
+                    self._transition(session, "rejected", "platform_rejected")
+                    self._transition(session, "replanning")
+                    previous_fingerprint = plan.fingerprint
+                    plan = await self._controller.plan_submission(task, goal_result, rejection=submission.message or "rejected")
+                    if plan.fingerprint == previous_fingerprint:
+                        raise AutoManagerError(
+                            "submission replan did not change the frozen plan"
+                        )
+                    session.current_replan_count += 1
+                    session.current_plan_fingerprint = plan.fingerprint
+                    self._transition(session, "submit_pending")
+                    submission, added = await self._submit_modern(
+                        session, task, goal_result, plan, cancel_event
+                    )
+                    attempt_records.extend(added)
+                    replans += 1
+                if submission.status == "rejected":
+                    self._transition(session, "rejected", "platform_rejected")
+                    if session.config.rejected_action == "skip":
+                        await self._skip_modern(
+                            session,
+                            task,
+                            submission.message or "rejected",
+                            attempts=attempt_records,
+                        )
+                        continue
+                    self._append_terminal_history(
+                        session,
+                        task,
+                        "rejected",
+                        submission.message,
+                        "platform_rejected",
+                        attempt_records,
+                    )
+                    raise AutoManagerError("platform rejected the Goal result")
+                if submission.status != "accepted":
+                    self._append_terminal_history(
+                        session,
+                        task,
+                        "failed",
+                        submission.message,
+                        "platform_submission_failed",
+                        attempt_records,
+                    )
+                    raise AutoManagerError(submission.message or "platform submission failed")
+                self._transition(session, "accepted")
+                finished_at = _timestamp()
+                session.history.append(AutoHistoryEntry(
+                    external_id=task.external_id,
+                    name=task.name,
+                    project_id=session.current_project_id or "",
+                    answer="",
+                    status="accepted",
+                    message=submission.message,
+                    result_ref=goal_result.result_ref,
+                    result_fact_id=goal_result.fact.id,
+                    attempt_count=len(attempt_records),
+                    plan_fingerprints=tuple(
+                        dict.fromkeys(
+                            str(item["plan_fingerprint"])
+                            for item in attempt_records
+                        )
+                    ),
+                    attempts=tuple(attempt_records),
+                    accepted_at=finished_at,
+                    finished_at=finished_at,
+                ))
+                session.completed_tasks += 1
+                session.processed_tasks += 1
+                self._clear_current_task(session)
+            if session.status not in {"finished", "failed", "stopped"}:
+                session.status = "finished"
+                session.last_message = "maximum task limit reached"
+        except asyncio.CancelledError:
+            session.status = "stopped"
+            session.current_task_status = "stopped"
+            session.last_message = "automatic session stopped"
+        except (AutoManagerError, DirectControllerError) as exc:
+            session.status = "failed"
+            session.current_task_status = "failed"
+            session.last_error = str(exc)
+        except Exception as exc:
+            session.status = "failed"
+            session.current_task_status = "failed"
+            session.last_error = f"automatic session failed: {type(exc).__name__}"
+        finally:
+            await self._dispose_modern_runtime()
+            self._clear_runtime_platform_secret(session)
+
+    async def _fetch_modern(self, session: AutoSession) -> PlatformResult:
+        if isinstance(self._adapter, StructuredPlatformAdapter):
+            return await self._adapter.fetch_task()
+        if not isinstance(self._adapter, PromptPlatformAdapter) or self._controller is None:
+            raise AutoManagerError("prompt platform adapter is unavailable")
+
+        async def handler(name, arguments):
+            if name != "platform_http_request":
+                raise ValueError("tool is unavailable in fetch phase")
+            return await self._adapter.platform_http_request(arguments)
+
+        prompt = self._runtime_platform_prompt()
+        return await self._controller.prompt_phase(
+            "fetch",
+            prompt + "\nFetch exactly one task. Return protocol_version 2 action JSON.",
+            handler,
+        )
+
+    async def _retry_fetch(
+        self,
+        session: AutoSession,
+        result: PlatformResult,
+        cancel_event: asyncio.Event,
+    ) -> PlatformResult:
+        for attempt in range(session.config.max_transport_retries):
+            self._transition(session, "retry_wait", "platform_transport")
+            await self._sleep_or_cancel(result.retry_after_seconds or min(2 ** attempt, 30), cancel_event)
+            self._transition(session, "queued")
+            result = await self._fetch_modern(session)
+            if result.status != "retryable_error":
+                return result
+        raise AutoManagerError("platform fetch transport retries exhausted")
+
+    async def _submit_modern(
+        self,
+        session,
+        task,
+        goal_result,
+        plan,
+        cancel_event,
+    ) -> tuple[PlatformResult, list[dict[str, object]]]:
+        attempts: list[dict[str, object]] = []
+        result: PlatformResult | None = None
+        while len(attempts) <= session.config.max_transport_retries:
+            attempt_number = len(attempts) + 1
+            session.current_retry_count = attempt_number - 1
+            if isinstance(self._adapter, StructuredPlatformAdapter):
+                result = await self._adapter.submit_result(task, plan, goal_result)
+            else:
+                result = await self._submit_prompt(session, task, goal_result, plan)
+            attempts.append(
+                {
+                    "attempt": attempt_number,
+                    "phase": "transport",
+                    "status": result.status,
+                    "plan_fingerprint": plan.fingerprint,
+                    "result_ref": goal_result.result_ref,
+                    "source_fact_ids": list(plan.source_fact_ids),
+                    "content_type": plan.content_type,
+                    "reason_code": (
+                        "platform_transport"
+                        if result.status == "retryable_error"
+                        else "platform_rejected"
+                        if result.status == "rejected"
+                        else None
+                    ),
+                }
+            )
+            if result.status != "retryable_error":
+                return result, attempts
+            if len(attempts) > session.config.max_transport_retries:
+                break
+            self._transition(session, "retry_wait", "platform_transport")
+            await self._sleep_or_cancel(
+                result.retry_after_seconds or min(2 ** (attempt_number - 1), 30),
+                cancel_event,
+            )
+            self._transition(session, "submit_pending")
+        assert result is not None
+        return (
+            PlatformResult(
+                "fatal_error", message="submission transport retries exhausted"
+            ),
+            attempts,
+        )
+
+    async def _submit_prompt(self, session, task, goal_result, plan) -> PlatformResult:
+        if not isinstance(self._adapter, PromptPlatformAdapter) or self._controller is None:
+            raise AutoManagerError("prompt platform adapter is unavailable")
+
+        async def handler(name, arguments):
+            if name == "preview_submission":
+                request = arguments.get("request")
+                if not isinstance(request, dict):
+                    raise ValueError("preview requires request")
+                fingerprint = self._adapter.freeze_submission(request)
+                return {"valid": True, "plan_fingerprint": fingerprint}
+            if name == "submit_platform_result":
+                return await self._adapter.replay_submission(str(arguments.get("frozen_plan_fingerprint", "")))
+            raise ValueError("tool is unavailable in submit phase")
+
+        prompt = self._runtime_platform_prompt()
+        instruction = {
+            "platform_contract": prompt,
+            "task": {"external_id": task.external_id, "name": task.name},
+            "goal_result": {"result_ref": goal_result.result_ref, "content": goal_result.fact.content},
+            "submission_plan": plan.to_dict(),
+            "instruction": "Preview and submit this frozen plan once, then return accepted, rejected, retryable_error, or fatal_error action JSON.",
+        }
+        return await self._controller.prompt_phase("submit", json.dumps(instruction, ensure_ascii=False), handler)
+
+    async def _skip_modern(
+        self,
+        session: AutoSession,
+        task: AutoTask,
+        reason: str,
+        *,
+        attempts: list[dict[str, object]] | None = None,
+    ) -> None:
+        if isinstance(self._adapter, StructuredPlatformAdapter):
+            result = await self._adapter.skip_task(task, reason)
+        elif isinstance(self._adapter, PromptPlatformAdapter) and self._controller is not None:
+            async def handler(name, arguments):
+                if name != "skip_platform_task":
+                    raise ValueError("tool is unavailable in skip phase")
+                return await self._adapter.platform_http_request(arguments)
+            prompt = self._runtime_platform_prompt()
+            result = await self._controller.prompt_phase("skip", prompt + f"\nRelease task {task.external_id}. Return skipped only after confirmation.", handler)
+        else:
+            raise AutoManagerError("skip adapter is unavailable")
+        if result.status != "skipped":
+            raise AutoManagerError(result.message or "platform skip failed")
+        if session.current_task_status == "rejected":
+            self._transition(session, "skipped")
+        elif session.current_task_status in {"fetched", "solving"}:
+            self._transition(session, "skipped")
+        self._append_terminal_history(
+            session,
+            task,
+            "skipped",
+            reason,
+            "skipped",
+            attempts or [],
+        )
+        session.processed_tasks += 1
+        self._clear_current_task(session)
+
+    @staticmethod
+    def _append_terminal_history(
+        session: AutoSession,
+        task: AutoTask,
+        status: str,
+        message: str | None,
+        reason_code: str,
+        attempts: list[dict[str, object]],
+    ) -> None:
+        session.history.append(
+            AutoHistoryEntry(
+                external_id=task.external_id,
+                name=task.name,
+                project_id=session.current_project_id or "",
+                answer="",
+                status=status,
+                message=message,
+                result_ref=session.current_result_ref,
+                result_fact_id=session.current_result_fact_id,
+                reason_code=reason_code,
+                attempt_count=len(attempts),
+                plan_fingerprints=tuple(
+                    dict.fromkeys(
+                        str(item["plan_fingerprint"])
+                        for item in attempts
+                    )
+                ),
+                attempts=tuple(attempts),
+                finished_at=_timestamp(),
+            )
+        )
+
+    @staticmethod
+    def _transition(session: AutoSession, status: str, reason_code: str | None = None) -> None:
+        allowed = TASK_TRANSITIONS.get(session.current_task_status, set())
+        if status not in allowed:
+            raise AutoManagerError(f"invalid automatic task transition: {session.current_task_status} -> {status}")
+        session.current_task_status = status
+        session.current_reason_code = reason_code
+        session.status = status
+
+    @staticmethod
+    def _clear_current_task(session: AutoSession) -> None:
+        session.current_external_id = None
+        session.current_task_name = None
+        session.current_project_id = None
+        session.current_task_status = None
+        session.current_reason_code = None
+        session.current_result_ref = None
+        session.current_result_fact_id = None
+        session.current_result_preview = None
+        session.current_attempt_phase = None
+        session.current_retry_count = 0
+        session.current_replan_count = 0
+        session.current_plan_fingerprint = None
+
+    @staticmethod
+    def _clear_runtime_platform_secret(session: AutoSession) -> None:
+        AutoManager._clear_config_platform_secret(session.config)
+
+    @staticmethod
+    def _clear_config_platform_secret(config: AutoStartConfig) -> None:
+        platform = config.platform
+        if isinstance(platform, PromptPlatformConfig):
+            object.__setattr__(platform, "prompt", "")
+
+    def _runtime_platform_prompt(self) -> str:
+        return self._platform_secret.prompt if self._platform_secret is not None else ""
+
+    async def _dispose_modern_runtime(self) -> None:
+        controller = self._controller
+        adapter = self._adapter
+        secret = self._controller_secret
+        platform_secret = self._platform_secret
+        self._controller = None
+        self._adapter = None
+        self._controller_secret = None
+        self._platform_secret = None
+        close_calls = []
+        if controller is not None:
+            close_calls.append(controller.close())
+        if adapter is not None:
+            close_calls.append(adapter.close())
+        if close_calls:
+            await asyncio.gather(*close_calls, return_exceptions=True)
+        if secret is not None:
+            secret.clear()
+        if platform_secret is not None:
+            platform_secret.clear()
 
     async def _controller_call(self, session, cancel_event, **kwargs):
         controller = AutoController(

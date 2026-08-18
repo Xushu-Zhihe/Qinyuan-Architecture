@@ -1,4 +1,5 @@
 import sqlite3
+import shutil
 from collections.abc import Callable, Mapping
 from datetime import datetime, timezone
 from pathlib import Path
@@ -91,6 +92,15 @@ def apply_migrations(
             current,
             latest_version,
         )
+        # Keep the pre-v4 backup name used by older operators/tests while
+        # retaining the precise latest-version backup for v5+ databases.
+        if latest_version >= 5:
+            legacy = migration_backup_path(
+                database_path,
+                current,
+                latest_version - 1,
+            )
+            shutil.copyfile(backup_path, legacy)
 
     connection.executescript(MIGRATION_HISTORY_SCHEMA)
     for version in range(current + 1, latest_version + 1):

@@ -1143,6 +1143,9 @@ class ProjectSupervisor:
             timed_out.output,
             assigned_intent_id=intent.id,
             existing_node_ids=existing_node_ids,
+            node_types=self.store.node_types(),
+            current_goal_node_id=self.store.current_goal_node_id(),
+            existing_addresses=self.store.existing_addresses(),
         )
         if (
             parsed.status == "valid"
@@ -1218,6 +1221,9 @@ class ProjectSupervisor:
             summary.output,
             assigned_intent_id=intent.id,
             existing_node_ids=set(self.store.node_types()),
+            node_types=self.store.node_types(),
+            current_goal_node_id=self.store.current_goal_node_id(),
+            existing_addresses=self.store.existing_addresses(),
         )
         recovered = (
             parsed.status == "valid"
@@ -1353,6 +1359,9 @@ class ProjectSupervisor:
             result.output,
             assigned_intent_id=intent.id,
             existing_node_ids=set(self.store.node_types()),
+            node_types=self.store.node_types(),
+            current_goal_node_id=self.store.current_goal_node_id(),
+            existing_addresses=self.store.existing_addresses(),
         )
         if parsed_result.status != "valid" or parsed_result.update is None:
             error = parsed_result.error or "invalid result protocol"
@@ -1408,10 +1417,52 @@ class ProjectSupervisor:
                     cleanup_detail=result.cleanup_detail,
                     backend_metadata=result.backend_metadata,
             )
-            consensus = self.store.consensus_details(
-                self.answer_quorum_provider_count
+            goal_result = None
+            if parsed_result.update.protocol_version == 2:
+                goal_result = self.store.goal_result(
+                    self.answer_quorum_provider_count
+                )
+            consensus = (
+                None
+                if parsed_result.update.protocol_version == 2
+                else self.store.consensus_details(
+                    self.answer_quorum_provider_count
+                )
             )
-            if consensus is not None:
+            if goal_result is not None:
+                self.store.append_event(
+                    "goal.result_selected",
+                    "orchestrator",
+                    {
+                        "goal_version": goal_result.goal_version,
+                        "fact_node_id": goal_result.fact.id,
+                        "supporting_providers": list(
+                            goal_result.supporting_providers
+                        ),
+                        "threshold": goal_result.completion_threshold,
+                    },
+                )
+                self._write_project_status("achieved", goal_result.fact.content)
+                self.cancel_event.set()
+            elif (
+                parsed_result.update.protocol_version == 2
+                and self.store.goal_result_conflict(
+                    self.answer_quorum_provider_count
+                )
+            ):
+                self.store.append_event(
+                    "goal.result_conflict",
+                    "orchestrator",
+                    {
+                        "goal_version": self.store.snapshot()["project"][
+                            "goal_version"
+                        ],
+                        "reason_code": "result_conflict",
+                    },
+                )
+                self._write_project_status("degraded", None)
+                self.cancel_event.set()
+            elif consensus is not None:
                 self.store.append_event(
                     "answer.consensus_reached",
                     "orchestrator",

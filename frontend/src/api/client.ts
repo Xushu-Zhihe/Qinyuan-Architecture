@@ -9,6 +9,11 @@ import type {
   RuntimeSnapshot,
   SyncedExecutionLogs,
   AutopilotSnapshot,
+  AutopilotStartPayload,
+  ControllerInput,
+  PlatformValidationPayload,
+  StructuredPlatformInput,
+  ValidationResult,
 } from '../types'
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -97,10 +102,25 @@ export const api = {
     request<PlanningAttempt[]>(`/api/projects/${projectId}/planning-attempts`),
   auditExportUrl: (projectId: string) => `/api/projects/${projectId}/audit/export`,
   getAutopilot: () => request<AutopilotSnapshot>('/api/autopilot'),
-  startAutopilot: (payload: object) =>
+  startAutopilot: (payload: AutopilotStartPayload) =>
     request<AutopilotSnapshot>('/api/autopilot/start', {
       method: 'POST',
       body: JSON.stringify(payload),
     }),
   stopAutopilot: () => request<AutopilotSnapshot>('/api/autopilot/stop', { method: 'POST' }),
+  testAutopilotController: (payload: ControllerInput) =>
+    request<ValidationResult>('/api/autopilot/test-controller', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+  validateAutopilotPlatform: (payload: PlatformValidationPayload) =>
+    request<ValidationResult>('/api/autopilot/validate-platform', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+  testAutopilotPlatformHealth: (platform: StructuredPlatformInput) =>
+    request<ValidationResult>('/api/autopilot/test-platform-health', {
+      method: 'POST',
+      body: JSON.stringify({ mode: 'structured', platform }),
+    }),
 }

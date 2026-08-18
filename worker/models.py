@@ -1,4 +1,5 @@
 from dataclasses import asdict, dataclass, field
+from typing import Literal
 
 
 @dataclass(frozen=True, slots=True)
@@ -29,6 +30,24 @@ class HealthCheckConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class CapabilityProbeConfig:
+    command: tuple[str, ...]
+    timeout_seconds: float
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderCapabilities:
+    request_protocol_versions: tuple[int, ...] = (1,)
+    result_protocol_versions: tuple[int, ...] = (1,)
+    skill_mode: Literal["none", "inline", "required", "tool"] = "inline"
+    available_skills: tuple[str, ...] = ()
+    validates_result_locally: bool = False
+    supports_result_fact: bool = False
+    schema_version: str | None = None
+    fixture_digest: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class ProviderConfig:
     name: str
     enabled: bool
@@ -42,6 +61,9 @@ class ProviderConfig:
     container_command: tuple[str, ...] | None = None
     stream_format: str = "text"
     streaming_supported: bool = True
+    capabilities: ProviderCapabilities = field(default_factory=ProviderCapabilities)
+    capability_probe: CapabilityProbeConfig | None = None
+    protocol_arguments: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

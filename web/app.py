@@ -15,7 +15,23 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from autopilot.manager import AutoManager, AutoManagerError
-from autopilot.models import AutoStartConfig
+from autopilot.direct_controller import DirectControllerError, DirectLLMController
+from autopilot.platform import StructuredPlatformAdapter
+from autopilot.models import (
+    AutoStartConfig,
+    ControllerConfig,
+    PromptPlatformConfig,
+    RuntimeControllerSecret,
+    RuntimePlatformSecret,
+)
+from autopilot.platform_models import (
+    AuthConfig,
+    EndpointConfig,
+    FieldMapping,
+    OutcomeCondition,
+    OutcomeConfig,
+    StructuredPlatformConfig,
+)
 from orchestrator.audit import export_audit_bundle, read_log_page
 from orchestrator.layout import LayoutConflict
 from orchestrator.models import IntentProposal
@@ -31,12 +47,100 @@ from web.schemas import (
     NodeCreate,
     ProjectCreate,
     AutoStart as AutoStartConfigPayload,
+    ControllerPayload,
+    LegacyAutoStart,
+    PromptAutoStart,
+    PlatformValidation,
+    StructuredAutoStart,
+    StructuredPlatformPayload,
+    StructuredPlatformValidation,
 )
 from worker.models import AuditConfig, CoordinatorConfig, ProviderConfig
 
 
 DEFAULT_DATA_ROOT = Path(__file__).resolve().parents[1] / "web-data"
 DEFAULT_FRONTEND_DIST = Path(__file__).resolve().parents[1] / "frontend" / "dist"
+
+
+def _controller_config(payload: ControllerPayload) -> ControllerConfig:
+    advanced = payload.advanced
+    return ControllerConfig(
+        base_url=payload.base_url,
+        model=payload.model,
+        timeout_seconds=advanced.timeout_seconds,
+        max_rounds=advanced.max_rounds,
+        temperature=advanced.temperature,
+        max_output_tokens=advanced.max_output_tokens,
+        reasoning_effort=advanced.reasoning_effort,
+        extra_headers=tuple(advanced.extra_headers.items()),
+    )
+
+
+def _endpoint_config(payload) -> EndpointConfig:
+    return EndpointConfig(
+        method=payload.method,
+        path=payload.path,
+        query=payload.query,
+        headers=payload.headers,
+        body=payload.body,
+        form=payload.form,
+        timeout_seconds=payload.timeout_seconds,
+        max_retries=payload.max_retries,
+        retry_status_codes=tuple(payload.retry_status_codes),
+    )
+
+
+def _condition(payload) -> OutcomeCondition | None:
+    if payload is None:
+        return None
+    return OutcomeCondition(
+        path=payload.path,
+        equals=payload.equals,
+        status_codes=tuple(payload.status_codes),
+    )
+
+
+def _structured_config(payload: StructuredPlatformPayload) -> StructuredPlatformConfig:
+    retryable = payload.outcomes.submit.retryable
+    return StructuredPlatformConfig(
+        base_url=payload.base_url,
+        auth=AuthConfig(
+            type=payload.auth.type,
+            header_name=payload.auth.header_name,
+            prefix=payload.auth.prefix,
+            parameter_name=payload.auth.parameter_name,
+        ),
+        default_headers=payload.default_headers,
+        fetch_task=_endpoint_config(payload.fetch_task),
+        task_info=(
+            _endpoint_config(payload.task_info) if payload.task_info is not None else None
+        ),
+        submit_result=_endpoint_config(payload.submit_result),
+        skip_task=(
+            _endpoint_config(payload.skip_task) if payload.skip_task is not None else None
+        ),
+        mapping=FieldMapping(**payload.mapping.model_dump()),
+        outcomes=OutcomeConfig(
+            fetch_finished=_condition(payload.outcomes.fetch.finished),
+            fetch_empty=_condition(payload.outcomes.fetch.empty),
+            submit_accepted=_condition(payload.outcomes.submit.accepted),
+            submit_rejected=_condition(payload.outcomes.submit.rejected),
+            submit_retryable_status_codes=(
+                tuple(retryable.status_codes)
+                if retryable is not None and retryable.status_codes
+                else (429, 500, 502, 503, 504)
+            ),
+            skip_succeeded=_condition(payload.outcomes.skip.succeeded),
+        ),
+        health_check=(
+            _endpoint_config(payload.health_check)
+            if payload.health_check is not None
+            else None
+        ),
+        task_info_mode=payload.task_info_mode,
+        task_info_failure_action=payload.task_info_failure_action,
+        initial_cursor=payload.initial_cursor,
+    )
 
 
 def create_app(
@@ -166,16 +270,59 @@ def create_app(
     @app.post("/api/autopilot/start", status_code=status.HTTP_202_ACCEPTED)
     async def start_autopilot(payload: AutoStartConfigPayload):
         try:
+            if isinstance(payload, LegacyAutoStart):
+                config = AutoStartConfig(
+                    platform_prompt=payload.platform_prompt,
+                    controller_provider=payload.controller_provider,
+                    solver_providers=tuple(payload.solver_providers),
+                    agent_limit=payload.agent_limit,
+                    max_tasks=payload.max_tasks,
+                    task_timeout_seconds=payload.task_timeout_minutes * 60,
+                    controller_timeout_seconds=payload.controller_timeout_seconds,
+                )
+                return await autopilot.start(config)
+
+            controller = _controller_config(payload.controller)
+            platform = (
+                _structured_config(payload.platform)
+                if isinstance(payload, StructuredAutoStart)
+                else PromptPlatformConfig()
+            )
             config = AutoStartConfig(
-                platform_prompt=payload.platform_prompt,
-                controller_provider=payload.controller_provider,
+                mode=payload.mode,
+                controller=controller,
+                platform=platform,
                 solver_providers=tuple(payload.solver_providers),
                 agent_limit=payload.agent_limit,
                 max_tasks=payload.max_tasks,
                 task_timeout_seconds=payload.task_timeout_minutes * 60,
-                controller_timeout_seconds=payload.controller_timeout_seconds,
+                poll_interval_seconds=payload.poll_interval_seconds,
+                rejected_action=payload.rejected_action,
+                solver_failure_action=payload.solver_failure_action,
+                stop_active_task_action=payload.stop_active_task_action,
+                max_replans_after_rejection=payload.max_replans_after_rejection,
+                max_transport_retries=payload.max_transport_retries,
             )
-            return await autopilot.start(config)
+            secret = RuntimeControllerSecret(
+                payload.controller.api_key.get_secret_value()
+            )
+            platform_secret = RuntimePlatformSecret(
+                prompt=(
+                    str(payload.platform["prompt"])
+                    if isinstance(payload, PromptAutoStart)
+                    else ""
+                ),
+                token=(
+                    payload.platform.auth.token.get_secret_value()
+                    if isinstance(payload, StructuredAutoStart)
+                    else ""
+                ),
+            )
+            return await autopilot.start(
+                config,
+                controller_secret=secret,
+                platform_secret=platform_secret,
+            )
         except AutoManagerError as exc:
             code = 409 if "already running" in str(exc) else 400
             raise HTTPException(status_code=code, detail=str(exc)) from exc
@@ -185,6 +332,96 @@ def create_app(
     @app.post("/api/autopilot/stop")
     async def stop_autopilot():
         return await autopilot.stop()
+
+    @app.post("/api/autopilot/test-controller")
+    async def test_autopilot_controller(payload: ControllerPayload):
+        secret = RuntimeControllerSecret(payload.api_key.get_secret_value())
+        controller = DirectLLMController(_controller_config(payload), secret)
+        try:
+            result = await controller.preflight()
+            return {
+                "ok": True,
+                "status": "valid",
+                "category": "controller",
+                "model": result.get("model", payload.model),
+            }
+        except DirectControllerError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "ok": False,
+                    "status": "invalid",
+                    "category": "controller",
+                    "field": "controller",
+                    "message": str(exc),
+                },
+            ) from exc
+        finally:
+            secret.clear()
+            await controller.close()
+
+    @app.post("/api/autopilot/validate-platform")
+    async def validate_autopilot_platform(payload: PlatformValidation):
+        if payload.mode == "prompt":
+            prompt = str(payload.platform.get("prompt", "")).strip()
+            if not prompt:
+                raise HTTPException(status_code=400, detail="platform.prompt is required")
+            missing = [
+                item
+                for item, markers in {
+                    "fetch": ("fetch", "get task", "next task", "取题"),
+                    "submit": ("submit", "answer", "提交"),
+                    "outcome": ("accepted", "rejected", "success", "成功", "拒绝"),
+                }.items()
+                if not any(marker in prompt.lower() for marker in markers)
+            ]
+            return {
+                "ok": True,
+                "status": "warning" if missing else "valid",
+                "category": "platform_prompt",
+                "warnings": [f"missing explicit {item} contract" for item in missing],
+            }
+        config = _structured_config(payload.platform)
+        warnings = []
+        if config.skip_task is None:
+            warnings.append("skip endpoint is not configured")
+        if config.outcomes.submit_accepted is None:
+            warnings.append("submit accepted outcome is not configured")
+        return {
+            "ok": True,
+            "status": "warning" if warnings else "valid",
+            "category": "structured_platform",
+            "warnings": warnings,
+        }
+
+    @app.post("/api/autopilot/test-platform-health")
+    async def test_autopilot_platform_health(payload: StructuredPlatformValidation):
+        config = _structured_config(payload.platform)
+        if config.health_check is None:
+            raise HTTPException(status_code=400, detail="health endpoint is not configured")
+        secret = RuntimePlatformSecret(token=payload.platform.auth.token.get_secret_value())
+        adapter = StructuredPlatformAdapter(config, secret=secret)
+        try:
+            result = await adapter.health_check()
+            if result.status != "healthy":
+                raise HTTPException(
+                    status_code=503,
+                    detail={
+                        "ok": False,
+                        "status": "invalid",
+                        "category": "platform_health",
+                        "message": result.message or result.status,
+                    },
+                )
+            return {
+                "ok": True,
+                "status": "valid",
+                "category": "platform_health",
+                "http_status": result.metadata.get("http_status"),
+            }
+        finally:
+            secret.clear()
+            await adapter.close()
 
     @app.delete(
         "/api/projects/{project_id}",

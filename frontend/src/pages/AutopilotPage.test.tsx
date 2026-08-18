@@ -1,4 +1,4 @@
-import { render, screen } from '@testing-library/react'
+import { render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
@@ -11,6 +11,8 @@ vi.mock('../api/client', () => ({
     getAutopilot: vi.fn(),
     startAutopilot: vi.fn(),
     stopAutopilot: vi.fn(),
+    testAutopilotController: vi.fn(),
+    validateAutopilotPlatform: vi.fn(),
   },
 }))
 
@@ -24,7 +26,9 @@ describe('AutopilotPage', () => {
       session: {
         id: 'auto-1',
         status: 'running',
-        controller_provider: 'fake',
+        mode: 'prompt',
+        controller_provider: null,
+        controller: { base_url: 'https://controller.example/v1', model: 'controller-model' },
         solver_providers: ['fake'],
         available_providers: ['fake'],
         agent_limit: 1,
@@ -44,14 +48,43 @@ describe('AutopilotPage', () => {
     render(<AutopilotPage onBack={() => {}} onOpenProject={() => {}} />)
 
     await screen.findByText('连接配置')
-    await userEvent.click(screen.getByRole('button', { name: '显示平台 prompt' }))
-    await userEvent.type(screen.getByPlaceholderText('粘贴平台 API、token 和答题接口说明'), 'token=secret')
+    await userEvent.clear(screen.getByRole('textbox', { name: 'Base URL' }))
+    await userEvent.type(screen.getByRole('textbox', { name: 'Base URL' }), 'https://controller.example/v1')
+    await userEvent.type(screen.getByRole('textbox', { name: '模型' }), 'controller-model')
+    await userEvent.type(screen.getByLabelText('API key'), 'controller-secret')
+    await userEvent.type(screen.getByRole('textbox', { name: '平台说明 prompt' }), 'platform instructions')
     await userEvent.click(screen.getByRole('button', { name: '启动全自动' }))
 
-    expect(api.startAutopilot).toHaveBeenCalledWith(expect.objectContaining({
-      platform_prompt: 'token=secret',
-      controller_provider: 'fake',
+    expect(api.startAutopilot).toHaveBeenCalledWith({
+      mode: 'prompt',
+      controller: {
+        api_key: 'controller-secret',
+        base_url: 'https://controller.example/v1',
+        model: 'controller-model',
+        advanced: {
+          timeout_seconds: 300,
+          max_rounds: 20,
+          temperature: null,
+          max_output_tokens: null,
+          reasoning_effort: null,
+          extra_headers: {},
+        },
+      },
+      platform: { prompt: 'platform instructions' },
       solver_providers: ['fake'],
-    }))
+      agent_limit: 1,
+      max_tasks: 10,
+      task_timeout_minutes: 60,
+      poll_interval_seconds: 1,
+      rejected_action: 'fail',
+      solver_failure_action: 'fail',
+      stop_active_task_action: 'leave',
+      max_replans_after_rejection: 1,
+      max_transport_retries: 2,
+    })
+    await waitFor(() => {
+      expect(screen.getByLabelText('API key')).toHaveValue('')
+      expect(screen.getByRole('textbox', { name: '平台说明 prompt' })).toHaveValue('')
+    })
   })
 })

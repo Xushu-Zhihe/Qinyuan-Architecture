@@ -12,6 +12,7 @@ from orchestrator.events import ProjectEventHub
 from orchestrator.health import HealthProbe
 from orchestrator.layout import LayoutStore
 from orchestrator.migrations import apply_migrations
+from orchestrator.models import GoalResult
 from orchestrator.store import BlackboardStore
 from orchestrator.supervisor import ProjectSupervisor
 from worker.models import (
@@ -397,6 +398,10 @@ class ProjectService:
             self._handles[record.id] = handle
             self._recover_project(handle)
             return handle
+
+    def get_goal_result(self, project_id: str) -> GoalResult | None:
+        handle = self.get_handle(project_id)
+        return handle.store.goal_result(len(handle.record.providers))
 
     def list_projects(self) -> tuple[dict[str, object], ...]:
         with self._lock:

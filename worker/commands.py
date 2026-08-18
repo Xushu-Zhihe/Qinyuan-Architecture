@@ -22,7 +22,14 @@ def expand_command(
         "{origin_host}": origin_host,
     }
     expanded: list[str] = []
-    for configured in template:
+    configured_arguments = list(template)
+    insertion_index = (
+        len(configured_arguments) - 1
+        if configured_arguments and configured_arguments[-1] == "-"
+        else len(configured_arguments)
+    )
+    configured_arguments[insertion_index:insertion_index] = provider.protocol_arguments
+    for configured in configured_arguments:
         argument = configured
         for placeholder, value in replacements.items():
             argument = argument.replace(placeholder, value)

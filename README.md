@@ -182,9 +182,20 @@ Vite 默认地址为 `http://127.0.0.1:5173`，并将 `/api` 和 `/ws` 代理到
 
 ### 全自动答题
 
-打开首页的“全自动模式”进入 `/auto`。这是现有 Web 服务下的独立页面，不会新增后端服务或端口；例如后端运行在 `127.0.0.1:8000` 时，页面就是 `http://127.0.0.1:8000/auto`。在平台 API prompt 中提供题目接口、提交接口和认证信息，选择一个控制器 provider 与解题 provider，设置题数和超时后启动。控制器只返回严格的 `AUTOPILOT_RESULT` JSON：先取下一题，再等待对应黑板项目达到 `achieved`，提交 `final_answer`，平台返回 `accepted` 后继续下一题；`rejected`、超时、协议错误或项目 `degraded` 会暂停并显示失败状态。
+打开首页的“全自动模式”进入 `/auto`。这是现有 Web 服务下的独立页面，不会新增后端服务或端口；例如后端运行在 `127.0.0.1:8000` 时，页面就是 `http://127.0.0.1:8000/auto`。
 
-控制器 prompt、认证信息和临时控制器日志只在活动会话内存中使用，不写入项目数据库、会话快照或浏览器存储。控制器下载的附件会被移动到该题的受管 challenge 目录，随后每题项目仍可独立打开和审计。对应接口为 `GET /api/autopilot`、`POST /api/autopilot/start` 和 `POST /api/autopilot/stop`，服务端同时只允许一个自动会话。
+自动模式有两种接入方式：
+
+- Prompt：输入平台说明 prompt，由独立的 Direct LLM Controller 使用当前阶段允许的 HTTP 工具取题、提交和放弃。
+- 结构化 API：填写平台 URL/token、fetch/info/submit/skip/health endpoint、字段映射、游标、结果判断、超时与重试；取题和响应判定由 `StructuredPlatformAdapter` 确定性执行。
+
+两种模式都单独填写 controller LLM 的 API key、base URL、model 和高级选项；controller 不占用 solver provider。solver provider 仍由现有 `ProjectService`/`Supervisor` 创建独立黑板项目。solver 完成后必须产生协议 v2 的 Goal Result Fact，controller 根据完整 Fact 和有限支持 Fact 生成 `SubmissionPlan`，支持 text、JSON 和 form 结果；平台明确返回 `accepted` 后才进入下一题。业务 `rejected` 只会按 `replan`、`skip` 或 `fail` 处理，429/5xx/网络错误只重试同一个 plan。
+
+协议 v2 使用 `goal_result_ref`、completion claim 和 `GoalResult`，不再把 `answer_key`/`final_answer` 当作新自动模式的结果入口。qinyuan-agent 与 q-subagent 通过 required Skill、stdout 前 validator gate 和 capability probe 提供 v2 provider 能力；未满足 v2 能力的 provider 不会被新自动模式选中。旧 provider-controller payload 保留为兼容入口，但新 UI 不使用它。
+
+controller key、平台 token 和完整 prompt 只存在于当前 React state/运行时 session；启动后输入立即清空，snapshot/history/SQLite 不包含凭据。服务重启不会恢复自动 session 或平台 lease。首版不支持 controller streaming、并行题目或结果 artifact/文件上传。
+
+对应接口为 `GET /api/autopilot`、`POST /api/autopilot/start`、`POST /api/autopilot/stop`、`POST /api/autopilot/test-controller`、`POST /api/autopilot/validate-platform` 和结构化模式的 `POST /api/autopilot/test-platform-health`。health 测试只调用用户显式配置的 health endpoint，不会取题或消耗 lease。
 
 ### 删除项目
 
@@ -584,7 +595,7 @@ provider 凭据只应存在于用户自己的环境变量或专用配置文件�
   `server restarted` 事件，并把遗留的
   `running` 项目恢复为 `idle`。恢复事件可通过 WebSocket `after` 参数重放；
   外部 CLI 不会自动重启，必须由用户再次启动项目。
-- 最终答案共识使用规范化后的精确文本，不自动向 CTF 平台提交答案。
+- v2 Goal Result Fact 共识只认可同一 Fact 或显式 `equivalent_to` 连通分量；多个不等价结果进入 `degraded/result_conflict`。新自动模式可按平台契约提交，手动项目不会自动提交。
 - 相似 Fact 不自动合并，只保守地保留独立命题和关系。
 
 ## 来源与致谢

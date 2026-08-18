@@ -40,6 +40,14 @@ LEGACY_RESULT_FIELDS = {
     "final_answer",
 }
 RESULT_FIELDS = LEGACY_RESULT_FIELDS | {"answer_key"}
+V2_RESULT_FIELDS = {
+    "protocol_version",
+    "intent_id",
+    "facts",
+    "edges",
+    "goal_achieved",
+    "goal_result_ref",
+}
 FACT_FIELDS = {"ref", "content"}
 
 
@@ -80,46 +88,75 @@ def last_result_line(stdout: str) -> str | None:
     return candidates[-1] if candidates else None
 
 
-def _result_contract(intent: dict[str, object]) -> str:
+def _current_goal_id(snapshot: dict[str, object]) -> str:
+    nodes = snapshot.get("nodes")
+    if isinstance(nodes, list):
+        goals = [
+            node
+            for node in nodes
+            if isinstance(node, dict)
+            and node.get("type") == "goal"
+            and node.get("state", "active") == "active"
+        ]
+        if goals:
+            goals.sort(
+                key=lambda node: (
+                    int(node.get("generation", 0)),
+                    str(node.get("created_at", "")),
+                    str(node.get("id", "")),
+                )
+            )
+            return str(goals[-1]["id"])
+    return "current-goal-node-id"
+
+
+def _result_contract(
+    intent: dict[str, object],
+    snapshot: dict[str, object],
+) -> str:
     intent_id = str(intent["id"])
-    target_node_id = str(intent.get("target_node_id", "target-node-id"))
+    goal_node_id = _current_goal_id(snapshot)
     example = {
+        "protocol_version": 2,
         "intent_id": intent_id,
         "facts": [{"ref": "fact-ref", "content": "verified fact"}],
         "edges": [
             {
-                "type": "supports",
+                "type": "addresses",
                 "from": "fact-ref",
-                "to": target_node_id,
+                "to": goal_node_id,
             }
         ],
         "goal_achieved": True,
-        "answer_key": "verified-answer",
-        "final_answer": "verified answer",
+        "goal_result_ref": "fact-ref",
     }
     edge_types = ", ".join(sorted(RELATION_EDGE_TYPES))
     return (
         "Codex: use $blackboard-result-protocol before producing the result. "
         "If the Skill is unavailable, continue with this inline contract.\n"
         "The final line must start with BLACKBOARD_RESULT: followed by one "
-        "strict JSON object on the same line. The object must contain exactly "
-        "intent_id, facts, edges, goal_achieved, answer_key, and "
-        "final_answer.\n"
+        "strict JSON object on the same line. For protocol_version 2 the "
+        "object must contain exactly protocol_version, intent_id, facts, "
+        "edges, goal_achieved, and goal_result_ref.\n"
         'Each fact must be {"ref":"temporary-ref","content":"non-empty fact"}. '
         'Each edge must be {"type":"relation","from":"node-or-ref",'
         '"to":"node-or-ref"}. Temporary fact refs must be unique. Edges may '
         "reference existing node IDs or fact refs from this result.\n"
         f"Allowed edge types: {edge_types}. goal_achieved must be a JSON "
-        "boolean. When true, answer_key and final_answer must be non-empty "
-        "strings. answer_key is the minimal canonical answer used for exact "
-        "cross-provider consensus; do not include explanation, Markdown, or "
-        "labels in it. When false, answer_key and final_answer may be null. "
+        "boolean. When true, goal_result_ref must identify exactly one Fact "
+        "that directly addresses the current Goal. When false, "
+        "goal_result_ref must be null. The result Fact content is complete "
+        "and must not be shortened. Protocol v1 answer_key/final_answer "
+        "remains accepted only for compatibility. "
         "Use empty arrays when there are "
         "no facts or edges. Do not use Python dict syntax, key=value syntax, "
         "tuples, or a Markdown fence for the protocol line.\n"
         "Valid shape using the assigned IDs:\n"
         f"{RESULT_PREFIX} "
         + json.dumps(example, ensure_ascii=False, separators=(",", ":"))
+        + "\nCompatibility v1 shape (accepted only for older providers): "
+        + '{"answer_key":"verified-answer","final_answer":"verified answer"}'
+        + '\nCompatibility relation example: {"type":"supports","from":"fact-ref","to":"goal-1"}'
         + "\n"
     )
 
@@ -178,7 +215,7 @@ def render_execution_request(
         "network, filesystem, unavailable tools) as execution diagnostics, "
         "not challenge facts. Describe them in normal output, but do not add "
         "them to facts.\n"
-        + _result_contract(intent)
+        + _result_contract(intent, snapshot)
         + correction
         + "\nAssigned intent:\n"
         + json.dumps(intent, ensure_ascii=False, indent=2)
@@ -211,7 +248,7 @@ def render_timeout_summary_request(
         "Finish promptly with exactly one valid BLACKBOARD_RESULT line for "
         "the assigned Intent.\n"
         f"Challenge directory (read-only): {_challenge_text(challenge_dir)}\n"
-        + _result_contract(intent)
+        + _result_contract(intent, snapshot)
         + "\nAssigned intent:\n"
         + json.dumps(intent, ensure_ascii=False, indent=2)
         + "\nGraph snapshot:\n"
@@ -317,15 +354,19 @@ def parse_result(
     stdout: str,
     assigned_intent_id: str,
     existing_node_ids: set[str],
+    *,
+    node_types: dict[str, str] | None = None,
+    current_goal_node_id: str | None = None,
+    existing_addresses: set[tuple[str, str]] | None = None,
 ) -> ResultParseResult:
     try:
         payload = _last_payload(stdout, RESULT_PREFIX)
-        legacy_result = set(payload) == LEGACY_RESULT_FIELDS
-        _require_fields(
-            payload,
-            LEGACY_RESULT_FIELDS if legacy_result else RESULT_FIELDS,
-            "result",
-        )
+        protocol_version = payload.get("protocol_version", 1)
+        if protocol_version == 2:
+            _require_fields(payload, V2_RESULT_FIELDS, "result")
+        else:
+            legacy_result = set(payload) == LEGACY_RESULT_FIELDS
+            _require_fields(payload, LEGACY_RESULT_FIELDS if legacy_result else RESULT_FIELDS, "result")
         intent_id = _non_empty_string(payload["intent_id"], "intent_id")
         if intent_id != assigned_intent_id:
             raise ValueError("result must reference the assigned intent")
@@ -333,24 +374,30 @@ def parse_result(
         raw_facts = payload["facts"]
         raw_edges = payload["edges"]
         achieved = payload["goal_achieved"]
-        answer = payload["final_answer"]
+        answer = payload.get("final_answer")
         answer_key = payload.get("answer_key")
+        goal_result_ref = payload.get("goal_result_ref")
         if not isinstance(raw_facts, list) or not isinstance(raw_edges, list):
             raise ValueError("facts and edges must be lists")
         if not isinstance(achieved, bool):
             raise ValueError("goal_achieved must be a boolean")
-        if answer is not None and (
+        if protocol_version != 2 and answer is not None and (
             not isinstance(answer, str) or not answer.strip()
         ):
             raise ValueError("final_answer must be null or a non-empty string")
-        if achieved and answer is None:
+        if protocol_version != 2 and achieved and answer is None:
             raise ValueError("goal_achieved requires final_answer")
         if answer_key is not None and (
             not isinstance(answer_key, str) or not answer_key.strip()
         ):
             raise ValueError("answer_key must be null or a non-empty string")
-        if achieved and not legacy_result and answer_key is None:
+        if protocol_version != 2 and achieved and not legacy_result and answer_key is None:
             raise ValueError("goal_achieved requires answer_key")
+        if protocol_version == 2:
+            if achieved and (not isinstance(goal_result_ref, str) or not goal_result_ref.strip()):
+                raise ValueError("goal_achieved requires goal_result_ref")
+            if not achieved and goal_result_ref is not None:
+                raise ValueError("goal_result_ref must be null when goal is not achieved")
 
         facts: list[FactProposal] = []
         refs: set[str] = set()
@@ -381,6 +428,26 @@ def parse_result(
                 raise ValueError("unknown node reference")
             edges.append(RelationProposal(edge_type, from_ref, to_ref))
 
+        if protocol_version == 2 and achieved:
+            assert isinstance(goal_result_ref, str)
+            goal_result_ref = goal_result_ref.strip()
+            result_type = (node_types or {}).get(goal_result_ref)
+            if goal_result_ref not in refs and result_type != "fact":
+                raise ValueError("goal_result_ref must reference a Fact")
+            if current_goal_node_id:
+                if current_goal_node_id not in existing_node_ids:
+                    raise ValueError("current goal node is unknown")
+                addresses = existing_addresses or set()
+                if goal_result_ref not in refs and (goal_result_ref, current_goal_node_id) in addresses:
+                    pass
+                elif not any(
+                    edge.type == "addresses"
+                    and edge.from_ref == goal_result_ref
+                    and edge.to_ref == current_goal_node_id
+                    for edge in edges
+                ):
+                    raise ValueError("goal result must address the current Goal")
+
         return ResultParseResult(
             status="valid",
             update=ExecutionUpdate(
@@ -393,6 +460,10 @@ def parse_result(
                     answer_key.strip()
                     if isinstance(answer_key, str)
                     else answer.strip() if achieved and answer else None
+                ),
+                protocol_version=int(protocol_version),
+                goal_result_ref=(
+                    goal_result_ref if isinstance(goal_result_ref, str) else None
                 ),
             ),
             error=None,

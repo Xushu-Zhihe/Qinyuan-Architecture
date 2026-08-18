@@ -382,6 +382,9 @@ class LocalExecutionBackend(ExecutionBackend):
                     cancel_file.write_text("cancel\n", encoding="utf-8")
                 except OSError:
                     pass
+                # Providers can use the cooperative marker to flush their own
+                # clients before the process-tree signal is sent.
+                await asyncio.sleep(0.1)
             await _terminate_process_tree(handle.process)
         finally:
             if cancel_file is not None:

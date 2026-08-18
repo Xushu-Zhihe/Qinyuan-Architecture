@@ -10,7 +10,12 @@ from uuid import uuid4
 
 from orchestrator.health import HEALTH_STATUSES, redact_error
 from orchestrator.migrations import apply_migrations, stamp_new_schema
-from orchestrator.models import IntentProposal, RELATION_EDGE_TYPES
+from orchestrator.models import (
+    GoalResult,
+    GoalResultFact,
+    IntentProposal,
+    RELATION_EDGE_TYPES,
+)
 
 
 PROVIDER_HEALTH_SCHEMA = """
@@ -78,6 +83,7 @@ CREATE TABLE projects (
     id TEXT PRIMARY KEY,
     status TEXT NOT NULL,
     goal_version INTEGER NOT NULL DEFAULT 1,
+    goal_result_fact_id TEXT REFERENCES nodes(id),
     final_answer TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
@@ -200,6 +206,15 @@ CREATE TABLE final_answers (
     created_at TEXT NOT NULL
 );
 
+CREATE TABLE goal_completion_claims (
+    id TEXT PRIMARY KEY,
+    goal_version INTEGER NOT NULL,
+    provider TEXT NOT NULL,
+    execution_id TEXT NOT NULL REFERENCES intent_executions(id),
+    fact_node_id TEXT NOT NULL REFERENCES nodes(id),
+    created_at TEXT NOT NULL
+);
+
 CREATE INDEX final_answers_by_consensus
 ON final_answers(goal_version, answer_fingerprint, provider);
 
@@ -249,7 +264,7 @@ def _timestamp_after(value: str, seconds: float) -> str:
     ).isoformat()
 
 
-BLACKBOARD_SCHEMA_VERSION = 4
+BLACKBOARD_SCHEMA_VERSION = 5
 
 
 def _add_columns(
@@ -349,11 +364,32 @@ def _migrate_blackboard_v4(connection: sqlite3.Connection) -> None:
     )
 
 
+def _migrate_blackboard_v5(connection: sqlite3.Connection) -> None:
+    _add_columns(connection, "projects", {"goal_result_fact_id": "TEXT"})
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS goal_completion_claims (
+            id TEXT PRIMARY KEY,
+            goal_version INTEGER NOT NULL,
+            provider TEXT NOT NULL,
+            execution_id TEXT NOT NULL REFERENCES intent_executions(id),
+            fact_node_id TEXT NOT NULL REFERENCES nodes(id),
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS goal_completion_claims_lookup "
+        "ON goal_completion_claims(goal_version, fact_node_id, provider)"
+    )
+
+
 BLACKBOARD_MIGRATIONS = {
     1: ("provider health state", _migrate_blackboard_v1),
     2: ("planning and execution audit", _migrate_blackboard_v2),
     3: ("execution backend audit", _migrate_blackboard_v3),
     4: ("canonical final answer consensus", _migrate_blackboard_v4),
+    5: ("goal result completion claims", _migrate_blackboard_v5),
 }
 
 
@@ -372,7 +408,7 @@ def _ensure_runtime_schema(
 
 
 BLACKBOARD_REQUIRED_SCHEMA = {
-    "projects": {"id", "status", "goal_version"},
+    "projects": {"id", "status", "goal_version", "goal_result_fact_id"},
     "provider_health": {"provider", "status", "cli_version"},
     "planning_attempts": {
         "id",
@@ -394,6 +430,9 @@ BLACKBOARD_REQUIRED_SCHEMA = {
         "backend_metadata_json",
     },
     "final_answers": {"answer_key", "answer_fingerprint"},
+    "goal_completion_claims": {
+        "id", "goal_version", "provider", "execution_id", "fact_node_id"
+    },
 }
 
 
@@ -690,6 +729,31 @@ class BlackboardStore:
                 """
                 SELECT id, type FROM nodes
                 WHERE project_id = ? AND state = 'active'
+                """,
+                (self.project_id,),
+            ).fetchall()
+        }
+
+    def current_goal_node_id(self) -> str:
+        row = self.connection.execute(
+            """
+            SELECT id FROM nodes
+            WHERE project_id = ? AND type = 'goal' AND state = 'active'
+            ORDER BY generation DESC, created_at DESC, id DESC LIMIT 1
+            """,
+            (self.project_id,),
+        ).fetchone()
+        if row is None:
+            raise ValueError("current Goal is missing")
+        return str(row["id"])
+
+    def existing_addresses(self) -> set[tuple[str, str]]:
+        return {
+            (str(row["from_node"]), str(row["to_node"]))
+            for row in self.connection.execute(
+                """
+                SELECT from_node, to_node FROM edges
+                WHERE project_id = ? AND type = 'addresses'
                 """,
                 (self.project_id,),
             ).fetchall()
@@ -1538,13 +1602,71 @@ class BlackboardStore:
                 )
 
             if update.goal_achieved:
-                if update.final_answer is None:
-                    raise ValueError("goal completion requires final answer")
-                self._record_answer(
-                    str(execution["provider"]),
-                    update.final_answer,
-                    update.answer_key,
-                )
+                if getattr(update, "protocol_version", 1) == 2:
+                    result_ref = getattr(update, "goal_result_ref", None)
+                    result_node_id = refs.get(result_ref or "", result_ref or "")
+                    result = self.connection.execute(
+                        "SELECT type FROM nodes WHERE id = ? AND project_id = ?",
+                        (result_node_id, self.project_id),
+                    ).fetchone()
+                    if result is None or result["type"] != "fact":
+                        raise ValueError("goal result must resolve to a Fact")
+                    goal = self.connection.execute(
+                        """
+                        SELECT id FROM nodes
+                        WHERE project_id = ? AND type = 'goal' AND state = 'active'
+                        ORDER BY generation DESC, created_at DESC, id DESC LIMIT 1
+                        """,
+                        (self.project_id,),
+                    ).fetchone()
+                    if goal is None:
+                        raise ValueError("current Goal is missing")
+                    address = self.connection.execute(
+                        """
+                        SELECT 1 FROM edges
+                        WHERE project_id = ? AND type = 'addresses'
+                          AND from_node = ? AND to_node = ?
+                        LIMIT 1
+                        """,
+                        (self.project_id, result_node_id, str(goal["id"])),
+                    ).fetchone()
+                    if address is None:
+                        raise ValueError("goal result must address the current Goal")
+                    goal_version = int(
+                        self.connection.execute(
+                            "SELECT goal_version FROM projects WHERE id = ?",
+                            (self.project_id,),
+                        ).fetchone()[0]
+                    )
+                    self.connection.execute(
+                        """
+                        INSERT INTO goal_completion_claims(
+                            id, goal_version, provider, execution_id,
+                            fact_node_id, created_at
+                        ) VALUES (?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            _id("claim"), goal_version, str(execution["provider"]),
+                            execution_id, result_node_id, _now(),
+                        ),
+                    )
+                    self._event(
+                        "goal.completion_claimed",
+                        str(execution["provider"]),
+                        {
+                            "execution_id": execution_id,
+                            "fact_node_id": result_node_id,
+                            "goal_version": goal_version,
+                        },
+                    )
+                else:
+                    if update.final_answer is None:
+                        raise ValueError("goal completion requires final answer")
+                    self._record_answer(
+                        str(execution["provider"]),
+                        update.final_answer,
+                        update.answer_key,
+                    )
 
             self.connection.execute(
                 """
@@ -1855,6 +1977,213 @@ class BlackboardStore:
     def consensus(self, available_providers: int) -> str | None:
         details = self.consensus_details(available_providers)
         return str(details["answer"]) if details is not None else None
+
+    def goal_result(
+        self,
+        available_providers: int | None = None,
+    ) -> GoalResult | None:
+        consensus = self._goal_result_consensus(available_providers)
+        winners = consensus["winners"]
+        if len(winners) != 1:
+            return None
+        winner = winners[0]
+        project = consensus["project"]
+        goal = consensus["goal"]
+        goal_version = int(project["goal_version"])
+        threshold = int(consensus["threshold"])
+        stored_fact_id = project["goal_result_fact_id"]
+        claimed_fact_ids = set(winner["claims_by_fact"])
+        if stored_fact_id is not None and str(stored_fact_id) in claimed_fact_ids:
+            fact_id = str(stored_fact_id)
+        else:
+            fact_id = min(
+                claimed_fact_ids,
+                key=lambda candidate: (
+                    -len(winner["claims_by_fact"][candidate]),
+                    candidate,
+                ),
+            )
+        fact = self.connection.execute(
+            "SELECT id, content FROM nodes WHERE id = ? AND project_id = ? AND type = 'fact' AND state = 'active'",
+            (fact_id, self.project_id),
+        ).fetchone()
+        if fact is None:
+            return None
+        provenance = tuple(
+            str(row["source"])
+            for row in self.connection.execute(
+                "SELECT DISTINCT source FROM node_provenance WHERE node_id = ? ORDER BY source",
+                (fact_id,),
+            ).fetchall()
+        )
+        produced = self.connection.execute(
+            """
+            SELECT intent_edge_id, execution_id FROM intent_outputs
+            WHERE node_id = ? ORDER BY rowid DESC LIMIT 1
+            """,
+            (fact_id,),
+        ).fetchone()
+        result_fact = GoalResultFact(
+            id=fact_id,
+            content=str(fact["content"]),
+            sources=provenance,
+            produced_by_intent_id=(str(produced["intent_edge_id"]) if produced else None),
+            produced_by_execution_id=(str(produced["execution_id"]) if produced else None),
+        )
+        supporting_rows = self.connection.execute(
+            """
+            SELECT DISTINCT n.id, n.content
+            FROM edges e JOIN nodes n ON n.id = e.from_node
+            WHERE e.project_id = ? AND e.to_node = ?
+              AND e.type IN ('supports', 'derived_from')
+              AND n.type = 'fact' AND n.state = 'active'
+            ORDER BY n.created_at DESC, n.id LIMIT 20
+            """,
+            (self.project_id, fact_id),
+        ).fetchall()
+        supporting_by_id = {
+            str(row["id"]): GoalResultFact(
+                id=str(row["id"]), content=str(row["content"])
+            )
+            for row in supporting_rows
+            if str(row["id"]) != fact_id
+        }
+        equivalent_ids = sorted(set(winner["fact_ids"]) - {fact_id})
+        if equivalent_ids:
+            placeholders = ",".join("?" for _ in equivalent_ids)
+            for row in self.connection.execute(
+                f"SELECT id, content FROM nodes WHERE id IN ({placeholders}) AND state = 'active' ORDER BY id",
+                equivalent_ids,
+            ).fetchall():
+                supporting_by_id.setdefault(
+                    str(row["id"]),
+                    GoalResultFact(id=str(row["id"]), content=str(row["content"])),
+                )
+        with self.connection:
+            self.connection.execute(
+                "UPDATE projects SET goal_result_fact_id = ?, updated_at = ? WHERE id = ?",
+                (fact_id, _now(), self.project_id),
+            )
+        return GoalResult(
+            project_id=self.project_id,
+            goal_version=goal_version,
+            goal_node_id=str(goal["id"]),
+            result_ref=f"{self.project_id}:{goal_version}:{fact_id}",
+            fact=result_fact,
+            supporting_facts=tuple(list(supporting_by_id.values())[:20]),
+            supporting_providers=tuple(sorted(winner["supporters"])),
+            completion_threshold=threshold,
+        )
+
+    def goal_result_conflict(
+        self,
+        available_providers: int | None = None,
+    ) -> bool:
+        return len(self._goal_result_consensus(available_providers)["winners"]) > 1
+
+    def _goal_result_consensus(
+        self,
+        available_providers: int | None,
+    ) -> dict[str, object]:
+        project = self.connection.execute(
+            "SELECT goal_version, goal_result_fact_id FROM projects WHERE id = ?",
+            (self.project_id,),
+        ).fetchone()
+        if project is None:
+            raise KeyError(self.project_id)
+        goal_version = int(project["goal_version"])
+        goal = self.connection.execute(
+            """
+            SELECT id FROM nodes
+            WHERE project_id = ? AND type = 'goal' AND state = 'active'
+            ORDER BY generation DESC, created_at DESC, id DESC LIMIT 1
+            """,
+            (self.project_id,),
+        ).fetchone()
+        if goal is None:
+            return {"project": project, "goal": None, "threshold": 1, "winners": []}
+        fact_rows = self.connection.execute(
+            """
+            SELECT id FROM nodes
+            WHERE project_id = ? AND type = 'fact' AND state = 'active'
+            """,
+            (self.project_id,),
+        ).fetchall()
+        active_facts = {str(row["id"]) for row in fact_rows}
+        parents = {fact_id: fact_id for fact_id in active_facts}
+
+        def find(fact_id: str) -> str:
+            while parents[fact_id] != fact_id:
+                parents[fact_id] = parents[parents[fact_id]]
+                fact_id = parents[fact_id]
+            return fact_id
+
+        def union(left: str, right: str) -> None:
+            left_root = find(left)
+            right_root = find(right)
+            if left_root != right_root:
+                first, second = sorted((left_root, right_root))
+                parents[second] = first
+
+        equivalent_rows = self.connection.execute(
+            """
+            SELECT e.from_node, e.to_node
+            FROM edges e
+            JOIN nodes source ON source.id = e.from_node
+            JOIN nodes target ON target.id = e.to_node
+            WHERE e.project_id = ? AND e.type = 'equivalent_to'
+              AND source.type = 'fact' AND source.state = 'active'
+              AND target.type = 'fact' AND target.state = 'active'
+            """,
+            (self.project_id,),
+        ).fetchall()
+        for row in equivalent_rows:
+            left = str(row["from_node"])
+            right = str(row["to_node"])
+            if left in parents and right in parents:
+                union(left, right)
+
+        claim_rows = self.connection.execute(
+            """
+            SELECT fact_node_id, provider FROM goal_completion_claims
+            WHERE goal_version = ? ORDER BY fact_node_id, provider
+            """,
+            (goal_version,),
+        ).fetchall()
+        components: dict[str, dict[str, object]] = {}
+        providers: set[str] = set()
+        for row in claim_rows:
+            fact_id = str(row["fact_node_id"])
+            if fact_id not in parents:
+                continue
+            provider = str(row["provider"])
+            providers.add(provider)
+            root = find(fact_id)
+            component = components.setdefault(
+                root,
+                {"fact_ids": set(), "supporters": set(), "claims_by_fact": {}},
+            )
+            component["fact_ids"].add(fact_id)
+            component["supporters"].add(provider)
+            component["claims_by_fact"].setdefault(fact_id, set()).add(provider)
+        for fact_id in active_facts:
+            root = find(fact_id)
+            if root in components:
+                components[root]["fact_ids"].add(fact_id)
+        provider_count = available_providers if available_providers is not None else max(1, len(providers))
+        threshold = 1 if provider_count == 1 else 2
+        winners = [
+            component
+            for component in components.values()
+            if len(component["supporters"]) >= threshold
+        ]
+        winners.sort(key=lambda component: min(component["fact_ids"]))
+        return {
+            "project": project,
+            "goal": goal,
+            "threshold": threshold,
+            "winners": winners,
+        }
 
     def candidates(self) -> tuple[str, ...]:
         goal_version = int(
@@ -2234,8 +2563,9 @@ class BlackboardStore:
             next_version = previous_version + 1
             self.connection.execute(
                 """
-                UPDATE projects
-                SET status = 'idle', goal_version = ?, final_answer = NULL,
+                    UPDATE projects
+                    SET status = 'idle', goal_version = ?, final_answer = NULL,
+                        goal_result_fact_id = NULL,
                     updated_at = ?
                 WHERE id = ?
                 """,

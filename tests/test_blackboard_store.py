@@ -49,6 +49,51 @@ class StoreTestCase(unittest.TestCase):
         )
         return store, intent
 
+    def finish_v2_result(
+        self,
+        store: BlackboardStore,
+        intent,
+        provider: str,
+        content: str,
+        *,
+        equivalent_to: str | None = None,
+    ) -> str:
+        execution = store.start_execution(
+            intent.id,
+            provider,
+            *self.execution_paths(provider),
+        )
+        relations = [
+            RelationProposal(
+                "addresses",
+                "result",
+                store.current_goal_node_id(),
+            )
+        ]
+        if equivalent_to is not None:
+            relations.append(
+                RelationProposal("equivalent_to", "result", equivalent_to)
+            )
+        store.finish_execution(
+            execution.id,
+            ExecutionUpdate(
+                intent_id=intent.id,
+                facts=(FactProposal("result", content),),
+                edges=tuple(relations),
+                goal_achieved=True,
+                final_answer=None,
+                protocol_version=2,
+                goal_result_ref="result",
+            ),
+            0,
+            "completed",
+        )
+        return next(
+            str(node["id"])
+            for node in store.snapshot()["nodes"]
+            if node["content"] == content
+        )
+
     @staticmethod
     def execution_paths(provider: str = "codex") -> tuple[str, str, str]:
         return (
@@ -689,6 +734,56 @@ class BlackboardExecutionTests(StoreTestCase):
             "flag{same}",
         )
         self.assertEqual(store.candidates(), ("flag{same}",))
+
+    def test_v2_goal_result_counts_claims_for_the_same_fact(self) -> None:
+        store, intent = self.make_store_and_intent()
+
+        fact_id = self.finish_v2_result(
+            store, intent, "codex", "Complete deployment report"
+        )
+        self.assertIsNone(store.goal_result(available_providers=2))
+        self.finish_v2_result(
+            store, intent, "claude", "Complete deployment report"
+        )
+
+        result = store.goal_result(available_providers=2)
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result.fact.id, fact_id)
+        self.assertEqual(result.supporting_providers, ("claude", "codex"))
+        self.assertFalse(store.goal_result_conflict(available_providers=2))
+
+    def test_v2_goal_result_merges_undirected_equivalent_components(self) -> None:
+        store, intent = self.make_store_and_intent()
+
+        first_id = self.finish_v2_result(
+            store, intent, "codex", "Detailed natural-language report"
+        )
+        second_id = self.finish_v2_result(
+            store,
+            intent,
+            "claude",
+            '{"status":"complete","value":42}',
+            equivalent_to=first_id,
+        )
+
+        result = store.goal_result(available_providers=2)
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result.supporting_providers, ("claude", "codex"))
+        exposed_ids = {result.fact.id, *(fact.id for fact in result.supporting_facts)}
+        self.assertTrue({first_id, second_id}.issubset(exposed_ids))
+
+    def test_v2_goal_result_reports_conflicting_quorum_components(self) -> None:
+        store, intent = self.make_store_and_intent()
+
+        self.finish_v2_result(store, intent, "codex", "Result A")
+        self.finish_v2_result(store, intent, "claude", "Result A")
+        self.finish_v2_result(store, intent, "gemini", "Result B")
+        self.finish_v2_result(store, intent, "qwen", "Result B")
+
+        self.assertIsNone(store.goal_result(available_providers=4))
+        self.assertTrue(store.goal_result_conflict(available_providers=4))
 
     def test_consensus_uses_answer_key_and_preserves_display_answer(self) -> None:
         store = self.make_store()

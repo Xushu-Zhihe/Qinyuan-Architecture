@@ -83,6 +83,39 @@ SUBMIT_RESULT_TOOL = {
     },
 }
 
+GET_SOLVER_RESULT_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "get_solver_result",
+        "description": "Read the selected GoalResult for the current solver project.",
+        "parameters": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["project_id"],
+            "properties": {"project_id": {"type": "string"}},
+        },
+    },
+}
+
+LIST_SOLVER_FACTS_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "list_solver_facts",
+        "description": "List bounded supporting facts already attached to the selected GoalResult.",
+        "parameters": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["project_id"],
+            "properties": {
+                "project_id": {"type": "string"},
+                "relation": {"type": ["string", "null"]},
+                "cursor": {"type": ["string", "null"]},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 50},
+            },
+        },
+    },
+}
+
 SKIP_TOOL = {
     "type": "function",
     "function": {
@@ -94,7 +127,7 @@ SKIP_TOOL = {
 
 PHASE_TOOLS = {
     "fetch": (PLATFORM_HTTP_TOOL, DOWNLOAD_ATTACHMENT_TOOL, EXTRACT_TASK_FIELDS_TOOL),
-    "submit": (PREVIEW_SUBMISSION_TOOL, SUBMIT_RESULT_TOOL),
+    "submit": (GET_SOLVER_RESULT_TOOL, LIST_SOLVER_FACTS_TOOL, PREVIEW_SUBMISSION_TOOL, SUBMIT_RESULT_TOOL),
     "skip": (SKIP_TOOL,),
     "plan": (),
 }

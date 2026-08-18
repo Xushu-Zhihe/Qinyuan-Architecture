@@ -661,6 +661,28 @@ class AutoManager:
             raise AutoManagerError("prompt platform adapter is unavailable")
 
         async def handler(name, arguments):
+            if name == "get_solver_result":
+                if str(arguments.get("project_id", "")) != str(session.current_project_id or ""):
+                    raise ValueError("project_id is not the current solver project")
+                return {
+                    "status": "ready",
+                    "result_ref": goal_result.result_ref,
+                    "goal_result_fact": {"id": goal_result.fact.id, "content": goal_result.fact.content},
+                    "supporting_facts": [
+                        {"id": fact.id, "content": fact.content}
+                        for fact in goal_result.supporting_facts
+                    ],
+                    "supporting_providers": list(goal_result.supporting_providers),
+                }
+            if name == "list_solver_facts":
+                if str(arguments.get("project_id", "")) != str(session.current_project_id or ""):
+                    raise ValueError("project_id is not the current solver project")
+                limit = max(1, min(int(arguments.get("limit", 20)), 50))
+                facts = [
+                    {"id": fact.id, "content": fact.content, "relation": "supports_goal"}
+                    for fact in goal_result.supporting_facts
+                ]
+                return {"status": "ready", "facts": facts[:limit], "next_cursor": None}
             if name == "preview_submission":
                 request = arguments.get("request")
                 if not isinstance(request, dict):

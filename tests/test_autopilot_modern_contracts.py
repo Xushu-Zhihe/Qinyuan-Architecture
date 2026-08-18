@@ -222,6 +222,43 @@ class ModernContractTests(unittest.IsolatedAsyncioTestCase):
             await status_controller.close()
             await status_client.aclose()
 
+    async def test_controller_enforces_phase_actions_and_tool_call_ids(self) -> None:
+        responses = [{"choices": [{"message": {"content": '{"protocol_version":2,"action":"accepted"}'}}]}]
+        client = httpx.AsyncClient(
+            transport=httpx.MockTransport(
+                lambda request: httpx.Response(200, json=responses.pop(0), request=request)
+            )
+        )
+        controller = DirectLLMController(
+            ControllerConfig("https://controller.example/v1", "model"),
+            RuntimeControllerSecret("key"),
+            client=client,
+        )
+        try:
+            with self.assertRaises(DirectControllerError):
+                await controller.prompt_phase("fetch", "fetch", lambda _n, _a: _result("ok"))
+        finally:
+            await controller.close()
+            await client.aclose()
+
+        responses = [{"choices": [{"message": {"tool_calls": [{"function": {"name": "platform_http_request", "arguments": "{}"}}]}}]}]
+        client = httpx.AsyncClient(
+            transport=httpx.MockTransport(
+                lambda request: httpx.Response(200, json=responses.pop(0), request=request)
+            )
+        )
+        controller = DirectLLMController(
+            ControllerConfig("https://controller.example/v1", "model"),
+            RuntimeControllerSecret("key"),
+            client=client,
+        )
+        try:
+            with self.assertRaises(DirectControllerError):
+                await controller.prompt_phase("fetch", "fetch", lambda _n, _a: _result("ok"))
+        finally:
+            await controller.close()
+            await client.aclose()
+
 
 async def _result(status: str) -> dict[str, str]:
     return {"status": status}

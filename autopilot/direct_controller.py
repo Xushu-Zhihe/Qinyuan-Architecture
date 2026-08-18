@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from uuid import uuid4
 from typing import Awaitable, Callable, Mapping
 
 import httpx
@@ -43,6 +44,11 @@ _OUTCOME_TOOL_STATUS = {
     "accepted": ("accepted",),
     "rejected": ("rejected",),
     "skipped": ("skipped",),
+}
+_PHASE_ACTIONS = {
+    "fetch": {"task", "wait", "finished", "retryable_error", "fatal_error"},
+    "submit": {"accepted", "rejected", "retryable_error", "fatal_error"},
+    "skip": {"skipped", "skip_failed"},
 }
 
 
@@ -133,6 +139,8 @@ class DirectLLMController:
             action = payload.get("action")
             if not isinstance(action, str) or action not in _ACTION_FIELDS:
                 raise ValueError("unsupported controller action")
+            if action not in _PHASE_ACTIONS.get(phase, set()):
+                raise ValueError(f"action {action} is not allowed in phase {phase}")
             unknown = set(payload) - _ACTION_FIELDS[action]
             if unknown:
                 raise ValueError(f"unknown action fields: {sorted(unknown)}")
@@ -247,19 +255,25 @@ class DirectLLMController:
             if not tools:
                 raise DirectControllerError("controller API attempted a tool call in a tool-free phase")
             for call in tool_calls:
+                if not isinstance(call, Mapping) or not str(call.get("id", "")).strip():
+                    raise DirectControllerError("tool call is missing tool_call_id")
                 function = call.get("function", {})
+                if not isinstance(function, Mapping):
+                    raise DirectControllerError("tool call function is invalid")
                 name = str(function.get("name", ""))
                 if name not in allowed_tools:
                     raise DirectControllerError(f"controller requested unavailable tool: {name}")
                 try:
                     arguments = json.loads(function.get("arguments", "{}"))
+                    if not isinstance(arguments, Mapping):
+                        raise ValueError("tool arguments must be a JSON object")
                     result = await handler(name, arguments)
                 except Exception as exc:
                     result = {"status": "tool_error", "message": str(exc)}
                 if not isinstance(result, Mapping):
                     result = {"status": "tool_error", "message": "tool returned non-object"}
                 tool_results.setdefault(name, []).append(dict(result))
-                messages.append({"role": "tool", "tool_call_id": call.get("id"), "content": json.dumps(result, ensure_ascii=False)})
+                messages.append({"role": "tool", "tool_call_id": call["id"], "content": json.dumps(result, ensure_ascii=False)})
         raise DirectControllerError("controller exceeded max_rounds")
 
     @staticmethod
@@ -278,7 +292,13 @@ class DirectLLMController:
         return "\n".join(parts).strip()
 
     async def _completion(self, messages, tools) -> dict[str, object]:
-        headers = {"Authorization": f"Bearer {self.secret.api_key}", "Content-Type": "application/json", **dict(self.config.extra_headers)}
+        request_id = f"controller-{uuid4().hex}"
+        headers = {
+            "Authorization": f"Bearer {self.secret.api_key}",
+            "Content-Type": "application/json",
+            "X-Request-ID": request_id,
+            **dict(self.config.extra_headers),
+        }
         payload: dict[str, object] = {"model": self.config.model, "messages": messages, **self.config.extra_body}
         if tools:
             payload["tools"] = list(tools)
@@ -303,13 +323,19 @@ class DirectLLMController:
                     exc.response.status_code == 429 or exc.response.status_code >= 500
                 )
                 if attempt < 2 and retryable:
-                    await asyncio.sleep(0.25 * (2**attempt))
+                    delay = 0.25 * (2**attempt)
+                    if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code == 429:
+                        try:
+                            delay = max(0.1, min(float(exc.response.headers.get("Retry-After", "")), 300.0))
+                        except ValueError:
+                            pass
+                    await asyncio.sleep(delay)
                 elif not retryable:
                     break
         if data is None:
             assert last_error is not None
             raise DirectControllerError(
-                f"controller transport failed: {type(last_error).__name__}"
+                f"controller transport failed ({request_id}): {type(last_error).__name__}"
             ) from last_error
         if not isinstance(data, dict):
             raise DirectControllerError("controller response must be an object")

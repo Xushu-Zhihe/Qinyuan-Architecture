@@ -168,6 +168,61 @@ class AutopilotWebTests(unittest.TestCase):
                 )
                 self.assertEqual(forbidden.status_code, 422)
 
+    def test_structured_platform_templates_persist_without_token(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            payload = {
+                "name": "NSSCTF Arena",
+                "platform": {
+                    "base_url": "https://platform.example/api",
+                    "auth": {"token": "platform-secret"},
+                    "fetch_task": {"method": "POST", "path": "/next"},
+                    "submit_result": {
+                        "method": "POST",
+                        "path": "/attempt/{{external_id}}/submit",
+                        "body": {"flag": "{{submission.value}}"},
+                    },
+                    "outcomes": {
+                        "submit": {
+                            "accepted": {"path": "data.correct", "equals": True}
+                        }
+                    },
+                },
+            }
+            with TestClient(create_app(root)) as client:
+                created = client.post("/api/autopilot/templates", json=payload)
+                self.assertEqual(created.status_code, 201, created.text)
+                template = created.json()
+                self.assertEqual(template["name"], "NSSCTF Arena")
+                self.assertEqual(template["platform"]["auth"]["token"], "")
+                self.assertNotIn("platform-secret", created.text)
+
+                duplicate = client.post("/api/autopilot/templates", json=payload)
+                self.assertEqual(duplicate.status_code, 409, duplicate.text)
+
+                listed = client.get("/api/autopilot/templates")
+                self.assertEqual(listed.status_code, 200, listed.text)
+                self.assertEqual([item["name"] for item in listed.json()], ["NSSCTF Arena"])
+                self.assertNotIn("platform-secret", listed.text)
+
+                stored = (root / "autopilot-platform-templates.json").read_text(encoding="utf-8")
+                self.assertNotIn("platform-secret", stored)
+
+                template_file = root / "autopilot-platform-templates.json"
+                template_file.write_text(
+                    stored.replace('"token": ""', '"token": "manually-added-secret"'),
+                    encoding="utf-8",
+                )
+                sanitized = client.get("/api/autopilot/templates")
+                self.assertEqual(sanitized.json()[0]["platform"]["auth"]["token"], "")
+                self.assertNotIn("manually-added-secret", sanitized.text)
+
+                deleted = client.delete(f"/api/autopilot/templates/{template['id']}")
+                self.assertEqual(deleted.status_code, 204, deleted.text)
+                self.assertEqual(client.get("/api/autopilot/templates").json(), [])
+                missing = client.delete(f"/api/autopilot/templates/{template['id']}")
+                self.assertEqual(missing.status_code, 404, missing.text)
+
     def test_platform_health_requires_and_uses_explicit_health_endpoint(self) -> None:
         calls: list[str] = []
 

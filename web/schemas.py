@@ -118,6 +118,8 @@ class FieldMappingPayload(BaseModel):
     name_path: str = "name"
     goal_path: str = "goal"
     origin_path: str = "origin"
+    origin_endpoint_path: str | None = None
+    goal_format: Literal["plain", "flag_objective"] = "plain"
     hints_path: str | None = "hints"
     hints_item_path: str | None = None
     attachments_path: str | None = None
@@ -273,6 +275,13 @@ class StructuredPlatformValidation(BaseModel):
     mode: Literal["structured"]
     platform: StructuredPlatformPayload
     sample_response: object | None = None
+
+
+class StructuredPlatformTemplateCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(min_length=1, max_length=120)
+    platform: StructuredPlatformPayload
 
 
 PlatformValidation = Annotated[

@@ -414,6 +414,11 @@ class DirectLLMController:
                     break
         if data is None:
             assert last_error is not None
+            if isinstance(last_error, httpx.HTTPStatusError):
+                status = last_error.response.status_code
+                raise DirectControllerError(
+                    f"controller transport failed ({request_id}): HTTP {status}"
+                ) from last_error
             raise DirectControllerError(
                 f"controller transport failed ({request_id}): {type(last_error).__name__}"
             ) from last_error

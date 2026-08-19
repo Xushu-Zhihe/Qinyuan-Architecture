@@ -158,6 +158,473 @@ class ModernContractTests(unittest.IsolatedAsyncioTestCase):
             await adapter.close()
             await client.aclose()
 
+    async def test_task_info_uses_the_configured_task_item_path(self) -> None:
+        calls: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(request.url.path)
+            if request.url.path.endswith("/next/"):
+                return httpx.Response(
+                    200,
+                    json={
+                        "code": 200,
+                        "data": {
+                            "attempt": {
+                                "id": 123,
+                                "problem": {
+                                    "type_label": "Web",
+                                    "content": "fetch content",
+                                    "hint": None,
+                                },
+                            }
+                        },
+                    },
+                    request=request,
+                )
+            if request.url.path.endswith("/attempt/123/"):
+                return httpx.Response(
+                    200,
+                    json={
+                        "code": 200,
+                        "data": {
+                            "attempt": {
+                                "id": 123,
+                                "problem": {
+                                    "type_label": "Web",
+                                    "content": "detail content",
+                                    "hint": None,
+                                },
+                            }
+                        },
+                    },
+                    request=request,
+                )
+            return httpx.Response(404, request=request)
+
+        config = _platform_config(
+            fetch_task=_endpoint("POST", "/skill/agent/arena/next/"),
+            task_info=_endpoint(
+                "GET",
+                "/skill/agent/arena/attempt/{{external_id}}/",
+            ),
+            mapping=FieldMapping(
+                task_list_path="data.attempt",
+                external_id_path="id",
+                name_path="problem.type_label",
+                goal_path="problem.content",
+                origin_path="problem.content",
+                hints_path="problem.hint",
+            ),
+        )
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        adapter = StructuredPlatformAdapter(config, client=client)
+        try:
+            result = await adapter.fetch_task()
+            self.assertEqual(result.status, "task")
+            self.assertEqual(result.task.external_id, "123")
+            self.assertEqual(result.task.name, "Web")
+            self.assertEqual(result.task.goal, "detail content")
+            self.assertIn("/api/skill/agent/arena/attempt/123/", calls)
+        finally:
+            await adapter.close()
+            await client.aclose()
+
+    async def test_task_info_empty_detail_field_uses_fetch_value(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            content = "fetch content" if request.url.path.endswith("/next/") else ""
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "attempt": {
+                            "id": 123,
+                            "problem": {
+                                "type_label": "Web",
+                                "content": content,
+                                "hint": None,
+                            },
+                        }
+                    }
+                },
+                request=request,
+            )
+
+        config = _platform_config(
+            fetch_task=_endpoint("POST", "/skill/agent/arena/next/"),
+            task_info=_endpoint(
+                "GET",
+                "/skill/agent/arena/attempt/{{external_id}}/",
+            ),
+            mapping=FieldMapping(
+                task_list_path="data.attempt",
+                external_id_path="id",
+                name_path="problem.type_label",
+                goal_path="problem.content",
+                origin_path="problem.content",
+                hints_path="problem.hint",
+            ),
+        )
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        adapter = StructuredPlatformAdapter(config, client=client)
+        try:
+            result = await adapter.fetch_task()
+            self.assertEqual(result.status, "task")
+            self.assertEqual(result.task.goal, "fetch content")
+            self.assertEqual(result.task.origin, "fetch content")
+        finally:
+            await adapter.close()
+            await client.aclose()
+
+    async def test_nssctf_attachment_only_task_is_downloaded_for_solver(self) -> None:
+        calls: list[tuple[str, str | None]] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append((request.url.path, request.headers.get("Authorization")))
+            if request.url.path.endswith("/next/") or request.url.path.endswith(
+                "/attempt/123/"
+            ):
+                return httpx.Response(
+                    200,
+                    json={
+                        "data": {
+                            "attempt": {
+                                "id": 123,
+                                "problem": {
+                                    "type_label": "Reverse",
+                                    "content": "",
+                                    "hint": None,
+                                    "annex": {
+                                        "name": "challenge.zip",
+                                        "size": 7,
+                                        "url": ["/media/challenge.zip"],
+                                    },
+                                },
+                            }
+                        }
+                    },
+                    request=request,
+                )
+            if request.url.path == "/media/challenge.zip":
+                return httpx.Response(200, content=b"archive", request=request)
+            return httpx.Response(404, request=request)
+
+        config = _platform_config(
+            fetch_task=_endpoint("POST", "/skill/agent/arena/next/"),
+            task_info=_endpoint("GET", "/skill/agent/arena/attempt/{{external_id}}/"),
+            mapping=FieldMapping(
+                task_list_path="data.attempt",
+                external_id_path="id",
+                name_path="problem.type_label",
+                goal_path="problem.content",
+                origin_path="problem.content",
+                hints_path="problem.hint",
+                attachments_path="problem.annex",
+            ),
+        )
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        adapter = StructuredPlatformAdapter(
+            config,
+            secret=RuntimePlatformSecret(token="platform-token"),
+            client=client,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            runtime_root = Path(directory) / "session"
+            adapter.set_runtime_root(runtime_root)
+            try:
+                result = await adapter.fetch_task()
+                self.assertEqual(result.status, "task")
+                self.assertIn("supplied challenge attachment", result.task.goal)
+                paths = result.task.raw_metadata["attachment_paths"]
+                promoted = adapter.promote_attachments(result.task.external_id, paths)
+                challenge_root = adapter.challenge_root(result.task.external_id)
+                self.assertEqual(len(promoted), 1)
+                self.assertEqual(promoted[0].read_bytes(), b"archive")
+                self.assertEqual(promoted[0].parent, challenge_root / "attachments")
+                media_calls = [
+                    auth for path, auth in calls if path.endswith("challenge.zip")
+                ]
+                self.assertEqual(media_calls, ["Bearer platform-token"])
+            finally:
+                await adapter.close()
+                await client.aclose()
+
+    async def test_nssctf_origin_uses_container_url_when_present(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "attempt": {
+                            "id": 5001,
+                            "problem": {
+                                "type_label": "Web",
+                                "content": "密码是多少呀",
+                                "container": {
+                                    "url": ["http://target.example:18080"]
+                                },
+                            },
+                        }
+                    }
+                },
+                request=request,
+            )
+
+        config = _platform_config(
+            fetch_task=_endpoint("POST", "/skill/agent/arena/next/"),
+            mapping=FieldMapping(
+                task_list_path="data.attempt",
+                external_id_path="id",
+                name_path="problem.type_label",
+                goal_path="problem.content",
+                origin_path="problem.content",
+                origin_endpoint_path="problem.container.url.0|problem.container.url",
+                goal_format="flag_objective",
+                hints_path=None,
+            ),
+        )
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        adapter = StructuredPlatformAdapter(config, client=client)
+        try:
+            result = await adapter.fetch_task()
+            self.assertEqual(result.status, "task")
+            self.assertEqual(
+                result.task.goal.splitlines(),
+                [
+                    "\u9898\u76ee\uff1aWeb",
+                    "\u9898\u9762\uff1a\u5bc6\u7801\u662f\u591a\u5c11\u5440",
+                    "\u76ee\u6807\uff1a\u83b7\u53d6\u8be5\u9898\u76ee\u7684 flag "
+                    "\u5e76\u4f5c\u4e3a\u6700\u7ec8\u7b54\u6848\u63d0\u4ea4\u3002",
+                ],
+            )
+            self.assertEqual(result.task.origin, "http://target.example:18080")
+        finally:
+            await adapter.close()
+            await client.aclose()
+
+    async def test_nssctf_uses_question_as_origin_without_endpoint(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "attempt": {
+                            "id": 5002,
+                            "problem": {
+                                "type_label": "Web",
+                                "content": "题面内容",
+                            },
+                        }
+                    }
+                },
+                request=request,
+            )
+
+        config = _platform_config(
+            fetch_task=_endpoint("POST", "/skill/agent/arena/next/"),
+            mapping=FieldMapping(
+                task_list_path="data.attempt",
+                external_id_path="id",
+                name_path="problem.type_label",
+                goal_path="problem.content",
+                origin_path="problem.content",
+                origin_endpoint_path="problem.container.url.0|problem.container.url",
+                goal_format="flag_objective",
+                hints_path=None,
+            ),
+        )
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        adapter = StructuredPlatformAdapter(config, client=client)
+        try:
+            result = await adapter.fetch_task()
+            self.assertEqual(result.status, "task")
+            self.assertEqual(result.task.origin, "题面内容")
+        finally:
+            await adapter.close()
+            await client.aclose()
+
+    async def test_nssctf_pwn_keeps_endpoint_and_attachment_context(self) -> None:
+        config = _platform_config(
+            mapping=FieldMapping(
+                task_list_path="data.attempt",
+                external_id_path="id",
+                name_path="problem.type_label",
+                goal_path="problem.content",
+                origin_path="problem.content",
+                origin_endpoint_path="problem.container.url.0|problem.container.url",
+                goal_format="flag_objective",
+                hints_path=None,
+                attachments_path="problem.annex",
+            ),
+        )
+        adapter = StructuredPlatformAdapter(config)
+        try:
+            task = adapter._map_task(
+                {
+                    "id": 5003,
+                    "problem": {
+                        "type_label": "Pwn",
+                        "content": "分析服务并获取 flag",
+                        "container": {"url": ["nc://target.example:31337"]},
+                        "annex": {
+                            "name": "pwn.bin",
+                            "url": ["/media/pwn.bin"],
+                        },
+                    },
+                }
+            )
+            self.assertEqual(task.origin, "nc://target.example:31337")
+            self.assertEqual(
+                task.raw_metadata["_attachments"],
+                [{"url": "/media/pwn.bin", "name": "pwn.bin"}],
+            )
+            self.assertIn("flag", task.goal)
+        finally:
+            await adapter.close()
+
+    async def test_attachment_retry_does_not_fetch_another_arena_task(self) -> None:
+        next_calls = 0
+        attachment_calls = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal next_calls, attachment_calls
+            if request.url.path.endswith("/next/"):
+                next_calls += 1
+                return httpx.Response(
+                    200,
+                    json={
+                        "data": {
+                            "attempt": {
+                                "id": 123,
+                                "problem": {
+                                    "type_label": "Pwn",
+                                    "content": "",
+                                    "annex": {"url": ["/media/pwn"]},
+                                },
+                            }
+                        }
+                    },
+                    request=request,
+                )
+            attachment_calls += 1
+            if attachment_calls == 1:
+                return httpx.Response(503, request=request)
+            return httpx.Response(200, content=b"binary", request=request)
+
+        config = _platform_config(
+            fetch_task=_endpoint("POST", "/skill/agent/arena/next/"),
+            mapping=FieldMapping(
+                task_list_path="data.attempt",
+                external_id_path="id",
+                name_path="problem.type_label",
+                goal_path="problem.content",
+                origin_path="problem.content",
+                hints_path=None,
+                attachments_path="problem.annex",
+            ),
+        )
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        adapter = StructuredPlatformAdapter(config, client=client)
+        with tempfile.TemporaryDirectory() as directory:
+            adapter.set_runtime_root(Path(directory) / "session")
+            try:
+                first = await adapter.fetch_task()
+                second = await adapter.fetch_task()
+                self.assertEqual(first.status, "retryable_error")
+                self.assertEqual(second.status, "task")
+                self.assertEqual(next_calls, 1)
+                self.assertEqual(attachment_calls, 2)
+            finally:
+                await adapter.close()
+                await client.aclose()
+
+    async def test_cross_origin_attachment_never_receives_platform_credentials(self) -> None:
+        received_headers: dict[str, str] = {}
+        received_query: dict[str, str] = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal received_headers, received_query
+            if request.url.host == "platform.example":
+                return httpx.Response(
+                    200,
+                    json={
+                        "items": [
+                            {
+                                "id": "one",
+                                "name": "Reverse",
+                                "goal": "",
+                                "origin": "",
+                                "attachments": [
+                                    "https://download.example/challenge.bin"
+                                ],
+                            }
+                        ]
+                    },
+                    request=request,
+                )
+            received_headers = dict(request.headers)
+            received_query = dict(request.url.params)
+            return httpx.Response(200, content=b"attachment", request=request)
+
+        config = _platform_config(
+            auth=AuthConfig(type="query", parameter_name="token"),
+            mapping=FieldMapping(
+                task_list_path="items",
+                attachments_path="attachments",
+                hints_path=None,
+            ),
+        )
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        adapter = StructuredPlatformAdapter(
+            config,
+            secret=RuntimePlatformSecret(token="platform-token"),
+            client=client,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            adapter.set_runtime_root(Path(directory) / "session")
+            try:
+                result = await adapter.fetch_task()
+                self.assertEqual(result.status, "task")
+                self.assertNotIn("authorization", received_headers)
+                self.assertNotIn("token", received_query)
+            finally:
+                await adapter.close()
+                await client.aclose()
+
+    async def test_task_info_mapping_error_reports_fields_when_item_path_is_missing(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path.endswith("/next/"):
+                return httpx.Response(
+                    200,
+                    json={"data": {"attempt": {"id": 123}}},
+                    request=request,
+                )
+            return httpx.Response(
+                200,
+                json={"data": {"description": "detail shape"}},
+                request=request,
+            )
+
+        config = _platform_config(
+            fetch_task=_endpoint("POST", "/skill/agent/arena/next/"),
+            task_info=_endpoint("GET", "/skill/agent/arena/attempt/{{external_id}}/"),
+            mapping=FieldMapping(
+                task_list_path="data.attempt",
+                external_id_path="id",
+                name_path="name",
+                goal_path="description",
+                origin_path="description",
+            ),
+        )
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        adapter = StructuredPlatformAdapter(config, client=client)
+        try:
+            result = await adapter.fetch_task()
+            self.assertEqual(result.status, "fatal_error")
+            self.assertIn("non-empty fields: data.description", result.message)
+        finally:
+            await adapter.close()
+            await client.aclose()
+
     async def test_structured_duplicate_task_id_and_attachment_shape_fail_visibly(self) -> None:
         def handler(request: httpx.Request) -> httpx.Response:
             return httpx.Response(
@@ -238,7 +705,7 @@ class ModernContractTests(unittest.IsolatedAsyncioTestCase):
         status_client = httpx.AsyncClient(transport=httpx.MockTransport(status_handler))
         status_controller = DirectLLMController(ControllerConfig("https://controller.example/v1", "model"), RuntimeControllerSecret("key"), client=status_client)
         try:
-            with self.assertRaises(DirectControllerError):
+            with self.assertRaisesRegex(DirectControllerError, r"controller transport failed \(controller-[^)]+\): HTTP 401"):
                 await status_controller.preflight()
             self.assertEqual(attempts, 1)
         finally:

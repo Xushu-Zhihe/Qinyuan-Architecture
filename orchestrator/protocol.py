@@ -168,6 +168,9 @@ def render_intent_request(
     return (
         "Choose the next useful action from the blackboard.\n"
         f"Challenge directory (read-only): {_challenge_text(challenge_dir)}\n"
+        "When the active Origin node is a URL or host:port, it is the "
+        "authoritative target endpoint. Use that endpoint; do not infer or "
+        "replace it.\n"
         "This is planning only. Do not call tools, inspect files, or access "
         "the network. Do not execute the action. Decide from the snapshot "
         "and return the Intent promptly.\n"
@@ -209,6 +212,9 @@ def render_execution_request(
     return (
         "Execute the assigned blackboard intent.\n"
         f"Challenge directory (read-only): {_challenge_text(challenge_dir)}\n"
+        "When the active Origin node is a URL or host:port, it is the "
+        "authoritative target endpoint. Use that endpoint together with any "
+        "files in the challenge directory.\n"
         "You may propose facts and ordinary relation edges only. Do not create "
         "goal, origin, hint, or another intent.\n"
         "Treat environment or provider limitations (permissions, sandbox, "

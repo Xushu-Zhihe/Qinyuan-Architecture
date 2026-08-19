@@ -43,7 +43,7 @@ def main() -> None:
         "web_main:create_server_app",
         factory=True,
         host="127.0.0.1",
-        port=8000,
+        port=8001,
         reload=False,
     )
 

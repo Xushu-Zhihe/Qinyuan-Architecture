@@ -381,6 +381,8 @@ export interface StructuredPlatformInput {
     name_path: string
     goal_path: string
     origin_path: string
+    origin_endpoint_path: string | null
+    goal_format: 'plain' | 'flag_objective'
     hints_path: string | null
     hints_item_path: string | null
     attachments_path: string | null
@@ -396,6 +398,14 @@ export interface StructuredPlatformInput {
   task_info_mode: 'always' | 'when_incomplete'
   task_info_failure_action: 'fail_task' | 'use_fetch_payload' | 'skip_task'
   initial_cursor: string | null
+}
+
+export interface StructuredPlatformTemplate {
+  id: string
+  name: string
+  created_at: string
+  updated_at: string
+  platform: StructuredPlatformInput
 }
 
 interface AutopilotStartCommon {

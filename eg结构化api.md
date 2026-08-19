@@ -149,13 +149,17 @@ NSSCTF `next` 和 attempt detail 响应中的题目位于 `data.attempt`：
   "name_path": "problem.type_label",
   "goal_path": "problem.content",
   "origin_path": "problem.content",
+  "origin_endpoint_path": "problem.container.url.0|problem.container.url",
+  "goal_format": "flag_objective",
   "hints_path": "problem.hint",
   "hints_item_path": null,
-  "attachments_path": null,
+  "attachments_path": "problem.annex",
   "cursor_path": null,
   "lease_id_path": null
 }
 ```
+
+`problem.content` 为空但附件存在时，后端会生成附件分析目标；`problem.annex` 中的 URL 会被下载到当前自动化会话目录，再把包含全部附件的目录作为只读 `challenge_path` 挂载到每个 solver 沙盒。附件下载不依赖 solver 容器内的网络或 Clash 配置。
 
 如果平台返回的字段名是 `attempt.id`，仍然使用模板变量
 `{{external_id}}`；`attempt_id` 不是结构化 API 支持的模板变量。

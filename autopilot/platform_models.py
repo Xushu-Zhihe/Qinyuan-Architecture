@@ -110,11 +110,17 @@ class FieldMapping:
     name_path: str = "name"
     goal_path: str = "goal"
     origin_path: str = "origin"
+    origin_endpoint_path: str | None = None
+    goal_format: str = "plain"
     hints_path: str | None = "hints"
     hints_item_path: str | None = None
     attachments_path: str | None = None
     cursor_path: str | None = None
     lease_id_path: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.goal_format not in {"plain", "flag_objective"}:
+            raise ValueError("unsupported goal format")
 
 
 @dataclass(frozen=True, slots=True)

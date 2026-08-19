@@ -1,10 +1,10 @@
-import { ArrowLeft, Bot, ExternalLink, FileJson2, MessageSquareText, ScanSearch, Square } from 'lucide-react'
+import { ArrowLeft, Bot, Check, ExternalLink, FileJson2, MessageSquareText, Save, ScanSearch, Square, Trash2 } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
 
 import { api } from '../api/client'
 import { AutopilotControllerFields } from '../components/AutopilotControllerFields'
 import { StructuredPlatformForm } from '../components/StructuredPlatformForm'
-import type { AutopilotSnapshot, AutopilotStartPayload, ControllerInput, CurrentTaskResult, PlatformValidationPayload, StructuredPlatformInput, ValidationResult } from '../types'
+import type { AutopilotSnapshot, AutopilotStartPayload, ControllerInput, CurrentTaskResult, PlatformValidationPayload, StructuredPlatformInput, StructuredPlatformTemplate, ValidationResult } from '../types'
 
 const statusLabel: Record<string, string> = {
   starting: '启动中', queued: '等待取题', fetched: '已取题', solving: '解题中', solver_achieved: '已生成结果',
@@ -24,7 +24,7 @@ const defaultStructured: StructuredPlatformInput = {
   default_headers: { Accept: 'application/json' },
   fetch_task: endpoint('GET', '/tasks/next'), current_task: null, task_info: null,
   submit_result: endpoint('POST', '/tasks/{{external_id}}/submit', { result: '{{submission.value}}' }), skip_task: null,
-  mapping: { task_list_path: null, external_id_path: 'id', name_path: 'name', goal_path: 'goal', origin_path: 'origin', hints_path: 'hints', hints_item_path: null, attachments_path: null, cursor_path: null, lease_id_path: null },
+  mapping: { task_list_path: null, external_id_path: 'id', name_path: 'name', goal_path: 'goal', origin_path: 'origin', origin_endpoint_path: null, goal_format: 'plain', hints_path: 'hints', hints_item_path: null, attachments_path: null, cursor_path: null, lease_id_path: null },
   outcomes: { fetch: { finished: null, empty: null }, submit: { accepted: null, rejected: null, retryable: { status_codes: [429, 500, 502, 503, 504] } }, skip: { succeeded: null } },
   health_check: null, task_info_mode: 'always', task_info_failure_action: 'fail_task', initial_cursor: null,
 }
@@ -35,6 +35,9 @@ export function AutopilotPage({ onBack, onOpenProject }: { onBack: () => void; o
   const [controller, setController] = useState(defaultController)
   const [prompt, setPrompt] = useState('')
   const [structured, setStructured] = useState(defaultStructured)
+  const [templates, setTemplates] = useState<StructuredPlatformTemplate[]>([])
+  const [selectedTemplateId, setSelectedTemplateId] = useState('')
+  const [templateName, setTemplateName] = useState('')
   const [sampleResponse, setSampleResponse] = useState('')
   const [solvers, setSolvers] = useState<string[]>([])
   const [agentLimit, setAgentLimit] = useState(1)
@@ -61,8 +64,14 @@ export function AutopilotPage({ onBack, onOpenProject }: { onBack: () => void; o
     } catch (caught) { setError(caught instanceof Error ? caught.message : String(caught)) }
   }
 
+  async function refreshTemplates() {
+    try { setTemplates(await api.listAutopilotTemplates()) }
+    catch (caught) { setError(caught instanceof Error ? caught.message : String(caught)) }
+  }
+
   useEffect(() => {
     void refresh()
+    void refreshTemplates()
     const timer = window.setInterval(() => { void refresh() }, 2000)
     return () => { window.clearInterval(timer); setController(current => ({ ...current, api_key: '' })); setStructured(current => ({ ...current, auth: { ...current.auth, token: '' } })); setPrompt('') }
   }, [])
@@ -76,6 +85,48 @@ export function AutopilotPage({ onBack, onOpenProject }: { onBack: () => void; o
   const history = useMemo(() => session?.history ?? [], [session])
 
   function toggleSolver(provider: string) { setSolvers(current => current.includes(provider) ? current.filter(item => item !== provider) : [...current, provider]) }
+
+  function applyTemplate() {
+    const template = templates.find(item => item.id === selectedTemplateId)
+    if (!template) return
+    setStructured(current => ({ ...template.platform, auth: { ...template.platform.auth, token: current.auth.token } }))
+    setSampleResponse('')
+    setPlatformValidation(null)
+    setCurrentTaskResult(null)
+    setError(null)
+  }
+
+  async function saveTemplate() {
+    const name = templateName.trim()
+    if (!name) { setError('请输入模板名称'); return }
+    const currentToken = structured.auth.token
+    try {
+      setBusy(true)
+      const platform = { ...structured, auth: { ...structured.auth, token: '' } }
+      const saved = await api.saveAutopilotTemplate({ name, platform })
+      setTemplates(current => [...current, saved])
+      setSelectedTemplateId(saved.id)
+      setTemplateName('')
+      setError(null)
+    } catch (caught) { setError(caught instanceof Error ? caught.message : String(caught)) }
+    finally {
+      setStructured(current => ({ ...current, auth: { ...current.auth, token: currentToken } }))
+      setBusy(false)
+    }
+  }
+
+  async function deleteTemplate() {
+    const template = templates.find(item => item.id === selectedTemplateId)
+    if (!template) return
+    try {
+      setBusy(true)
+      await api.deleteAutopilotTemplate(template.id)
+      setTemplates(current => current.filter(item => item.id !== template.id))
+      setSelectedTemplateId('')
+      setError(null)
+    } catch (caught) { setError(caught instanceof Error ? caught.message : String(caught)) }
+    finally { setBusy(false) }
+  }
 
   async function testController() {
     try { setBusy(true); setControllerValidation(await api.testAutopilotController(controller)); setError(null) }
@@ -154,6 +205,14 @@ export function AutopilotPage({ onBack, onOpenProject }: { onBack: () => void; o
     finally { setBusy(false) }
   }
 
+  const templateControls = <div className="platform-template-tools">
+    <label className="auto-field platform-template-select"><span>结构化 API 模板</span><select aria-label="结构化 API 模板" value={selectedTemplateId} onChange={event => setSelectedTemplateId(event.target.value)} disabled={active || busy}><option value="">选择已保存模板</option>{templates.map(template => <option key={template.id} value={template.id}>{template.name}</option>)}</select></label>
+    <div className="platform-template-actions"><button className="secondary-button" type="button" onClick={applyTemplate} disabled={active || busy || !selectedTemplateId}><Check size={15} /> 套用</button><button className="icon-button" type="button" aria-label="删除结构化 API 模板" title="删除模板" onClick={() => void deleteTemplate()} disabled={active || busy || !selectedTemplateId}><Trash2 size={16} /></button></div>
+    <label className="auto-field platform-template-name"><span>新模板名称</span><input value={templateName} onChange={event => setTemplateName(event.target.value)} placeholder="例如 NSSCTF Arena" maxLength={120} disabled={active || busy} /></label>
+    <button className="secondary-button platform-template-save" type="button" onClick={() => void saveTemplate()} disabled={active || busy || !templateName.trim()}><Save size={15} /> 保存模板</button>
+    <p className="auto-help">模板会保存 endpoint、字段映射和结果判断，不保存平台 token。</p>
+  </div>
+
   return <main className="auto-shell">
     <header className="auto-header"><button className="icon-button" aria-label="返回项目" title="返回项目" onClick={onBack}><ArrowLeft size={20} /></button><div><div className="auto-kicker"><Bot size={15} /> AUTOMATIC MODE</div><h1>全自动答题</h1></div>{session && <span className={`auto-status auto-status--${session.status}`}>{statusLabel[session.status] ?? session.status}</span>}</header>
     {error && <p className="form-error auto-error" role="alert">{error}</p>}
@@ -161,7 +220,8 @@ export function AutopilotPage({ onBack, onOpenProject }: { onBack: () => void; o
       <section className="auto-panel auto-config-panel">
         <div className="auto-panel-heading"><div><span className="auto-panel-kicker">CONNECTION</span><h2>连接配置</h2></div><div className="mode-segments" role="group" aria-label="平台接入模式"><button className={mode === 'prompt' ? 'is-active' : ''} onClick={() => setMode('prompt')} disabled={active}><MessageSquareText size={15} /> Prompt</button><button className={mode === 'structured' ? 'is-active' : ''} onClick={() => setMode('structured')} disabled={active}><FileJson2 size={15} /> 结构化 API</button></div></div>
         <AutopilotControllerFields value={controller} disabled={active || busy} validation={controllerValidation} onChange={value => { setController(value); setControllerValidation(null) }} onTest={() => void testController()} />
-        <section className="auto-config-section"><div className="auto-section-heading"><h3>平台</h3><div className="auto-inline-actions"><button className="secondary-button" type="button" onClick={() => void validatePlatform()} disabled={active || busy || !platformReady}>验证配置</button>{mode === 'structured' && structured.current_task !== null && <button className="secondary-button" type="button" onClick={() => void inspectCurrentTask()} disabled={active || busy || !structured.base_url.trim()}><ScanSearch size={15} /> 查看当前题目</button>}{mode === 'structured' && structured.health_check !== null && <button className="secondary-button" type="button" onClick={() => void testPlatformHealth()} disabled={active || busy || !structured.base_url.trim()}>测试健康接口</button>}</div></div>{mode === 'prompt' ? <label className="auto-field auto-field--full"><span>平台说明 prompt</span><textarea value={prompt} onChange={event => { setPrompt(event.target.value); setPlatformValidation(null) }} placeholder="平台协议说明：URL、认证、取题、提交、结果判断与放弃规则" rows={9} disabled={active} /></label> : <><StructuredPlatformForm value={structured} disabled={active} onChange={value => { setStructured(value); setPlatformValidation(null); setCurrentTaskResult(null) }} /><label className="auto-field auto-field--full"><span>样例响应 JSON（可选）</span><textarea value={sampleResponse} onChange={event => { setSampleResponse(event.target.value); setPlatformValidation(null) }} placeholder="粘贴不含 token 的 fetch 样例响应" rows={6} disabled={active} /></label></>}{platformValidation && <p className={`validation-state validation-state--${platformValidation.status}`}>{platformValidation.status === 'valid' ? (platformValidation.mapping_preview ? '配置与样例映射有效' : '配置有效') : [...(platformValidation.missing ?? []).map(item => `缺少：${item}`), ...(platformValidation.warnings ?? []), ...(platformValidation.mapping_preview?.errors ?? [])].join('；')}</p>}{currentTaskResult && (currentTaskResult.task ? <div className="current-task-preview" aria-live="polite"><div><strong>{currentTaskResult.task.name}</strong><small>{currentTaskResult.task.external_id}</small></div><dl><div><dt>Goal</dt><dd>{currentTaskResult.task.goal}</dd></div><div><dt>题面</dt><dd>{currentTaskResult.task.origin}</dd></div>{currentTaskResult.task.hints.length > 0 && <div><dt>提示</dt><dd>{currentTaskResult.task.hints.join('；')}</dd></div>}</dl></div> : <p className="validation-state validation-state--warning" aria-live="polite">{currentTaskResult.message ?? '当前没有题目'}</p>)}</section>
+        {mode === 'structured' && <section className="auto-config-section">{templateControls}</section>}
+        <section className="auto-config-section"><div className="auto-section-heading"><h3>平台</h3><div className="auto-inline-actions"><button className="secondary-button" type="button" onClick={() => void validatePlatform()} disabled={active || busy || !platformReady}>验证配置</button>{mode === 'structured' && structured.current_task !== null && <button className="secondary-button" type="button" onClick={() => void inspectCurrentTask()} disabled={active || busy || !structured.base_url.trim()}><ScanSearch size={15} /> 查看当前题目</button>}{mode === 'structured' && structured.health_check !== null && <button className="secondary-button" type="button" onClick={() => void testPlatformHealth()} disabled={active || busy || !structured.base_url.trim()}>测试健康接口</button>}</div></div>{mode === 'prompt' ? <label className="auto-field auto-field--full"><span>平台说明 prompt</span><textarea value={prompt} onChange={event => { setPrompt(event.target.value); setPlatformValidation(null) }} placeholder="平台协议说明：URL、认证、取题、提交、结果判断与放弃规则" rows={9} disabled={active} /></label> : <><StructuredPlatformForm value={structured} disabled={active} onChange={value => { setStructured(value); setPlatformValidation(null); setCurrentTaskResult(null) }} /><label className="auto-field auto-field--full"><span>样例响应 JSON（可选）</span><textarea value={sampleResponse} onChange={event => { setSampleResponse(event.target.value); setPlatformValidation(null) }} placeholder="粘贴不含 token 的 fetch 样例响应" rows={6} disabled={active} /></label></>}{platformValidation && <p className={`validation-state validation-state--${platformValidation.status}`}>{platformValidation.status === 'valid' ? (platformValidation.mapping_preview ? '配置与样例映射有效' : '配置有效') : [...(platformValidation.missing ?? []).map(item => `缺少：${item}`), ...(platformValidation.warnings ?? []), ...(platformValidation.mapping_preview?.errors ?? [])].join('；')}</p>}{currentTaskResult && (currentTaskResult.task ? <div className="current-task-preview" aria-live="polite"><div><strong>{currentTaskResult.task.name}</strong><small>{currentTaskResult.task.external_id}</small></div><dl><div><dt>Goal</dt><dd>{currentTaskResult.task.goal}</dd></div><div><dt>Origin</dt><dd>{currentTaskResult.task.origin}</dd></div>{currentTaskResult.task.hints.length > 0 && <div><dt>提示</dt><dd>{currentTaskResult.task.hints.join('；')}</dd></div>}</dl></div> : <p className="validation-state validation-state--warning" aria-live="polite">{currentTaskResult.message ?? '当前没有题目'}</p>)}</section>
         <section className="auto-config-section"><div className="auto-fields-grid"><label className="auto-field"><span>每题超时（分钟）</span><input type="number" min={1} max={1440} value={timeoutMinutes} onChange={event => setTimeoutMinutes(Number(event.target.value))} disabled={active} /></label><label className="auto-field"><span>最多题数</span><input type="number" min={1} max={1000} value={maxTasks} onChange={event => setMaxTasks(Number(event.target.value))} disabled={active} /></label><label className="auto-field"><span>拒答后动作</span><select value={rejectedAction} onChange={event => setRejectedAction(event.target.value as typeof rejectedAction)} disabled={active}><option value="fail">终止</option><option value="replan">重新规划</option><option value="skip">跳过</option></select></label><label className="auto-field"><span>业务重新规划次数</span><input type="number" min={0} max={10} value={maxReplans} onChange={event => setMaxReplans(Number(event.target.value))} disabled={active} /></label><label className="auto-field"><span>网络/限流传输重试</span><input type="number" min={0} max={10} value={maxTransportRetries} onChange={event => setMaxTransportRetries(Number(event.target.value))} disabled={active} /></label><label className="auto-field"><span>solver 失败动作</span><select value={solverFailureAction} onChange={event => setSolverFailureAction(event.target.value as typeof solverFailureAction)} disabled={active}><option value="fail">终止</option><option value="skip">跳过</option></select></label><label className="auto-field"><span>停止时 lease</span><select value={stopActiveTaskAction} onChange={event => setStopActiveTaskAction(event.target.value as typeof stopActiveTaskAction)} disabled={active}><option value="leave">保留</option><option value="skip">释放/跳过</option></select></label></div><p className="auto-help">拒答重新规划是业务策略；传输重试只处理网络/限流。solver 失败和停止行为按上方选择执行。</p><fieldset className="auto-provider-choices"><legend>Solver providers</legend>{available.map(provider => { const capability = snapshot?.provider_capabilities?.[provider]; const ready = capability?.auto_ready ?? true; return <label key={provider} className="choice-row"><input type="checkbox" checked={solvers.includes(provider)} onChange={() => toggleSolver(provider)} disabled={active || !ready} /><span>{provider}</span>{!ready && <small>{capability?.status ?? 'legacy-only'}</small>}</label> })}</fieldset><label className="auto-field"><span>每题 Agent 数量</span><input type="number" min={1} max={Math.max(1, solvers.length)} value={selectedLimit} onChange={event => setAgentLimit(Number(event.target.value))} disabled={active || solvers.length === 0} /></label></section>
         <div className="auto-actions"><button className="primary-button" onClick={() => void start()} disabled={!canStart}>{busy ? '处理中...' : '启动全自动'}</button><button className="danger-button" onClick={() => void stop()} disabled={!active || busy}><Square size={16} /> 停止</button></div>
       </section>

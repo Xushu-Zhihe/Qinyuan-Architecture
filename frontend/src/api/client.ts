@@ -14,6 +14,7 @@ import type {
   CurrentTaskResult,
   PlatformValidationPayload,
   StructuredPlatformInput,
+  StructuredPlatformTemplate,
   ValidationResult,
 } from '../types'
 
@@ -103,6 +104,14 @@ export const api = {
     request<PlanningAttempt[]>(`/api/projects/${projectId}/planning-attempts`),
   auditExportUrl: (projectId: string) => `/api/projects/${projectId}/audit/export`,
   getAutopilot: () => request<AutopilotSnapshot>('/api/autopilot'),
+  listAutopilotTemplates: () => request<StructuredPlatformTemplate[]>('/api/autopilot/templates'),
+  saveAutopilotTemplate: (payload: { name: string; platform: StructuredPlatformInput }) =>
+    request<StructuredPlatformTemplate>('/api/autopilot/templates', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+  deleteAutopilotTemplate: (templateId: string) =>
+    request<void>(`/api/autopilot/templates/${templateId}`, { method: 'DELETE' }),
   startAutopilot: (payload: AutopilotStartPayload) =>
     request<AutopilotSnapshot>('/api/autopilot/start', {
       method: 'POST',

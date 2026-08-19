@@ -90,6 +90,7 @@ class IntentProtocolTests(unittest.TestCase):
         self.assertIn("BLACKBOARD_INTENT:", request)
         self.assertIn('"id": "goal-1"', request)
         self.assertIn("E:/ctf/task", request)
+        self.assertIn("authoritative target endpoint", request)
         self.assertIn("Do not call tools", request)
         self.assertIn("Do not execute the action", request)
 
@@ -222,6 +223,7 @@ class ResultProtocolTests(unittest.TestCase):
         self.assertIn("BLACKBOARD_RESULT:", request)
         self.assertIn("intent-1", request)
         self.assertIn("Verify key", request)
+        self.assertIn("authoritative target endpoint", request)
 
     def test_render_execution_request_contains_exact_result_contract(self) -> None:
         request = render_execution_request(

@@ -4,10 +4,10 @@ import asyncio
 import hashlib
 import json
 import shutil
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 from typing import Mapping
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit
 
 import httpx
 
@@ -23,6 +23,7 @@ from autopilot.solver_result import SubmissionPlan
 
 
 RETRYABLE_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
+MAX_ATTACHMENT_SIZE_BYTES = 512 * 1024 * 1024
 
 
 def _extract(value: object, path: str | None) -> object:
@@ -45,6 +46,34 @@ def _extract(value: object, path: str | None) -> object:
         else:
             raise ValueError(f"response mapping path not found: {path}")
     return current
+
+
+def _non_empty_scalar_paths(value: object, prefix: str = "") -> tuple[str, ...]:
+    """Return bounded response-shape diagnostics without exposing field values."""
+
+    paths: list[str] = []
+
+    def visit(current: object, current_path: str, depth: int) -> None:
+        if len(paths) >= 40 or depth > 6:
+            return
+        if isinstance(current, Mapping):
+            for key, nested in current.items():
+                name = str(key)
+                child_path = f"{current_path}.{name}" if current_path else name
+                visit(nested, child_path, depth + 1)
+            return
+        if isinstance(current, list):
+            for index, nested in enumerate(current[:10]):
+                child_path = f"{current_path}.{index}" if current_path else str(index)
+                visit(nested, child_path, depth + 1)
+            return
+        if isinstance(current, str) and current.strip():
+            paths.append(current_path)
+        elif isinstance(current, (int, float)) and not isinstance(current, bool):
+            paths.append(current_path)
+
+    visit(value, prefix, 0)
+    return tuple(paths)
 
 
 def _condition_matches(condition: OutcomeCondition | None, status: int, payload: object) -> bool:
@@ -121,6 +150,8 @@ class StructuredPlatformAdapter:
         self._cursor = config.initial_cursor
         self._terminal_tasks: dict[str, str] = {}
         self._seen_task_ids: set[str] = set()
+        self._pending_attachment_task: AutoTask | None = None
+        self._runtime_root: Path | None = None
 
     @staticmethod
     def preview_mapping(config: StructuredPlatformConfig, sample_response: object) -> dict[str, object]:
@@ -155,6 +186,198 @@ class StructuredPlatformAdapter:
             await self.client.aclose()
         self._pending_items.clear()
         self._seen_task_ids.clear()
+        self._pending_attachment_task = None
+        if self._runtime_root is not None:
+            shutil.rmtree(self._runtime_root / "staging", ignore_errors=True)
+
+    def set_runtime_root(self, runtime_root: Path) -> None:
+        self._runtime_root = runtime_root.resolve()
+        (self._runtime_root / "staging").mkdir(parents=True, exist_ok=True)
+
+    def challenge_root(self, external_id: str) -> Path | None:
+        if self._runtime_root is None:
+            return None
+        task_key = hashlib.sha256(external_id.encode("utf-8")).hexdigest()[:24]
+        return self._runtime_root / "tasks" / task_key
+
+    def _attachment_url(self, value: str) -> str:
+        url = urljoin(self.config.base_url + "/", value)
+        parsed = urlsplit(url)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ValueError("unsupported attachment URL")
+        return url
+
+    def _is_platform_origin(self, url: str) -> bool:
+        base = urlsplit(self.config.base_url)
+        target = urlsplit(url)
+        return (target.scheme.casefold(), target.netloc.casefold()) == (
+            base.scheme.casefold(),
+            base.netloc.casefold(),
+        )
+
+    def _attachment_headers(self, url: str) -> dict[str, str]:
+        headers = dict(self.config.default_headers)
+        if not self._is_platform_origin(url):
+            return headers
+        auth = self.config.auth
+        token = self.secret.token
+        if token:
+            if auth.type in {"bearer", "header"}:
+                headers[auth.header_name] = f"{auth.prefix} {token}".strip()
+            elif auth.type == "cookie":
+                headers["Cookie"] = f"{auth.parameter_name}={token}"
+        return headers
+
+    def _attachment_query(self, url: str) -> dict[str, str] | None:
+        auth = self.config.auth
+        if (
+            self.secret.token
+            and auth.type == "query"
+            and self._is_platform_origin(url)
+        ):
+            return {auth.parameter_name: self.secret.token}
+        return None
+
+    @staticmethod
+    def _attachment_filename(value: object, index: int) -> str:
+        name = value.get("name") if isinstance(value, Mapping) else None
+        if not isinstance(name, str) or not name.strip():
+            url = value.get("url") if isinstance(value, Mapping) else value
+            if isinstance(url, str):
+                name = Path(urlsplit(url).path).name
+        name = str(name or "").strip()
+        if name in {"", ".", ".."}:
+            name = f"attachment-{index}"
+        name = Path(name.replace("\\", "/")).name
+        name = "".join(
+            "_" if character in '<>:"/\\|?*' or ord(character) < 32 else character
+            for character in name
+        )[:180]
+        if Path(name).stem.upper() in {
+            "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4",
+            "COM5", "COM6", "COM7", "COM8", "COM9", "LPT1", "LPT2", "LPT3",
+            "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+        }:
+            name = f"_{name}"
+        return name if name not in {"", ".", ".."} else f"attachment-{index}"
+
+    async def _stage_attachments(
+        self, task: AutoTask
+    ) -> tuple[AutoTask | None, PlatformResult | None]:
+        raw = task.raw_metadata.get("_attachments", ())
+        if not raw:
+            return task, None
+        if self._runtime_root is None:
+            return None, PlatformResult(
+                "fatal_error", message="attachment runtime root is not configured"
+            )
+        if not isinstance(raw, list):
+            return None, PlatformResult(
+                "fatal_error", message="attachments must be an array"
+            )
+        paths: list[str] = []
+        for index, attachment in enumerate(raw, start=1):
+            url_value = (
+                attachment.get("url")
+                if isinstance(attachment, Mapping)
+                else attachment
+            )
+            if not isinstance(url_value, str) or not url_value.strip():
+                return None, PlatformResult(
+                    "fatal_error", message="attachment URL is empty"
+                )
+            filename = self._attachment_filename(attachment, index)
+            relative = PurePosixPath("attachments") / f"{index}-{filename}"
+            target = self._runtime_root / "staging" / Path(*relative.parts)
+            temporary = target.with_suffix(target.suffix + ".part")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                url = self._attachment_url(url_value.strip())
+                async with self.client.stream(
+                    "GET",
+                    url,
+                    headers=self._attachment_headers(url),
+                    params=self._attachment_query(url),
+                    timeout=120,
+                ) as response:
+                    if response.status_code in RETRYABLE_STATUS_CODES:
+                        return None, PlatformResult(
+                            "retryable_error",
+                            message=f"attachment download HTTP {response.status_code}",
+                            retry_after_seconds=_retry_delay(response, 0),
+                        )
+                    response.raise_for_status()
+                    declared_size = response.headers.get("Content-Length")
+                    if declared_size and int(declared_size) > MAX_ATTACHMENT_SIZE_BYTES:
+                        return None, PlatformResult(
+                            "fatal_error", message="attachment exceeds 512 MiB limit"
+                        )
+                    size = 0
+                    with temporary.open("wb") as output:
+                        async for chunk in response.aiter_bytes():
+                            size += len(chunk)
+                            if size > MAX_ATTACHMENT_SIZE_BYTES:
+                                raise ValueError("attachment exceeds 512 MiB limit")
+                            output.write(chunk)
+                temporary.replace(target)
+            except httpx.HTTPStatusError as exc:
+                temporary.unlink(missing_ok=True)
+                return None, PlatformResult(
+                    "fatal_error",
+                    message=f"attachment download HTTP {exc.response.status_code}",
+                )
+            except ValueError as exc:
+                temporary.unlink(missing_ok=True)
+                if str(exc) in {
+                    "attachment exceeds 512 MiB limit",
+                    "unsupported attachment URL",
+                }:
+                    return None, PlatformResult("fatal_error", message=str(exc))
+                return None, PlatformResult(
+                    "retryable_error",
+                    message=f"attachment download {type(exc).__name__}",
+                )
+            except (httpx.HTTPError, OSError) as exc:
+                temporary.unlink(missing_ok=True)
+                return None, PlatformResult(
+                    "retryable_error",
+                    message=f"attachment download {type(exc).__name__}",
+                )
+            paths.append(relative.as_posix())
+        metadata = {**dict(task.raw_metadata), "attachment_paths": tuple(paths)}
+        return replace(task, raw_metadata=metadata), None
+
+    async def _prepare_task(self, task: AutoTask) -> PlatformResult:
+        prepared, error = await self._stage_attachments(task)
+        if error is not None:
+            self._pending_attachment_task = (
+                task if error.status == "retryable_error" else None
+            )
+            return error
+        assert prepared is not None
+        self._pending_attachment_task = None
+        return PlatformResult("task", task=prepared, metadata={"cursor": self._cursor})
+
+    def promote_attachments(
+        self, external_id: str, paths: object
+    ) -> tuple[Path, ...]:
+        if self._runtime_root is None or not isinstance(paths, (list, tuple)):
+            return ()
+        destination = self.challenge_root(external_id)
+        assert destination is not None
+        promoted: list[Path] = []
+        for item in paths:
+            relative = PurePosixPath(str(item).replace("\\", "/"))
+            if relative.is_absolute() or ".." in relative.parts:
+                continue
+            source = self._runtime_root / "staging" / Path(*relative.parts)
+            if not source.is_file():
+                continue
+            target = destination / Path(*relative.parts)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(source), str(target))
+            promoted.append(target)
+        return tuple(promoted)
 
     def _headers_and_query(self, endpoint: EndpointConfig, context: Mapping[str, object]) -> tuple[dict[str, str], dict[str, object]]:
         headers = dict(
@@ -214,6 +437,8 @@ class StructuredPlatformAdapter:
         return response, payload, None
 
     async def fetch_task(self) -> PlatformResult:
+        if self._pending_attachment_task is not None:
+            return await self._prepare_task(self._pending_attachment_task)
         if self._pending_items:
             return await self._task_result(self._pending_items.pop(0))
         response, payload, error = await self._request(
@@ -327,9 +552,10 @@ class StructuredPlatformAdapter:
                 )
             self._seen_task_ids.add(task.external_id)
         if self.config.task_info is None:
-            return PlatformResult("task", task=task, metadata={"cursor": self._cursor})
+            assert task is not None
+            return await self._prepare_task(task)
         if task is not None and self.config.task_info_mode == "when_incomplete":
-            return PlatformResult("task", task=task, metadata={"cursor": self._cursor})
+            return await self._prepare_task(task)
         if task is None:
             context = {"cursor": self._cursor or "", "lease_id": ""}
             if isinstance(item, Mapping):
@@ -361,12 +587,15 @@ class StructuredPlatformAdapter:
             )
         if info_error or info_response is None or info_response.is_error:
             if self.config.task_info_failure_action == "use_fetch_payload" and task is not None:
-                return PlatformResult(
-                    "task",
-                    task=task,
-                    message="task info unavailable; using fetch payload",
-                    metadata={"cursor": self._cursor},
-                )
+                prepared = await self._prepare_task(task)
+                if prepared.status == "task":
+                    return PlatformResult(
+                        "task",
+                        task=prepared.task,
+                        message="task info unavailable; using fetch payload",
+                        metadata=prepared.metadata,
+                    )
+                return prepared
             if self.config.task_info_failure_action == "skip_task":
                 if task is None:
                     try:
@@ -392,13 +621,28 @@ class StructuredPlatformAdapter:
                 "fatal_error",
                 message=f"task info HTTP {info_response.status_code}",
             )
+        # Keep the complete payload available for diagnostics when the
+        # configured item path itself is absent or malformed.
+        info_item: object = info_payload
         try:
-            info_task = self._map_task(info_payload, fallback=task)
+            # Field mappings are relative to the configured task item. Detail
+            # endpoints often keep that item under the same path as fetch.
+            info_item = _extract(
+                info_payload,
+                self.config.mapping.task_list_path,
+            )
+            if isinstance(info_item, list):
+                if not info_item:
+                    raise ValueError("task info response contains no task")
+                info_item = info_item[0]
+            info_task = self._map_task(info_item, fallback=task)
         except (KeyError, IndexError, TypeError, ValueError) as exc:
-            return PlatformResult("fatal_error", message=f"task info mapping failed: {exc}")
-        return PlatformResult(
-            "task", task=info_task, metadata={"cursor": self._cursor}
-        )
+            fields = _non_empty_scalar_paths(info_item)
+            detail = f"; non-empty fields: {', '.join(fields)}" if fields else ""
+            return PlatformResult(
+                "fatal_error", message=f"task info mapping failed: {exc}{detail}"
+            )
+        return await self._prepare_task(info_task)
 
     async def health_check(self) -> PlatformResult:
         if self.config.health_check is None:
@@ -419,18 +663,98 @@ class StructuredPlatformAdapter:
         mapping = self.config.mapping
 
         def text(path: str, label: str, default: str | None = None) -> str:
-            try:
-                raw = _extract(item, path)
-            except (KeyError, IndexError, TypeError, ValueError):
-                if default is not None:
-                    return default
-                raise ValueError(f"{label} path not found: {path}")
-            if not isinstance(raw, (str, int, float)) or isinstance(raw, bool):
-                raise TypeError(f"{label} must be a string or number")
-            value = str(raw).strip()
-            if not value:
+            missing = False
+            empty = False
+            invalid = False
+            for candidate in path.split("|"):
+                try:
+                    raw = _extract(item, candidate.strip())
+                except (KeyError, IndexError, TypeError, ValueError):
+                    missing = True
+                    continue
+                if not isinstance(raw, (str, int, float)) or isinstance(raw, bool):
+                    invalid = True
+                    continue
+                value = str(raw).strip()
+                if value:
+                    return value
+                empty = True
+            if default is not None:
+                fallback_value = str(default).strip()
+                if fallback_value:
+                    return fallback_value
+            if empty:
                 raise ValueError(f"{label} is empty")
-            return value
+            if invalid:
+                raise TypeError(f"{label} must be a string or number")
+            if missing:
+                raise ValueError(f"{label} path not found: {path}")
+            raise ValueError(f"{label} path is empty")
+
+        def optional_text(path: str | None) -> str | None:
+            if not path:
+                return None
+            for candidate in path.split("|"):
+                try:
+                    raw = _extract(item, candidate.strip())
+                except (KeyError, IndexError, TypeError, ValueError):
+                    continue
+                if isinstance(raw, (str, int, float)) and not isinstance(raw, bool):
+                    value = str(raw).strip()
+                    if value:
+                        return value
+            return None
+
+        attachments: list[object] = []
+        if fallback is not None:
+            fallback_attachments = fallback.raw_metadata.get("_attachments", ())
+            if isinstance(fallback_attachments, list):
+                attachments = list(fallback_attachments)
+        if mapping.attachments_path:
+            try:
+                raw_attachments = _extract(item, mapping.attachments_path)
+            except (KeyError, IndexError, TypeError, ValueError):
+                raw_attachments = None
+            if raw_attachments is not None:
+                if isinstance(raw_attachments, str):
+                    attachments = [raw_attachments]
+                elif isinstance(raw_attachments, Mapping):
+                    urls = raw_attachments.get("url")
+                    if isinstance(urls, str):
+                        urls = [urls]
+                    if not isinstance(urls, list):
+                        raise TypeError("attachment object url must be a string or array")
+                    name = raw_attachments.get("name")
+                    attachments = [
+                        {
+                            "url": url,
+                            **(
+                                {"name": name}
+                                if len(urls) == 1 and name is not None
+                                else {}
+                            ),
+                        }
+                        for url in urls
+                    ]
+                elif isinstance(raw_attachments, list):
+                    attachments = list(raw_attachments)
+                else:
+                    raise TypeError("attachments must be an array, URL, or attachment object")
+            for attachment in attachments:
+                if isinstance(attachment, str):
+                    if not attachment.strip():
+                        raise ValueError("attachment URL must be non-empty")
+                elif isinstance(attachment, Mapping):
+                    url = attachment.get("url")
+                    name = attachment.get("name")
+                    if not isinstance(url, str) or not url.strip():
+                        raise TypeError("attachment object url must be a non-empty string")
+                    if name is not None and (
+                        not isinstance(name, str) or not name.strip()
+                    ):
+                        raise TypeError("attachment object name must be a non-empty string")
+                else:
+                    raise TypeError("attachments must contain URLs or {url, name} objects")
 
         hints = fallback.hints if fallback else ()
         if mapping.hints_path:
@@ -461,43 +785,43 @@ class StructuredPlatformAdapter:
                     raise ValueError(
                         f"lease_id path not found: {mapping.lease_id_path}"
                     )
-        metadata = dict(item)
+        metadata = {**(dict(fallback.raw_metadata) if fallback else {}), **dict(item)}
         if mapping.attachments_path:
-            try:
-                attachments = _extract(item, mapping.attachments_path)
-            except (KeyError, IndexError, TypeError, ValueError):
-                attachments = None
-            if attachments is None:
-                attachments = []
-            if not isinstance(attachments, list):
-                raise TypeError("attachments must be an array")
-            for attachment in attachments:
-                if isinstance(attachment, str):
-                    if not attachment.strip():
-                        raise ValueError("attachment path must be non-empty")
-                elif isinstance(attachment, Mapping):
-                    url = attachment.get("url")
-                    name = attachment.get("name")
-                    if not isinstance(url, str) or not url.strip():
-                        raise TypeError("attachment object url must be a non-empty string")
-                    if name is not None and (not isinstance(name, str) or not name.strip()):
-                        raise TypeError("attachment object name must be a non-empty string")
-                else:
-                    raise TypeError("attachments must contain strings or {url, name} objects")
             metadata["_attachments"] = attachments
+        attachment_goal = (
+            "Analyze the supplied challenge attachment(s) and recover the requested result."
+            if attachments
+            else None
+        )
+        task_name = text(mapping.name_path, "name", fallback.name if fallback else None)
+        goal = text(
+            mapping.goal_path,
+            "goal",
+            fallback.goal if fallback else attachment_goal,
+        )
+        origin = text(
+            mapping.origin_path,
+            "origin",
+            fallback.origin if fallback else attachment_goal,
+        )
+        endpoint_origin = optional_text(mapping.origin_endpoint_path)
+        if endpoint_origin is not None:
+            origin = endpoint_origin
+        if mapping.goal_format == "flag_objective":
+            goal = (
+                f"题目：{task_name}\n"
+                f"题面：{goal}\n"
+                "目标：获取该题目的 flag 并作为最终答案提交。"
+            )
         return AutoTask(
             external_id=text(
                 mapping.external_id_path,
                 "external_id",
                 fallback.external_id if fallback else None,
             ),
-            name=text(mapping.name_path, "name", fallback.name if fallback else None),
-            goal=text(mapping.goal_path, "goal", fallback.goal if fallback else None),
-            origin=text(
-                mapping.origin_path,
-                "origin",
-                fallback.origin if fallback else None,
-            ),
+            name=task_name,
+            goal=goal,
+            origin=origin,
             hints=hints,
             raw_metadata=metadata,
             lease_id=lease_id,

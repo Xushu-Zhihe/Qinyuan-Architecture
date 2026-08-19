@@ -233,7 +233,9 @@ class AutoManager:
                 self._persist_session(session)
                 if self._controller is not None and hasattr(self._controller, "set_runtime_root"):
                     self._controller.set_runtime_root(runtime_root)
-                if isinstance(self._adapter, PromptPlatformAdapter):
+                if self._adapter is not None and hasattr(
+                    self._adapter, "set_runtime_root"
+                ):
                     self._adapter.set_runtime_root(runtime_root)
                 self._cancel_event = asyncio.Event()
                 self._runner = asyncio.create_task(
@@ -564,15 +566,32 @@ class AutoManager:
                 session.consecutive_duplicate_ids = 0
                 session.current_task = task
                 seen_ids.add(task.external_id)
-                if isinstance(self._adapter, PromptPlatformAdapter):
+                if self._adapter is not None and hasattr(
+                    self._adapter, "promote_attachments"
+                ):
                     attachment_paths = task.raw_metadata.get("attachment_paths", ())
-                    promoted = self._adapter.promote_attachments(task.external_id, attachment_paths)
+                    promoted = self._adapter.promote_attachments(
+                        task.external_id, attachment_paths
+                    )
                     if promoted:
+                        challenge_path = (
+                            self._adapter.challenge_root(task.external_id)
+                            if isinstance(self._adapter, StructuredPlatformAdapter)
+                            and hasattr(self._adapter, "challenge_root")
+                            else promoted[0]
+                        )
                         task = replace(
                             task,
-                            challenge_path=promoted[0],
-                            raw_metadata={**dict(task.raw_metadata), "attachment_paths": tuple(str(path.relative_to(session.runtime_root)) for path in promoted)},
+                            challenge_path=challenge_path,
+                            raw_metadata={
+                                **dict(task.raw_metadata),
+                                "attachment_paths": tuple(
+                                    str(path.relative_to(session.runtime_root))
+                                    for path in promoted
+                                ),
+                            },
                         )
+                        session.current_task = task
                 self._transition(session, "fetched")
                 self._transition(session, "solving")
                 try:

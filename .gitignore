@@ -2,6 +2,8 @@
 .venv/
 
 # Python caches and test artifacts
+.test-tmp/
+.test-work/
 __pycache__/
 *.py[cod]
 .pytest_cache/

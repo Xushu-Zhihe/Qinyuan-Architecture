@@ -17,6 +17,7 @@ from fastapi.staticfiles import StaticFiles
 from autopilot.manager import AutoManager, AutoManagerError
 from autopilot.direct_controller import DirectControllerError, DirectLLMController
 from autopilot.platform import StructuredPlatformAdapter
+from autopilot.platform_templates import PlatformTemplateStore
 from autopilot.models import (
     AutoTask,
     AutoStartConfig,
@@ -55,6 +56,7 @@ from web.schemas import (
     PlatformValidation,
     StructuredAutoStart,
     StructuredPlatformPayload,
+    StructuredPlatformTemplateCreate,
     StructuredPlatformValidation,
 )
 from worker.models import AuditConfig, CoordinatorConfig, ProviderConfig
@@ -175,6 +177,7 @@ def create_app(
         execute=execute,
         audit_config=audit_config,
     )
+    platform_templates = PlatformTemplateStore(service.registry.data_root)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -275,6 +278,25 @@ def create_app(
     @app.get("/api/autopilot")
     async def get_autopilot():
         return await autopilot.snapshot()
+
+    @app.get("/api/autopilot/templates")
+    def list_autopilot_templates():
+        return platform_templates.list()
+
+    @app.post("/api/autopilot/templates", status_code=status.HTTP_201_CREATED)
+    def create_autopilot_template(payload: StructuredPlatformTemplateCreate):
+        platform = payload.platform.model_dump(mode="json")
+        platform["auth"]["token"] = ""
+        try:
+            return platform_templates.create(payload.name, platform)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.delete("/api/autopilot/templates/{template_id}", status_code=status.HTTP_204_NO_CONTENT)
+    def delete_autopilot_template(template_id: str):
+        if not platform_templates.delete(template_id):
+            raise HTTPException(status_code=404, detail="template not found")
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
 
     @app.post("/api/autopilot/start", status_code=status.HTTP_202_ACCEPTED)
     async def start_autopilot(payload: AutoStartConfigPayload):

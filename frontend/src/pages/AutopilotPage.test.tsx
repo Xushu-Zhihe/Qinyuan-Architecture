@@ -3,12 +3,15 @@ import userEvent from '@testing-library/user-event'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { api } from '../api/client'
-import type { AutopilotSnapshot } from '../types'
+import type { AutopilotSnapshot, StructuredPlatformInput } from '../types'
 import { AutopilotPage } from './AutopilotPage'
 
 vi.mock('../api/client', () => ({
   api: {
     getAutopilot: vi.fn(),
+    listAutopilotTemplates: vi.fn(),
+    saveAutopilotTemplate: vi.fn(),
+    deleteAutopilotTemplate: vi.fn(),
     startAutopilot: vi.fn(),
     stopAutopilot: vi.fn(),
     testAutopilotController: vi.fn(),
@@ -20,11 +23,29 @@ vi.mock('../api/client', () => ({
 }))
 
 const empty: AutopilotSnapshot = { session: null, providers: ['fake'] }
+const templateEndpoint = (method: 'GET' | 'POST', path: string, body: unknown = null) => ({ method, path, query: {}, headers: {}, body, form: null, timeout_seconds: 30, max_retries: 0, retry_status_codes: [429, 500, 502, 503, 504] })
+const defaultTemplatePlatform: StructuredPlatformInput = {
+  base_url: '',
+  auth: { type: 'bearer', token: '', header_name: 'Authorization', prefix: 'Bearer', parameter_name: 'token' },
+  default_headers: { Accept: 'application/json' },
+  fetch_task: templateEndpoint('POST', '/next'),
+  current_task: null,
+  task_info: null,
+  submit_result: templateEndpoint('POST', '/attempt/{{external_id}}/submit', { flag: '{{submission.value}}' }),
+  skip_task: null,
+        mapping: { task_list_path: null, external_id_path: 'id', name_path: 'name', goal_path: 'goal', origin_path: 'origin', origin_endpoint_path: null, goal_format: 'plain', hints_path: 'hints', hints_item_path: null, attachments_path: null, cursor_path: null, lease_id_path: null },
+  outcomes: { fetch: { finished: null, empty: null }, submit: { accepted: null, rejected: null, retryable: { status_codes: [429, 500, 502, 503, 504] } }, skip: { succeeded: null } },
+  health_check: null,
+  task_info_mode: 'always',
+  task_info_failure_action: 'fail_task',
+  initial_cursor: null,
+}
 
 describe('AutopilotPage', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     vi.mocked(api.getAutopilot).mockResolvedValue(empty)
+    vi.mocked(api.listAutopilotTemplates).mockResolvedValue([])
     vi.mocked(api.startAutopilot).mockResolvedValue({
       ...empty,
       session: {
@@ -127,5 +148,33 @@ describe('AutopilotPage', () => {
     expect(await screen.findByText('Current challenge')).toBeInTheDocument()
     expect(screen.getByText('attempt-1')).toBeInTheDocument()
     expect(api.startAutopilot).not.toHaveBeenCalled()
+  })
+
+  it('saves and applies structured API templates without replacing the current token', async () => {
+    const savedPlatform = {
+      ...defaultTemplatePlatform,
+      base_url: 'https://saved.example/api',
+      auth: { ...defaultTemplatePlatform.auth, token: '' },
+    }
+    vi.mocked(api.listAutopilotTemplates).mockResolvedValue([{ id: 'template-1', name: 'Arena 1', created_at: 'now', updated_at: 'now', platform: savedPlatform }])
+    vi.mocked(api.saveAutopilotTemplate).mockResolvedValue({ id: 'template-2', name: 'Arena 2', created_at: 'now', updated_at: 'now', platform: savedPlatform })
+
+    render(<AutopilotPage onBack={() => {}} onOpenProject={() => {}} />)
+    await screen.findByText('连接配置')
+    await userEvent.click(screen.getByRole('button', { name: '结构化 API' }))
+    await userEvent.type(screen.getByLabelText('平台 token'), 'current-secret')
+    await userEvent.selectOptions(await screen.findByLabelText('结构化 API 模板'), 'template-1')
+    await userEvent.click(screen.getByRole('button', { name: '套用' }))
+
+    expect(screen.getByLabelText('平台 Base URL')).toHaveValue('https://saved.example/api')
+    expect(screen.getByLabelText('平台 token')).toHaveValue('current-secret')
+
+    await userEvent.type(screen.getByLabelText('新模板名称'), 'Arena 2')
+    await userEvent.click(screen.getByRole('button', { name: '保存模板' }))
+    expect(api.saveAutopilotTemplate).toHaveBeenCalledWith(expect.objectContaining({
+      name: 'Arena 2',
+      platform: expect.objectContaining({ base_url: 'https://saved.example/api', auth: expect.objectContaining({ token: '' }) }),
+    }))
+    expect(screen.getByLabelText('平台 token')).toHaveValue('current-secret')
   })
 })

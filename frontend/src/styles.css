@@ -116,12 +116,17 @@ button { color: inherit; }
 .validation-state { margin: 12px 0 0; padding: 8px 10px; border-left: 3px solid #6b8e7b; background: #edf2ee; color: #40594c; font-size: 12px; }
 .validation-state--warning { border-color: #aa812f; background: #f5f0e4; color: #72571f; }
 .validation-state--invalid { border-color: #a55248; background: #f6eae8; color: #843b34; }
+.platform-template-tools { display: grid; grid-template-columns: minmax(190px, 1fr) auto minmax(170px, .8fr) auto; align-items: end; gap: 10px; }
+.platform-template-actions { display: flex; align-items: center; gap: 6px; }
+.platform-template-actions .icon-button { flex: 0 0 38px; }
+.platform-template-tools .auto-help { grid-column: 1 / -1; margin: 0; }
+.platform-template-save { min-height: 38px; }
 .endpoint-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; margin-top: 14px; }
 .endpoint-fields { min-width: 0; margin: 0; padding: 10px; border: 1px solid #cbd0cc; border-radius: 6px; }
 .endpoint-fields legend { padding: 0 5px; color: #59615d; font-size: 11px; font-weight: 750; }
 .endpoint-row { display: grid; grid-template-columns: 96px minmax(0, 1fr); gap: 8px; }
 .auto-provider-choices small { color: #8d342c; font-size: 10px; }
-@media (max-width: 760px) { .mode-segments { width: 100%; }.mode-segments button { flex: 1; justify-content: center; }.auto-field--wide { grid-column: auto; }.endpoint-grid { grid-template-columns: 1fr; }.endpoint-row { grid-template-columns: 88px minmax(0, 1fr); } }
+@media (max-width: 760px) { .mode-segments { width: 100%; }.mode-segments button { flex: 1; justify-content: center; }.auto-field--wide { grid-column: auto; }.platform-template-tools { grid-template-columns: minmax(0, 1fr) auto; }.platform-template-select, .platform-template-name { grid-column: 1; }.platform-template-actions, .platform-template-save { grid-column: 2; }.endpoint-grid { grid-template-columns: 1fr; }.endpoint-row { grid-template-columns: 88px minmax(0, 1fr); } }
 
 .workspace-shell { height: 100vh; display: grid; grid-template-columns: 48px minmax(0, 1fr) 300px; grid-template-rows: 54px minmax(0, 1fr) 238px; overflow: hidden; background: #edf0ed; }
 .workspace-header { grid-column: 1 / -1; display: flex; align-items: center; gap: 12px; padding: 0 12px; background: #fff; border-bottom: 1px solid #cbd0cc; z-index: 5; }

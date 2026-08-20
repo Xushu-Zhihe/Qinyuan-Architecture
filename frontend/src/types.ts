@@ -303,6 +303,10 @@ export interface AutoSession {
   current_external_id: string | null
   current_task_name: string | null
   current_project_id: string | null
+  skip_requested?: boolean
+  current_task_started_at?: string | null
+  current_task_deadline_at?: string | null
+  current_task_remaining_seconds?: number | null
   last_message: string | null
   last_error: string | null
   current_task_status?: string | null

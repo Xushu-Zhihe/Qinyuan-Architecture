@@ -14,6 +14,8 @@ vi.mock('../api/client', () => ({
     deleteAutopilotTemplate: vi.fn(),
     startAutopilot: vi.fn(),
     stopAutopilot: vi.fn(),
+    extendAutopilotTime: vi.fn(),
+    skipAutopilotTask: vi.fn(),
     testAutopilotController: vi.fn(),
     validateAutopilotPlatform: vi.fn(),
     validateAutopilotPrompt: vi.fn(),

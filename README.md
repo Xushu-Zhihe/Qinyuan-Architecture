@@ -198,7 +198,7 @@ Vite 默认地址为 `http://127.0.0.1:5173`，并将 `/api` 和 `/ws` 代理到
 
 controller key、平台 token 和完整 prompt 只存在于当前 React state/运行时 session；启动后输入立即清空，snapshot/history/SQLite 不包含凭据。服务重启不会恢复自动 session 或平台 lease。首版不支持 controller streaming、并行题目或结果 artifact/文件上传。
 
-对应接口为 `GET /api/autopilot`、`POST /api/autopilot/start`、`POST /api/autopilot/stop`、`POST /api/autopilot/test-controller`、`POST /api/autopilot/validate-platform`，以及结构化模式的 `POST /api/autopilot/current-task` 和 `POST /api/autopilot/test-platform-health`。current/health 查询只调用用户显式配置的对应 endpoint，不会取题或消耗 lease。
+对应接口为 `GET /api/autopilot`、`POST /api/autopilot/start`、`POST /api/autopilot/stop`、`POST /api/autopilot/extend-time`、`POST /api/autopilot/skip-current-task`、`POST /api/autopilot/test-controller`、`POST /api/autopilot/validate-platform`，以及结构化模式的 `POST /api/autopilot/current-task` 和 `POST /api/autopilot/test-platform-health`。current/health 查询只调用用户显式配置的对应 endpoint，不会取题或消耗 lease。运行中的题目可以通过 `extend-time` 追加本地 solver 时限；`skip-current-task` 会调用平台 skip endpoint，记录跳过并继续下一题。
 
 ### 删除项目
 
@@ -288,6 +288,13 @@ project's `agent-lifecycle/` directory and in an
 | `health_check.failure_threshold` | 连续失败达到该值后将项目标记为 `degraded` |
 | `planning_timeout_seconds` | 规划调用超时；省略时取 `timeout_seconds` 与 120 秒中的较小值 |
 | `timeout_seconds` | Intent 执行调用超时 |
+
+自动答题还受独立的每题总时限控制。Web 页面中的“每题超时（分钟）”默认
+为 60 分钟（3600 秒），并由 `AutoStartConfig.task_timeout_seconds` 执行。运行中追加的
+时间只延长当前本地 solver 截止时间，不会延长平台租约；放弃本题会调用配置的 skip
+endpoint 释放租约并结束本题。默认
+`qinyuan-agent` 的单次规划和执行上限分别为 300 秒和 3600 秒。平台返回的
+`remaining_seconds` 或 `expire_at` 属于平台租约，本地超时配置不能延长平台租约。
 
 `{config_dir}` 会在加载 provider 配置时解析为该 JSON 文件所在目录，可用于声明不受
 进程工作目录影响的仓库相对命令路径。`{work_dir}`、`{challenge_dir}`、

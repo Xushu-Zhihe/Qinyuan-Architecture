@@ -285,6 +285,18 @@ class StructuredPlatformTemplateCreate(BaseModel):
     platform: StructuredPlatformPayload
 
 
+class AutopilotTimeAdjustment(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    seconds: float = Field(gt=0, le=86400)
+
+
+class AutopilotSkipRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    reason: str = Field(default="user skipped", max_length=500)
+
+
 PlatformValidation = Annotated[
     Union[PromptPlatformValidation, StructuredPlatformValidation],
     Field(discriminator="mode"),

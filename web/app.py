@@ -58,6 +58,8 @@ from web.schemas import (
     StructuredPlatformPayload,
     StructuredPlatformTemplateCreate,
     StructuredPlatformValidation,
+    AutopilotTimeAdjustment,
+    AutopilotSkipRequest,
 )
 from worker.models import AuditConfig, CoordinatorConfig, ProviderConfig
 
@@ -371,6 +373,20 @@ def create_app(
     @app.post("/api/autopilot/stop")
     async def stop_autopilot():
         return await autopilot.stop()
+
+    @app.post("/api/autopilot/extend-time")
+    async def extend_autopilot_time(payload: AutopilotTimeAdjustment):
+        try:
+            return await autopilot.extend_time(payload.seconds)
+        except AutoManagerError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/api/autopilot/skip-current-task")
+    async def skip_autopilot_task(payload: AutopilotSkipRequest):
+        try:
+            return await autopilot.skip_current_task(payload.reason)
+        except AutoManagerError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @app.post("/api/autopilot/test-controller")
     async def test_autopilot_controller(payload: ControllerPayload):

@@ -118,6 +118,16 @@ export const api = {
       body: JSON.stringify(payload),
     }),
   stopAutopilot: () => request<AutopilotSnapshot>('/api/autopilot/stop', { method: 'POST' }),
+  extendAutopilotTime: (seconds: number) =>
+    request<AutopilotSnapshot>('/api/autopilot/extend-time', {
+      method: 'POST',
+      body: JSON.stringify({ seconds }),
+    }),
+  skipAutopilotTask: (reason = 'user skipped') =>
+    request<AutopilotSnapshot>('/api/autopilot/skip-current-task', {
+      method: 'POST',
+      body: JSON.stringify({ reason }),
+    }),
   testAutopilotController: (payload: ControllerInput) =>
     request<ValidationResult>('/api/autopilot/test-controller', {
       method: 'POST',

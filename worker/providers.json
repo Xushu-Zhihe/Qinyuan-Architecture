@@ -138,8 +138,8 @@
         "--result-protocol-version",
         "2"
       ],
-      "planning_timeout_seconds": 120,
-      "timeout_seconds": 900,
+      "planning_timeout_seconds": 300,
+      "timeout_seconds": 3600,
       "streaming_supported": false,
       "capabilities": {
         "request_protocol_versions": [1],

@@ -1,4 +1,5 @@
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 import json
 import re
@@ -391,6 +392,9 @@ class AutoSession:
     consecutive_fetch_errors: int = 0
     consecutive_duplicate_ids: int = 0
     stop_release_attempted: bool = False
+    skip_requested: bool = False
+    current_task_started_at: str | None = None
+    current_task_deadline_at: str | None = None
 
     def snapshot(self, providers: tuple[str, ...]) -> dict[str, object]:
         result = {
@@ -413,6 +417,10 @@ class AutoSession:
             "current_external_id": self.current_external_id,
             "current_task_name": self.current_task_name,
             "current_project_id": self.current_project_id,
+            "skip_requested": self.skip_requested,
+            "current_task_started_at": self.current_task_started_at,
+            "current_task_deadline_at": self.current_task_deadline_at,
+            "current_task_remaining_seconds": self._remaining_task_seconds(),
             "last_message": self.last_message,
             "last_error": self.last_error,
             "current_task_status": self.current_task_status,
@@ -437,3 +445,14 @@ class AutoSession:
         if self.config.is_legacy:
             result["controller_provider"] = self.config.controller_provider
         return result
+
+    def _remaining_task_seconds(self) -> float | None:
+        if not self.current_task_deadline_at:
+            return None
+        try:
+            deadline = datetime.fromisoformat(self.current_task_deadline_at)
+        except (TypeError, ValueError):
+            return None
+        if deadline.tzinfo is None:
+            deadline = deadline.replace(tzinfo=timezone.utc)
+        return max(0.0, (deadline - datetime.now(timezone.utc)).total_seconds())

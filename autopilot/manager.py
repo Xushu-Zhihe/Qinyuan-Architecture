@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import re
 import shutil
 from dataclasses import replace
@@ -30,6 +31,10 @@ from worker.capabilities import probe_provider_capabilities, static_capability_s
 
 class AutoManagerError(RuntimeError):
     """A requested automation operation is invalid or cannot continue."""
+
+
+class _SkipTaskRequested(Exception):
+    """Internal signal used to unwind the solver for a user-requested skip."""
 
 
 _CREDENTIAL_PATTERN = re.compile(
@@ -127,6 +132,9 @@ class AutoManager:
         self._controller_secret: RuntimeControllerSecret | None = None
         self._platform_secret: RuntimePlatformSecret | None = None
         self._cleanup_failures = 0
+        self._task_deadline_monotonic: float | None = None
+        self._skip_requested: asyncio.Event | None = None
+        self._skip_reason: str | None = None
         self._controller_health: dict[str, object] = {
             "status": "unknown",
             "last_error": None,
@@ -238,6 +246,8 @@ class AutoManager:
                 ):
                     self._adapter.set_runtime_root(runtime_root)
                 self._cancel_event = asyncio.Event()
+                self._skip_requested = asyncio.Event()
+                self._skip_reason = None
                 self._runner = asyncio.create_task(
                     self._run(session, self._cancel_event)
                 )
@@ -304,6 +314,59 @@ class AutoManager:
                     self._session.current_reason_code = "user_stopped"
                 self._clear_prompt(self._session)
                 self._persist_session(self._session)
+            return self._snapshot_locked()
+
+    async def extend_time(self, seconds: float) -> dict[str, object]:
+        """Extend the deadline of the currently running solver project."""
+        try:
+            additional = float(seconds)
+        except (TypeError, ValueError) as exc:
+            raise AutoManagerError("extension seconds must be a number") from exc
+        if not math.isfinite(additional) or additional <= 0 or additional > 24 * 60 * 60:
+            raise AutoManagerError("extension seconds must be greater than 0 and at most 86400")
+        async with self._lock:
+            session = self._session
+            if session is None or not self._is_active():
+                raise AutoManagerError("no automatic session is running")
+            if session.current_task is None or session.current_project_id is None:
+                raise AutoManagerError("there is no running task to extend")
+            if self._task_deadline_monotonic is None:
+                raise AutoManagerError("the solver deadline is not ready")
+            self._task_deadline_monotonic += additional
+            deadline = datetime.now(timezone.utc).timestamp() + max(
+                0.0, self._task_deadline_monotonic - asyncio.get_running_loop().time()
+            )
+            session.current_task_deadline_at = datetime.fromtimestamp(
+                deadline, timezone.utc
+            ).isoformat()
+            session.last_message = f"task time extended by {int(additional)} seconds"
+            self._persist_session(session)
+            return self._snapshot_locked()
+
+    async def skip_current_task(self, reason: str = "user skipped") -> dict[str, object]:
+        """Request a platform skip for the active task and continue automation."""
+        async with self._lock:
+            session = self._session
+            if session is None or not self._is_active():
+                raise AutoManagerError("no automatic session is running")
+            if session.current_task is None or session.current_external_id is None:
+                raise AutoManagerError("there is no active task to skip")
+            if session.current_task_status in {"submit_pending", "accepted", "skipped", "stopped"}:
+                raise AutoManagerError("the current task can no longer be skipped")
+            adapter_config = getattr(self._adapter, "config", None)
+            if (
+                isinstance(self._adapter, StructuredPlatformAdapter)
+                and adapter_config is not None
+                and adapter_config.skip_task is None
+            ):
+                raise AutoManagerError("structured platform skip endpoint is not configured")
+            if self._skip_requested is None:
+                raise AutoManagerError("skip control is unavailable")
+            self._skip_reason = reason.strip() or "user skipped"
+            self._skip_requested.set()
+            session.skip_requested = True
+            session.last_message = "skip requested; releasing the current task"
+            self._persist_session(session)
             return self._snapshot_locked()
 
     async def aclose(self) -> None:
@@ -565,6 +628,9 @@ class AutoManager:
                     continue
                 session.consecutive_duplicate_ids = 0
                 session.current_task = task
+                session.skip_requested = False
+                if self._skip_requested is not None:
+                    self._skip_requested.clear()
                 seen_ids.add(task.external_id)
                 if self._adapter is not None and hasattr(
                     self._adapter, "promote_attachments"
@@ -596,6 +662,14 @@ class AutoManager:
                 self._transition(session, "solving")
                 try:
                     await self._solve_task(session, task, cancel_event)
+                except _SkipTaskRequested:
+                    await self._skip_modern(
+                        session,
+                        task,
+                        self._skip_reason or "user skipped",
+                    )
+                    self._skip_reason = None
+                    continue
                 except AutoManagerError as exc:
                     if session.config.solver_failure_action == "skip":
                         await self._skip_modern(
@@ -605,6 +679,14 @@ class AutoManager:
                         )
                         continue
                     raise
+                if self._skip_requested is not None and self._skip_requested.is_set():
+                    await self._skip_modern(
+                        session,
+                        task,
+                        self._skip_reason or "user skipped",
+                    )
+                    self._skip_reason = None
+                    continue
                 goal_result = self.service.get_goal_result(session.current_project_id or "")
                 if goal_result is None:
                     project_id = session.current_project_id or ""
@@ -626,9 +708,25 @@ class AutoManager:
                 plan = await self._controller.plan_submission(
                     task, goal_result, cancel_event=cancel_event
                 )
+                if self._skip_requested is not None and self._skip_requested.is_set():
+                    await self._skip_modern(
+                        session,
+                        task,
+                        self._skip_reason or "user skipped",
+                    )
+                    self._skip_reason = None
+                    continue
                 session.current_plan_fingerprint = plan.fingerprint
                 session.current_attempt_phase = "submit"
                 self._transition(session, "submit_pending")
+                if self._skip_requested is not None and self._skip_requested.is_set():
+                    await self._skip_modern(
+                        session,
+                        task,
+                        self._skip_reason or "user skipped",
+                    )
+                    self._skip_reason = None
+                    continue
                 submission, attempt_records = await self._submit_modern(
                     session, task, goal_result, plan, cancel_event
                 )
@@ -948,7 +1046,12 @@ class AutoManager:
             self._reason_code_for_error(reason, default="skipped"),
             attempts or [],
         )
+        session.last_message = "task skipped"
         session.processed_tasks += 1
+        session.skip_requested = False
+        if self._skip_requested is not None:
+            self._skip_requested.clear()
+        self._skip_reason = None
         self._clear_current_task(session)
 
     async def _platform_skip_result(self, task: AutoTask, reason: str) -> PlatformResult:
@@ -1112,6 +1215,9 @@ class AutoManager:
         session.current_external_id = None
         session.current_task_name = None
         session.current_project_id = None
+        session.skip_requested = False
+        session.current_task_started_at = None
+        session.current_task_deadline_at = None
         session.current_task_status = None
         session.current_reason_code = None
         session.current_result_ref = None
@@ -1231,18 +1337,28 @@ class AutoManager:
             )
             project_id = project.id
             session.current_project_id = project.id
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + session.config.task_timeout_seconds
+            self._task_deadline_monotonic = deadline
+            session.current_task_started_at = _timestamp()
+            session.current_task_deadline_at = datetime.fromtimestamp(
+                datetime.now(timezone.utc).timestamp() + session.config.task_timeout_seconds,
+                timezone.utc,
+            ).isoformat()
+            self._persist_session(session)
             await self.service.start_project(project.id)
-            deadline = asyncio.get_running_loop().time() + session.config.task_timeout_seconds
             while True:
                 if cancel_event.is_set():
                     raise asyncio.CancelledError
+                if self._skip_requested is not None and self._skip_requested.is_set():
+                    raise _SkipTaskRequested
                 snapshot = project.store.snapshot()["project"]
                 status = str(snapshot["status"])
                 if status == "achieved":
                     return
                 if status in {"degraded", "stopped"}:
                     raise AutoManagerError(f"solver_degraded: solver project ended with {status}")
-                if asyncio.get_running_loop().time() >= deadline:
+                if loop.time() >= (self._task_deadline_monotonic or deadline):
                     raise AutoManagerError("solver_timeout: solver project timed out")
                 await self._sleep_or_cancel(
                     session.config.poll_interval_seconds, cancel_event
@@ -1252,6 +1368,9 @@ class AutoManager:
                 if project_id is not None:
                     await self.service.stop_project(project_id)
             finally:
+                self._task_deadline_monotonic = None
+                session.current_task_started_at = None
+                session.current_task_deadline_at = None
                 cleanup = getattr(self._adapter, "cleanup_task_artifacts", None)
                 if callable(cleanup):
                     cleanup(task.external_id)

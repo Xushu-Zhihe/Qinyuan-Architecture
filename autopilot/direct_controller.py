@@ -257,6 +257,11 @@ class DirectLLMController:
                 "supporting_facts": [{"id": fact.id, "content": fact.content} for fact in goal_result.supporting_facts],
             },
             "previous_rejection": rejection,
+            "submission_value_contract": (
+                "Represent only the exact business answer, not the platform HTTP request. "
+                "For one flag or token, use content_type text and put only that value in text; "
+                "do not wrap it in a JSON object or repeat endpoint field names."
+            ),
             "required_output": {
                 "content_type": "text|json|form", "text": None,
                 "json_value": None, "named_values": {}, "form_fields": [],

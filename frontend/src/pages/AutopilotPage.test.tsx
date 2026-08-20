@@ -178,4 +178,15 @@ describe('AutopilotPage', () => {
     }))
     expect(screen.getByLabelText('平台 token')).toHaveValue('current-secret')
   })
+
+  it('defaults a configured rejection condition to false', async () => {
+    render(<AutopilotPage onBack={() => {}} onOpenProject={() => {}} />)
+    await screen.findByText('连接配置')
+    await userEvent.click(screen.getByRole('button', { name: '结构化 API' }))
+    await userEvent.type(screen.getByLabelText('拒绝结果路径'), 'data.correct')
+
+    expect(screen.getByLabelText('拒绝结果值')).toHaveValue('false')
+    await userEvent.selectOptions(screen.getByLabelText('拒绝结果值'), 'true')
+    expect(screen.getByLabelText('拒绝结果值')).toHaveValue('true')
+  })
 })

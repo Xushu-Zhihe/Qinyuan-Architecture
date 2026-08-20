@@ -777,6 +777,12 @@ class StructuredPlatformAdapter:
                 raw_hints = None
             if raw_hints is None:
                 hints = fallback.hints if fallback else ()
+            elif (
+                isinstance(raw_hints, (str, int, float))
+                and not isinstance(raw_hints, bool)
+                and mapping.hints_item_path is None
+            ):
+                hints = (str(raw_hints),)
             elif not isinstance(raw_hints, list):
                 raise TypeError("hints must be an array")
             elif mapping.hints_item_path:
@@ -863,6 +869,31 @@ class StructuredPlatformAdapter:
             context[f"task.{key}"] = value
         return context
 
+    @staticmethod
+    def _submission_value(plan: SubmissionPlan, *, scalar_answer: bool) -> object:
+        value = (
+            plan.text
+            if plan.content_type == "text"
+            else plan.json_value
+            if plan.content_type == "json"
+            else dict(plan.form_fields)
+        )
+        if not scalar_answer:
+            return value
+        if isinstance(value, str) and value.strip():
+            return value
+        if isinstance(value, Mapping):
+            candidates = [
+                item
+                for key in ("flag", "answer", "value")
+                if isinstance((item := value.get(key)), str) and item.strip()
+            ]
+            if candidates and all(item == candidates[0] for item in candidates):
+                return candidates[0]
+        raise ValueError(
+            "flag submission plan must provide one scalar string via text, flag, answer, or value"
+        )
+
     async def submit_result(self, task: AutoTask, plan: SubmissionPlan, goal_result) -> PlatformResult:
         terminal = self._terminal_tasks.get(task.external_id)
         if terminal is not None:
@@ -870,7 +901,13 @@ class StructuredPlatformAdapter:
                 "fatal_error",
                 message=f"task is already terminal: {terminal}",
             )
-        value = plan.text if plan.content_type == "text" else plan.json_value if plan.content_type == "json" else dict(plan.form_fields)
+        try:
+            value = self._submission_value(
+                plan,
+                scalar_answer=self.config.mapping.goal_format == "flag_objective",
+            )
+        except ValueError as exc:
+            return PlatformResult("fatal_error", message=str(exc))
         context = {
             **self._task_context(task),
             "external_id": task.external_id,

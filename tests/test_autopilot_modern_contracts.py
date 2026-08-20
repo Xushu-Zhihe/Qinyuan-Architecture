@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -18,6 +19,7 @@ from autopilot.platform_models import (
     OutcomeConfig,
     StructuredPlatformConfig,
 )
+from autopilot.solver_result import SubmissionPlan
 
 
 def _endpoint(method: str, path: str, **kwargs) -> EndpointConfig:
@@ -45,6 +47,56 @@ def _platform_config(**kwargs) -> StructuredPlatformConfig:
 
 
 class ModernContractTests(unittest.IsolatedAsyncioTestCase):
+    async def test_flag_submission_unwraps_json_plan_and_classifies_false_as_rejected(self) -> None:
+        task = AutoTask("5046", "Web", "Recover the flag", "target")
+        goal_result = type(
+            "GoalResult",
+            (),
+            {
+                "result_ref": "result:v2:5046",
+                "fact": type("Fact", (), {"id": "fact-1", "content": "report"})(),
+            },
+        )()
+        plan = SubmissionPlan(
+            result_ref=goal_result.result_ref,
+            source_fact_ids=(goal_result.fact.id,),
+            content_type="json",
+            json_value={"flag": "NSSCTF{answer}"},
+        )
+        config = _platform_config(
+            submit_result=_endpoint(
+                "POST",
+                "/attempt/{{external_id}}/submit",
+                body={"flag": "{{submission.value}}"},
+            ),
+            mapping=FieldMapping(goal_format="flag_objective"),
+            outcomes=OutcomeConfig(
+                submit_accepted=OutcomeCondition(path="data.correct", equals=True),
+                submit_rejected=OutcomeCondition(path="data.correct", equals=False),
+            ),
+        )
+
+        for correct, expected_status in ((True, "accepted"), (False, "rejected")):
+            requests: list[object] = []
+
+            def handler(request: httpx.Request) -> httpx.Response:
+                requests.append(json.loads(request.content))
+                return httpx.Response(
+                    200,
+                    json={"data": {"correct": correct}},
+                    request=request,
+                )
+
+            client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+            adapter = StructuredPlatformAdapter(config, client=client)
+            try:
+                result = await adapter.submit_result(task, plan, goal_result)
+                self.assertEqual(result.status, expected_status)
+                self.assertEqual(requests, [{"flag": "NSSCTF{answer}"}])
+            finally:
+                await adapter.close()
+                await client.aclose()
+
     def test_structured_config_rejects_absolute_paths_and_duplicate_auth(self) -> None:
         with self.assertRaises(ValueError):
             _endpoint("GET", "https://other.example/tasks")
@@ -342,6 +394,46 @@ class ModernContractTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(result.task.name, "Web")
             self.assertEqual(result.task.goal, "detail content")
             self.assertIn("/api/skill/agent/arena/attempt/123/", calls)
+        finally:
+            await adapter.close()
+            await client.aclose()
+
+    async def test_nssctf_scalar_hint_is_normalized(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "attempt": {
+                            "id": 124,
+                            "problem": {
+                                "type_label": "Web",
+                                "content": "challenge content",
+                                "hint": "inspect the request body",
+                            },
+                        }
+                    }
+                },
+                request=request,
+            )
+
+        config = _platform_config(
+            fetch_task=_endpoint("POST", "/skill/agent/arena/next/"),
+            mapping=FieldMapping(
+                task_list_path="data.attempt",
+                external_id_path="id",
+                name_path="problem.type_label",
+                goal_path="problem.content",
+                origin_path="problem.content",
+                hints_path="problem.hint",
+            ),
+        )
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        adapter = StructuredPlatformAdapter(config, client=client)
+        try:
+            result = await adapter.fetch_task()
+            self.assertEqual(result.status, "task")
+            self.assertEqual(result.task.hints, ("inspect the request body",))
         finally:
             await adapter.close()
             await client.aclose()

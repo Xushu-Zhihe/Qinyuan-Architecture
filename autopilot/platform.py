@@ -200,6 +200,17 @@ class StructuredPlatformAdapter:
         task_key = hashlib.sha256(external_id.encode("utf-8")).hexdigest()[:24]
         return self._runtime_root / "tasks" / task_key
 
+    def cleanup_task_artifacts(self, external_id: str) -> None:
+        destination = self.challenge_root(external_id)
+        if destination is None or not destination.exists():
+            return
+        assert self._runtime_root is not None
+        managed_root = (self._runtime_root / "tasks").resolve()
+        resolved_destination = destination.resolve()
+        if destination.is_symlink() or resolved_destination.parent != managed_root:
+            raise ValueError("task artifact path is outside the managed tasks directory")
+        shutil.rmtree(resolved_destination)
+
     def _attachment_url(self, value: str) -> str:
         url = urljoin(self.config.base_url + "/", value)
         parsed = urlsplit(url)
@@ -572,6 +583,8 @@ class StructuredPlatformAdapter:
                     )
         else:
             context = self._task_context(task)
+        if self.config.task_info_delay_seconds > 0:
+            await asyncio.sleep(self.config.task_info_delay_seconds)
         info_response, info_payload, info_error = await self._request(
             self.config.task_info,
             context,
@@ -788,23 +801,35 @@ class StructuredPlatformAdapter:
         metadata = {**(dict(fallback.raw_metadata) if fallback else {}), **dict(item)}
         if mapping.attachments_path:
             metadata["_attachments"] = attachments
-        attachment_goal = (
-            "Analyze the supplied challenge attachment(s) and recover the requested result."
-            if attachments
-            else None
-        )
+        endpoint_origin = optional_text(mapping.origin_endpoint_path)
+        if attachments and endpoint_origin is not None:
+            resource_goal = (
+                "Analyze the supplied challenge attachment(s) and service endpoint "
+                "to recover the requested result."
+            )
+        elif attachments:
+            resource_goal = (
+                "Analyze the supplied challenge attachment(s) and recover the "
+                "requested result."
+            )
+        elif endpoint_origin is not None:
+            resource_goal = (
+                "Analyze the supplied challenge service endpoint and recover the "
+                "requested result."
+            )
+        else:
+            resource_goal = None
         task_name = text(mapping.name_path, "name", fallback.name if fallback else None)
         goal = text(
             mapping.goal_path,
             "goal",
-            fallback.goal if fallback else attachment_goal,
+            fallback.goal if fallback else resource_goal,
         )
         origin = text(
             mapping.origin_path,
             "origin",
-            fallback.origin if fallback else attachment_goal,
+            fallback.origin if fallback else resource_goal,
         )
-        endpoint_origin = optional_text(mapping.origin_endpoint_path)
         if endpoint_origin is not None:
             origin = endpoint_origin
         if mapping.goal_format == "flag_objective":

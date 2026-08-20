@@ -563,6 +563,13 @@ class ProjectService:
     async def stop_project(self, project_id: str) -> ProjectRecord:
         handle = self.get_handle(project_id)
         supervisor = self._supervisors.get(project_id)
+        if supervisor is None and any(
+            self.provider_configs.get(name) is not None
+            and self.provider_configs[name].agent_lifecycle is not None
+            for name in handle.record.providers
+        ):
+            supervisor = self._create_supervisor(handle)
+            self._supervisors[project_id] = supervisor
         if supervisor is not None:
             await supervisor.stop()
         elif handle.store.snapshot()["project"]["status"] != "achieved":
@@ -593,6 +600,13 @@ class ProjectService:
             supervisor = self._supervisors.get(project_id)
 
         try:
+            if supervisor is None and any(
+                self.provider_configs.get(name) is not None
+                and self.provider_configs[name].agent_lifecycle is not None
+                for name in handle.record.providers
+            ):
+                supervisor = self._create_supervisor(handle)
+                self._supervisors[project_id] = supervisor
             if supervisor is not None:
                 await supervisor.stop()
 

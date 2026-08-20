@@ -397,6 +397,7 @@ export interface StructuredPlatformInput {
   health_check: EndpointInput | null
   task_info_mode: 'always' | 'when_incomplete'
   task_info_failure_action: 'fail_task' | 'use_fetch_payload' | 'skip_task'
+  task_info_delay_seconds: number
   initial_cursor: string | null
 }
 

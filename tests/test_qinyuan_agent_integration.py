@@ -209,30 +209,15 @@ class _ProjectFlowHandler(BaseHTTPRequestHandler):
 class QinyuanAgentProviderIntegrationTests(unittest.IsolatedAsyncioTestCase):
     @staticmethod
     def _provider():
-        executable = shutil.which("qinyuan-agent")
-        if executable is None:
-            local = ROOT / ".venv" / "Scripts" / "qinyuan-agent.exe"
-            executable = str(local) if local.is_file() else None
-        if executable is None:
-            return None
-
         configured = next(
             provider
             for provider in load_provider_configs(DEFAULT_PROVIDERS)
             if provider.name == "qinyuan-agent"
         )
-        health_check = configured.health_check
-        if health_check is not None:
-            configured = replace(
-                configured,
-                health_check=replace(
-                    health_check,
-                    command=(executable, *health_check.command[1:]),
-                ),
-            )
+        if shutil.which(configured.command[0]) is None:
+            return None
         return replace(
             configured,
-            command=(executable, *configured.command[1:]),
             timeout_seconds=30,
         )
 
@@ -292,6 +277,8 @@ class QinyuanAgentProviderIntegrationTests(unittest.IsolatedAsyncioTestCase):
                         render_intent_request({"nodes": [], "edges": []}, None),
                         None,
                         directory / "work",
+                        agent_owner_id="qinyuan-bat:test:planning",
+                        agent_work_dir=directory / "agent-work",
                     )
                 stderr = Path(result.stderr_path).read_text(encoding="utf-8")
 

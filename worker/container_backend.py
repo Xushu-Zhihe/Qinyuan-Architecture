@@ -388,6 +388,8 @@ class ContainerExecutionBackend(ExecutionBackend):
         cancel_event: asyncio.Event | None = None,
         max_log_bytes: int = 8 * 1024 * 1024,
         origin_host: str | None = None,
+        agent_owner_id: str | None = None,
+        agent_work_dir: Path | None = None,
     ) -> WorkerResult:
         work_dir.mkdir(parents=True, exist_ok=True)
         stdout_path = work_dir / "stdout.txt"
@@ -400,6 +402,12 @@ class ContainerExecutionBackend(ExecutionBackend):
             self.config.work_mount_path,
             has_challenge=challenge_dir is not None,
             origin_host=origin_host,
+            agent_owner_id=agent_owner_id,
+            agent_work_dir=(
+                str(agent_work_dir.resolve())
+                if agent_work_dir is not None
+                else None
+            ),
         )
         started = time.monotonic()
         outcome = BackendOutcome("unavailable", None)

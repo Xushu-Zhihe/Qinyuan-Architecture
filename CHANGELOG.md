@@ -15,6 +15,11 @@
 
 ## [Unreleased]
 
+- 默认 qinyuan-agent 的执行、释放、能力探测和健康检查统一通过 provider 配置目录
+  定位相邻的 `Qinyuan_Agent` uv 项目，避免系统 `PATH` 中多个同名 CLI 导致随机失效。
+- qinyuan-agent provider 的 sandbox 生命周期改由 solver project 持有：同一
+  `project_id + provider` 的短进程通过稳定 owner ID 和 workspace 接管同一容器，
+  并在项目 achieved/stop/delete 收尾后执行可审计的显式释放。
 - 新增 `BLACKBOARD_RESULT` v2、`goal_result_ref`、Goal Result Fact、completion claim、SQLite schema v5 和 `ProjectService.get_goal_result()`；多 provider 通过同一 Fact 或显式 `equivalent_to` 达成结果共识，不等价结果进入 `result_conflict`。
 - 全自动模式新增独立 OpenAI-compatible Direct LLM Controller，并支持 Prompt/结构化 API 两种平台接入；新 UI 不再选择 provider 作为 controller，旧 provider-controller payload 仅作为兼容入口保留。
 - 新增 text/JSON/form `SubmissionPlan`、冻结 plan fingerprint、rejected/replan 与传输重试分流、题目级状态/history、显式平台 health endpoint 测试和运行时 controller/platform secret 清理。

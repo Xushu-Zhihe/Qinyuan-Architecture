@@ -48,6 +48,12 @@ class ProviderCapabilities:
 
 
 @dataclass(frozen=True, slots=True)
+class AgentLifecycleConfig:
+    release_command: tuple[str, ...]
+    release_timeout_seconds: float = 30.0
+
+
+@dataclass(frozen=True, slots=True)
 class ProviderConfig:
     name: str
     enabled: bool
@@ -64,6 +70,7 @@ class ProviderConfig:
     capabilities: ProviderCapabilities = field(default_factory=ProviderCapabilities)
     capability_probe: CapabilityProbeConfig | None = None
     protocol_arguments: tuple[str, ...] = ()
+    agent_lifecycle: AgentLifecycleConfig | None = None
 
 
 @dataclass(frozen=True, slots=True)

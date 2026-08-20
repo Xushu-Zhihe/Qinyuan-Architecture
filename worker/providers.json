@@ -103,12 +103,35 @@
       "priority": 70,
       "max_running": 2,
       "command": [
+        "uv",
+        "run",
+        "--project",
+        "{config_dir}/../../Qinyuan_Agent",
+        "--frozen",
         "qinyuan-agent",
         "--challenge-dir",
         "{challenge_dir}",
         "--work-dir",
-        "{work_dir}"
+        "{work_dir}",
+        "--sandbox-owner-id",
+        "{agent_owner_id}",
+        "--sandbox-work-dir",
+        "{agent_work_dir}"
       ],
+      "agent_lifecycle": {
+        "release_command": [
+          "uv",
+          "run",
+          "--project",
+          "{config_dir}/../../Qinyuan_Agent",
+          "--frozen",
+          "qinyuan-agent",
+          "--release-sandbox",
+          "--sandbox-owner-id",
+          "{agent_owner_id}"
+        ],
+        "release_timeout_seconds": 30
+      },
       "protocol_arguments": [
         "--required-skill",
         "blackboard-result-protocol",
@@ -129,11 +152,25 @@
         "fixture_digest": "sha256:916cb6308fe2ce645a632a452bc309c330407f126165d09b0bef65bb80a5dcc6"
       },
       "capability_probe": {
-        "command": ["qinyuan-agent", "--capabilities", "--json"],
+        "command": [
+          "uv",
+          "run",
+          "--project",
+          "{config_dir}/../../Qinyuan_Agent",
+          "--frozen",
+          "qinyuan-agent",
+          "--capabilities",
+          "--json"
+        ],
         "timeout_seconds": 15
       },
       "health_check": {
         "command": [
+          "uv",
+          "run",
+          "--project",
+          "{config_dir}/../../Qinyuan_Agent",
+          "--frozen",
           "qinyuan-agent",
           "--health"
         ],

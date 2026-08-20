@@ -150,6 +150,7 @@ def _structured_config(payload: StructuredPlatformPayload) -> StructuredPlatform
         ),
         task_info_mode=payload.task_info_mode,
         task_info_failure_action=payload.task_info_failure_action,
+        task_info_delay_seconds=payload.task_info_delay_seconds,
         initial_cursor=payload.initial_cursor,
     )
 

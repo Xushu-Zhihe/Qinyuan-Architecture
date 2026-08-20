@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import math
 import re
 from typing import Mapping
 from urllib.parse import urlsplit
@@ -155,6 +156,7 @@ class StructuredPlatformConfig:
     health_check: EndpointConfig | None = None
     task_info_mode: str = "always"
     task_info_failure_action: str = "fail_task"
+    task_info_delay_seconds: float = 0
     initial_cursor: str | None = None
 
     def __post_init__(self) -> None:
@@ -172,6 +174,11 @@ class StructuredPlatformConfig:
             "skip_task",
         }:
             raise ValueError("invalid task_info_failure_action")
+        if (
+            not math.isfinite(self.task_info_delay_seconds)
+            or self.task_info_delay_seconds < 0
+        ):
+            raise ValueError("task_info_delay_seconds must be a non-negative finite number")
         auth_header = self.auth.header_name.casefold()
         endpoints = (
             self.fetch_task,

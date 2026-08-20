@@ -38,6 +38,7 @@ const defaultTemplatePlatform: StructuredPlatformInput = {
   health_check: null,
   task_info_mode: 'always',
   task_info_failure_action: 'fail_task',
+  task_info_delay_seconds: 0,
   initial_cursor: null,
 }
 

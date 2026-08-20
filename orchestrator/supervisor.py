@@ -33,6 +33,7 @@ from orchestrator.protocol import (
     render_timeout_summary_request,
 )
 from orchestrator.store import BlackboardStore, ExecutionRecord, IntentRecord
+from worker.agent_lifecycle import release_agent_lifecycle
 from worker.executor import execute_provider
 from worker.models import AuditConfig, LogChunk, ProviderConfig, WorkerResult
 from worker.provider_adapters import get_provider_adapter
@@ -239,6 +240,14 @@ class ProjectSupervisor:
             execute,
             "origin_host",
         )
+        self._execute_accepts_agent_owner_id = self._accepts_keyword(
+            execute,
+            "agent_owner_id",
+        )
+        self._execute_accepts_agent_work_dir = self._accepts_keyword(
+            execute,
+            "agent_work_dir",
+        )
         self.cancel_event = asyncio.Event()
         self.wake_event = asyncio.Event()
         self.write_lock = asyncio.Lock()
@@ -246,6 +255,13 @@ class ProjectSupervisor:
         self.manual_tasks: dict[str, asyncio.Task[None]] = {}
         self._agent_status = {name: "idle" for name in self.providers}
         self._failures = {name: 0 for name in self.providers}
+        self._agent_lifecycle_locks = {
+            name: asyncio.Lock()
+            for name, provider in self.providers.items()
+            if provider.agent_lifecycle is not None
+        }
+        self._released_agent_lifecycles: set[str] = set()
+        self._lifecycle_cleanup_task: asyncio.Task[None] | None = None
         self.store.ensure_provider_health(tuple(self.providers))
 
     @staticmethod
@@ -563,6 +579,91 @@ class ProjectSupervisor:
     async def ensure_provider_ready(self, provider_name: str) -> bool:
         return await self._ensure_provider_ready(self.providers[provider_name])
 
+    def _agent_owner_id(self, provider: ProviderConfig) -> str:
+        return f"qinyuan-bat:{self.store.project_id}:{provider.name}"
+
+    def _agent_work_dir(self, provider: ProviderConfig) -> Path:
+        return self.project_dir / "agent-workspaces" / provider.name
+
+    async def _release_agent_lifecycle(self, provider: ProviderConfig) -> None:
+        if (
+            provider.agent_lifecycle is None
+            or provider.name in self._released_agent_lifecycles
+        ):
+            return
+        lock = self._agent_lifecycle_locks[provider.name]
+        async with lock:
+            if provider.name in self._released_agent_lifecycles:
+                return
+            try:
+                result = await release_agent_lifecycle(
+                    provider,
+                    self._agent_owner_id(provider),
+                    self._agent_work_dir(provider),
+                    self.project_dir
+                    / "agent-lifecycle"
+                    / provider.name
+                    / f"release-{uuid4().hex}",
+                    max_log_bytes=self.audit_config.max_log_bytes,
+                )
+                payload = {
+                    "provider": provider.name,
+                    "owner_id": self._agent_owner_id(provider),
+                    "status": result.status,
+                    "exit_code": result.exit_code,
+                    "duration_seconds": result.duration_seconds,
+                    "stdout_path": result.stdout_path,
+                    "stderr_path": result.stderr_path,
+                    "detail": result.detail,
+                }
+                if result.status == "released":
+                    self._released_agent_lifecycles.add(provider.name)
+            except Exception as exc:
+                payload = {
+                    "provider": provider.name,
+                    "owner_id": self._agent_owner_id(provider),
+                    "status": "failed",
+                    "error_type": type(exc).__name__,
+                    "detail": str(exc)[:500],
+                }
+            await self._append_runtime_event(
+                "agent.lifecycle_release_finished",
+                provider.name,
+                payload,
+            )
+
+    async def _release_agent_lifecycles(self) -> None:
+        await asyncio.gather(
+            *(
+                self._release_agent_lifecycle(provider)
+                for provider in self.providers.values()
+                if provider.agent_lifecycle is not None
+            )
+        )
+
+    def _schedule_agent_lifecycle_cleanup(self) -> None:
+        if not self._agent_lifecycle_locks:
+            return
+        if (
+            self._lifecycle_cleanup_task is not None
+            and not self._lifecycle_cleanup_task.done()
+        ):
+            return
+
+        async def cleanup_after_tasks() -> None:
+            current = asyncio.current_task()
+            active = tuple(self.tasks.values()) + tuple(self.manual_tasks.values())
+            pending = [
+                task
+                for task in active
+                if task is not current and not task.done()
+            ]
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+            await self._release_agent_lifecycles()
+
+        self._lifecycle_cleanup_task = asyncio.create_task(cleanup_after_tasks())
+
     async def _run_provider(
         self,
         provider: ProviderConfig,
@@ -582,6 +683,18 @@ class ProjectSupervisor:
                 kwargs["max_log_bytes"] = self.audit_config.max_log_bytes
             if self._execute_accepts_origin_host:
                 kwargs["origin_host"] = self._origin_host()
+            if provider.agent_lifecycle is not None:
+                if not (
+                    self._execute_accepts_agent_owner_id
+                    and self._execute_accepts_agent_work_dir
+                ):
+                    raise RuntimeError(
+                        "execution backend does not accept Agent lifecycle arguments"
+                    )
+                agent_work_dir = self._agent_work_dir(provider)
+                agent_work_dir.mkdir(parents=True, exist_ok=True)
+                kwargs["agent_owner_id"] = self._agent_owner_id(provider)
+                kwargs["agent_work_dir"] = agent_work_dir
             return await self.execute(
                 provider,
                 request,
@@ -609,37 +722,44 @@ class ProjectSupervisor:
                 cli_version=cli_version,
             )
 
-        try:
-            if self.coordinator is not None:
-                async with self.coordinator.permit(
-                    project_id=self.store.project_id,
-                    provider=provider.name,
-                    kind=kind,
-                    priority=provider.priority,
-                    provider_limit=provider.max_running,
-                    cancel_event=self.cancel_event,
-                ) as lease:
+        async def scheduled() -> WorkerResult:
+            try:
+                if self.coordinator is not None:
+                    async with self.coordinator.permit(
+                        project_id=self.store.project_id,
+                        provider=provider.name,
+                        kind=kind,
+                        priority=provider.priority,
+                        provider_limit=provider.max_running,
+                        cancel_event=self.cancel_event,
+                    ) as lease:
+                        await acquired(lease)
+                        if self.cancel_event.is_set():
+                            return self._cancelled_result(
+                                provider,
+                                work_dir,
+                                lease=lease,
+                                reason="project stop requested",
+                            )
+                        return with_lease(await run(), lease)
+                assert self.global_semaphore is not None
+                async with self.global_semaphore:
+                    lease = PermitLease(0.0, ())
                     await acquired(lease)
-                    if self.cancel_event.is_set():
-                        return self._cancelled_result(
-                            provider,
-                            work_dir,
-                            lease=lease,
-                            reason="project stop requested",
-                        )
                     return with_lease(await run(), lease)
-            assert self.global_semaphore is not None
-            async with self.global_semaphore:
-                lease = PermitLease(0.0, ())
-                await acquired(lease)
-                return with_lease(await run(), lease)
-        except PermitCancelled as exc:
-            return self._cancelled_result(
-                provider,
-                work_dir,
-                lease=PermitLease(exc.queue_seconds, exc.wait_reasons),
-                reason="scheduler permit wait cancelled",
-            )
+            except PermitCancelled as exc:
+                return self._cancelled_result(
+                    provider,
+                    work_dir,
+                    lease=PermitLease(exc.queue_seconds, exc.wait_reasons),
+                    reason="scheduler permit wait cancelled",
+                )
+
+        lifecycle_lock = self._agent_lifecycle_locks.get(provider.name)
+        if lifecycle_lock is None:
+            return await scheduled()
+        async with lifecycle_lock:
+            return await scheduled()
 
     @staticmethod
     def _cancelled_result(
@@ -1478,6 +1598,13 @@ class ProjectSupervisor:
             await self.hub.publish(event)
         await self._prune_finished_logs()
         self.wake_event.set()
+        project_status = str(self.store.snapshot()["project"]["status"])
+        if self.cancel_event.is_set() and project_status in {
+            "achieved",
+            "degraded",
+            "stopped",
+        }:
+            self._schedule_agent_lifecycle_cleanup()
         return IntentAttemptResult("completed")
 
     async def queue_retry(
@@ -1672,6 +1799,13 @@ class ProjectSupervisor:
     async def start(self) -> None:
         if any(not task.done() for task in self.tasks.values()):
             return
+        if self._lifecycle_cleanup_task is not None:
+            await asyncio.gather(
+                self._lifecycle_cleanup_task,
+                return_exceptions=True,
+            )
+            self._lifecycle_cleanup_task = None
+        self._released_agent_lifecycles.clear()
         self.cancel_event.clear()
         runnable: list[str] = []
         for name, provider in self.providers.items():
@@ -1720,3 +1854,7 @@ class ProjectSupervisor:
             )
         if self.store.snapshot()["project"]["status"] != "achieved":
             await self._set_project_status("stopped")
+        await self._release_agent_lifecycles()
+        cleanup_task = self._lifecycle_cleanup_task
+        if cleanup_task is not None and cleanup_task is not asyncio.current_task():
+            await asyncio.gather(cleanup_task, return_exceptions=True)

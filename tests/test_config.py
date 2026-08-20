@@ -47,6 +47,60 @@ class ProviderConfigTests(unittest.TestCase):
             self.assertIsNone(providers[0].health_check)
             self.assertTrue(providers[0].streaming_supported)
 
+    def test_resolves_config_dir_in_all_provider_commands(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = self.write_config(
+                directory,
+                {
+                    "providers": [
+                        {
+                            "name": "qinyuan-agent",
+                            "enabled": True,
+                            "priority": 1,
+                            "command": [
+                                "runner",
+                                "{config_dir}/agent",
+                                "{agent_owner_id}",
+                                "{agent_work_dir}",
+                            ],
+                            "timeout_seconds": 30,
+                            "agent_lifecycle": {
+                                "release_command": [
+                                    "runner",
+                                    "{config_dir}/agent",
+                                    "{agent_owner_id}",
+                                ]
+                            },
+                            "capability_probe": {
+                                "command": ["runner", "{config_dir}/agent"],
+                                "timeout_seconds": 5,
+                            },
+                            "health_check": {
+                                "command": ["runner", "{config_dir}/agent"],
+                                "timeout_seconds": 5,
+                                "cooldown_seconds": 2,
+                            },
+                        }
+                    ]
+                },
+            )
+
+            provider = load_provider_configs(path)[0]
+
+            agent_path = f"{path.resolve().parent}/agent"
+            self.assertEqual(provider.command[1], agent_path)
+            self.assertEqual(provider.command[2], "{agent_owner_id}")
+            assert provider.agent_lifecycle is not None
+            self.assertEqual(provider.agent_lifecycle.release_command[1], agent_path)
+            self.assertEqual(
+                provider.agent_lifecycle.release_command[2],
+                "{agent_owner_id}",
+            )
+            assert provider.capability_probe is not None
+            self.assertEqual(provider.capability_probe.command[1], agent_path)
+            assert provider.health_check is not None
+            self.assertEqual(provider.health_check.command[1], agent_path)
+
     def test_loads_provider_container_overrides(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = self.write_config(
@@ -326,13 +380,39 @@ class ProviderConfigTests(unittest.TestCase):
         self.assertEqual(
             qinyuan.command,
             (
+                "uv",
+                "run",
+                "--project",
+                str(DEFAULT_PROVIDERS.parent) + "/../../Qinyuan_Agent",
+                "--frozen",
                 "qinyuan-agent",
                 "--challenge-dir",
                 "{challenge_dir}",
                 "--work-dir",
                 "{work_dir}",
+                "--sandbox-owner-id",
+                "{agent_owner_id}",
+                "--sandbox-work-dir",
+                "{agent_work_dir}",
             ),
         )
+        self.assertIsNotNone(qinyuan.agent_lifecycle)
+        assert qinyuan.agent_lifecycle is not None
+        self.assertEqual(
+            qinyuan.agent_lifecycle.release_command,
+            (
+                "uv",
+                "run",
+                "--project",
+                str(DEFAULT_PROVIDERS.parent) + "/../../Qinyuan_Agent",
+                "--frozen",
+                "qinyuan-agent",
+                "--release-sandbox",
+                "--sandbox-owner-id",
+                "{agent_owner_id}",
+            ),
+        )
+        self.assertEqual(qinyuan.agent_lifecycle.release_timeout_seconds, 30)
         self.assertEqual(qinyuan.max_running, 2)
         self.assertEqual(qinyuan.planning_timeout_seconds, 120)
         self.assertFalse(qinyuan.streaming_supported)

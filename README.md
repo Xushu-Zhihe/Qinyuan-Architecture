@@ -107,7 +107,10 @@ web-data/
 - npm `11.16.0`；
 - Git；
 - 至少一个已安装并完成认证的 CLI provider（Codex、Claude 或 Kimi）；
-- Docker CLI 和可用 daemon 是可选依赖，仅在使用 `container` 后端时需要；
+- 启用默认 qinyuan-agent provider 时需要 `uv`；它会从相邻的
+  `Qinyuan_Agent` 项目及其 `uv.lock` 启动，不依赖系统安装的同名 CLI；
+- Docker CLI 和可用 daemon 是可选依赖，在使用 `container` 后端或
+  qinyuan-agent sandbox 时需要；
 - Windows、macOS 或 Linux。
 
 如果需要在受支持的 Windows 机器上安装环境，可运行仓库中的
@@ -256,6 +259,19 @@ Codex 使用纯文本流式适配器，Kimi 默认仅在任务完成后输出。
 }
 ```
 
+### Persistent provider lifecycle
+
+A provider that owns resources across short-lived executions can declare an
+`agent_lifecycle` block. Its normal command must use both
+`{agent_owner_id}` and `{agent_work_dir}`. qinyuan-bat derives the owner from
+`project_id + provider`, serializes calls for that owner, and keeps individual
+Execution logs in their original directories while the provider uses one
+stable workspace. `agent_lifecycle.release_command` must contain
+`{agent_owner_id}` and is executed only after the solver project reaches its
+terminal cleanup path. Release stdout/stderr and status are recorded under the
+project's `agent-lifecycle/` directory and in an
+`agent.lifecycle_release_finished` event.
+
 字段说明：
 
 | 字段 | 说明 |
@@ -273,7 +289,10 @@ Codex 使用纯文本流式适配器，Kimi 默认仅在任务完成后输出。
 | `planning_timeout_seconds` | 规划调用超时；省略时取 `timeout_seconds` 与 120 秒中的较小值 |
 | `timeout_seconds` | Intent 执行调用超时 |
 
-支持 `{work_dir}` 和 `{challenge_dir}` 占位符。prompt 通过 stdin 发送，CLI 认证由各 provider 自己管理，平台不读取或保存 API Key。
+`{config_dir}` 会在加载 provider 配置时解析为该 JSON 文件所在目录，可用于声明不受
+进程工作目录影响的仓库相对命令路径。`{work_dir}`、`{challenge_dir}`、
+`{origin_host}`、`{agent_owner_id}` 和 `{agent_work_dir}` 保留到具体调用时再解析。
+prompt 通过 stdin 发送，CLI 认证由各 provider 自己管理，平台不读取或保存 API Key。
 
 ### 执行配额与公平调度
 

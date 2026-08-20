@@ -182,6 +182,7 @@ class StructuredPlatformPayload(BaseModel):
     task_info_failure_action: Literal[
         "fail_task", "use_fetch_payload", "skip_task"
     ] = "fail_task"
+    task_info_delay_seconds: float = Field(default=0, ge=0, le=300)
     initial_cursor: str | None = None
 
 

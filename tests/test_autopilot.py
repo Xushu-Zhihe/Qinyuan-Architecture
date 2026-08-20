@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 
 from autopilot.manager import AutoManager
-from autopilot.models import AutoStartConfig
+from autopilot.models import AutoSession, AutoStartConfig, AutoTask
 from autopilot.protocol import parse_controller_result
 from orchestrator.coordinator import ExecutionCoordinator
 from worker.models import CoordinatorConfig, ProviderConfig, WorkerResult
@@ -71,6 +71,7 @@ class _FakeService:
         )
         self.handles: dict[str, _FakeHandle] = {}
         self.created: list[dict[str, object]] = []
+        self.stopped: list[str] = []
 
     def create_project(self, **kwargs):
         project_id = f"project-{len(self.handles) + 1}"
@@ -89,10 +90,52 @@ class _FakeService:
         return self.handles[project_id]
 
     async def stop_project(self, project_id: str):
-        self.handles[project_id].store.project["status"] = "stopped"
+        self.stopped.append(project_id)
+        if self.handles[project_id].store.project["status"] != "achieved":
+            self.handles[project_id].store.project["status"] = "stopped"
 
 
 class ManagerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_solver_stops_before_cleaning_task_artifacts(self) -> None:
+        root = Path("tests") / "nonexistent-lifecycle-root"
+        events: list[str] = []
+
+        class OrderedService(_FakeService):
+            async def stop_project(self, project_id: str):
+                events.append("stop")
+                await super().stop_project(project_id)
+
+        class CleanupAdapter:
+            def cleanup_task_artifacts(self, external_id: str) -> None:
+                events.append(f"cleanup:{external_id}")
+
+        service = OrderedService(root)
+        provider = ProviderConfig(
+            "fake", True, 10, ("unused",), 10, max_running=1
+        )
+        manager = AutoManager(
+            service=service,
+            provider_configs=(provider,),
+            execute=None,
+        )
+        manager._adapter = CleanupAdapter()
+        config = AutoStartConfig(
+            platform_prompt="platform",
+            controller_provider="fake",
+            solver_providers=("fake",),
+            agent_limit=1,
+            max_tasks=1,
+            poll_interval_seconds=0.001,
+        )
+        session = AutoSession("auto-test", config, root / "runtime")
+        await manager._solve_task(
+            session,
+            AutoTask("task-1", "Task", "Goal", "Origin"),
+            asyncio.Event(),
+        )
+        self.assertEqual(events, ["stop", "cleanup:task-1"])
+        self.assertEqual(service.stopped, ["project-1"])
+
     async def test_completed_submission_advances_to_next_queue_item(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -161,6 +204,7 @@ class ManagerTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(session["completed_tasks"], 1)
             self.assertNotIn("secret-token", json.dumps(snapshot))
             self.assertEqual(len(service.created), 1)
+            self.assertEqual(service.stopped, ["project-1"])
             attachment = service.created[0]["challenge_path"]
             self.assertTrue(Path(attachment).joinpath("input.txt").is_file())
             self.assertNotIn("secret-token", str(service.created[0]["origin"]))

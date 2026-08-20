@@ -4,6 +4,7 @@ from pathlib import Path
 from string import Formatter
 
 from worker.models import (
+    AgentLifecycleConfig,
     AuditConfig,
     CapabilityProbeConfig,
     ContainerBackendConfig,
@@ -16,7 +17,13 @@ from worker.models import (
 from worker.output_adapters import STREAM_FORMATS
 
 
-ALLOWED_PLACEHOLDERS = {"challenge_dir", "work_dir", "origin_host"}
+ALLOWED_PLACEHOLDERS = {
+    "agent_owner_id",
+    "agent_work_dir",
+    "challenge_dir",
+    "origin_host",
+    "work_dir",
+}
 
 
 class ConfigError(ValueError):
@@ -178,6 +185,52 @@ def _parse_capabilities(raw: object, provider_name: str) -> ProviderCapabilities
     )
 
 
+def _parse_agent_lifecycle(
+    raw: object,
+    provider_name: str,
+    command: list[str],
+) -> AgentLifecycleConfig | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ConfigError(
+            f"provider {provider_name!r}.agent_lifecycle must be an object"
+        )
+    release_command = raw.get("release_command")
+    if (
+        not isinstance(release_command, list)
+        or not release_command
+        or any(
+            not isinstance(argument, str) or not argument
+            for argument in release_command
+        )
+    ):
+        raise ConfigError(
+            f"provider {provider_name!r}.agent_lifecycle.release_command "
+            "must be a non-empty list of strings"
+        )
+    _validate_placeholders(provider_name, release_command)
+    invocation = "\n".join(command)
+    if (
+        "{agent_owner_id}" not in invocation
+        or "{agent_work_dir}" not in invocation
+    ):
+        raise ConfigError(
+            f"provider {provider_name!r} with agent_lifecycle must use "
+            "agent_owner_id and agent_work_dir command placeholders"
+        )
+    if "{agent_owner_id}" not in "\n".join(release_command):
+        raise ConfigError(
+            f"provider {provider_name!r}.agent_lifecycle.release_command "
+            "must use the agent_owner_id placeholder"
+        )
+    timeout = _positive_number(
+        raw.get("release_timeout_seconds", 30),
+        f"provider {provider_name!r}.agent_lifecycle.release_timeout_seconds",
+    )
+    return AgentLifecycleConfig(tuple(release_command), timeout)
+
+
 def _parse_provider(raw: object, index: int) -> ProviderConfig:
     if not isinstance(raw, dict):
         raise ConfigError(f"providers[{index}] must be an object")
@@ -291,6 +344,11 @@ def _parse_provider(raw: object, index: int) -> ProviderConfig:
         capabilities=_parse_capabilities(raw.get("capabilities"), name),
         capability_probe=_parse_capability_probe(raw.get("capability_probe"), name),
         protocol_arguments=tuple(protocol_arguments),
+        agent_lifecycle=_parse_agent_lifecycle(
+            raw.get("agent_lifecycle"),
+            name,
+            command,
+        ),
     )
 
 
@@ -305,6 +363,22 @@ def _load_payload(path: Path) -> dict[str, object]:
     if not isinstance(payload, dict) or not isinstance(payload.get("providers"), list):
         raise ConfigError("provider config must contain a providers list")
     return payload
+
+
+def _resolve_provider_config_paths(value: object, config_dir: Path) -> object:
+    if isinstance(value, str):
+        return value.replace("{config_dir}", str(config_dir))
+    if isinstance(value, list):
+        return [
+            _resolve_provider_config_paths(item, config_dir)
+            for item in value
+        ]
+    if isinstance(value, dict):
+        return {
+            key: _resolve_provider_config_paths(item, config_dir)
+            for key, item in value.items()
+        }
+    return value
 
 
 def load_coordinator_config(path: Path) -> CoordinatorConfig:
@@ -403,9 +477,13 @@ def load_audit_config(path: Path) -> AuditConfig:
 
 def load_provider_configs(path: Path) -> tuple[ProviderConfig, ...]:
     payload = _load_payload(path)
+    config_dir = path.resolve().parent
 
     providers = tuple(
-        _parse_provider(raw, index)
+        _parse_provider(
+            _resolve_provider_config_paths(raw, config_dir),
+            index,
+        )
         for index, raw in enumerate(payload["providers"])
     )
     names = [provider.name.casefold() for provider in providers]

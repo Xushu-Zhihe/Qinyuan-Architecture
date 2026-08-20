@@ -177,6 +177,7 @@ class AutopilotWebTests(unittest.TestCase):
                     "base_url": "https://platform.example/api",
                     "auth": {"token": "platform-secret"},
                     "fetch_task": {"method": "POST", "path": "/next"},
+                    "task_info_delay_seconds": 15,
                     "submit_result": {
                         "method": "POST",
                         "path": "/attempt/{{external_id}}/submit",
@@ -195,6 +196,9 @@ class AutopilotWebTests(unittest.TestCase):
                 template = created.json()
                 self.assertEqual(template["name"], "NSSCTF Arena")
                 self.assertEqual(template["platform"]["auth"]["token"], "")
+                self.assertEqual(
+                    template["platform"]["task_info_delay_seconds"], 15
+                )
                 self.assertNotIn("platform-secret", created.text)
 
                 duplicate = client.post("/api/autopilot/templates", json=payload)

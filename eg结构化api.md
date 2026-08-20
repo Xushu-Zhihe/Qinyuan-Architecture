@@ -101,6 +101,18 @@ https://www.nssctf.cn/api
 }
 ```
 
+NSSCTF 题目容器可能在 `next` 返回后才完成创建。将题目信息策略设为 `always`，
+并将 `task_info_delay_seconds` 设为 `15`，使系统在领取题目后等待 15 秒再请求
+attempt detail；端口和附件都以这次 detail 响应为准：
+
+```json
+{
+  "task_info_mode": "always",
+  "task_info_failure_action": "fail_task",
+  "task_info_delay_seconds": 15
+}
+```
+
 ### 提交结果
 
 ```json
@@ -159,7 +171,7 @@ NSSCTF `next` 和 attempt detail 响应中的题目位于 `data.attempt`：
 }
 ```
 
-`problem.content` 为空但附件存在时，后端会生成附件分析目标；`problem.annex` 中的 URL 会被下载到当前自动化会话目录，再把包含全部附件的目录作为只读 `challenge_path` 挂载到每个 solver 沙盒。附件下载不依赖 solver 容器内的网络或 Clash 配置。
+`problem.content` 为空但容器端口或附件存在时，后端会根据实际下发的资源生成分析目标：端口继续写入 `origin`，`problem.annex` 中的 URL 会被下载到当前题目的受管目录，再把包含全部附件的目录作为只读 `challenge_path` 挂载到每个 solver 沙盒。题面、端口和附件全部缺失时仍会拒绝该无效题目。solver project 终态释放 sandbox 后，该题目录会立即删除，下一题不会保留上一题附件。附件下载不依赖 solver 容器内的网络或 Clash 配置。
 
 如果平台返回的字段名是 `attempt.id`，仍然使用模板变量
 `{{external_id}}`；`attempt_id` 不是结构化 API 支持的模板变量。

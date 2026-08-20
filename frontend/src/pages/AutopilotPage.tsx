@@ -26,7 +26,7 @@ const defaultStructured: StructuredPlatformInput = {
   submit_result: endpoint('POST', '/tasks/{{external_id}}/submit', { result: '{{submission.value}}' }), skip_task: null,
   mapping: { task_list_path: null, external_id_path: 'id', name_path: 'name', goal_path: 'goal', origin_path: 'origin', origin_endpoint_path: null, goal_format: 'plain', hints_path: 'hints', hints_item_path: null, attachments_path: null, cursor_path: null, lease_id_path: null },
   outcomes: { fetch: { finished: null, empty: null }, submit: { accepted: null, rejected: null, retryable: { status_codes: [429, 500, 502, 503, 504] } }, skip: { succeeded: null } },
-  health_check: null, task_info_mode: 'always', task_info_failure_action: 'fail_task', initial_cursor: null,
+  health_check: null, task_info_mode: 'always', task_info_failure_action: 'fail_task', task_info_delay_seconds: 0, initial_cursor: null,
 }
 
 export function AutopilotPage({ onBack, onOpenProject }: { onBack: () => void; onOpenProject: (id: string) => void }) {
@@ -89,7 +89,7 @@ export function AutopilotPage({ onBack, onOpenProject }: { onBack: () => void; o
   function applyTemplate() {
     const template = templates.find(item => item.id === selectedTemplateId)
     if (!template) return
-    setStructured(current => ({ ...template.platform, auth: { ...template.platform.auth, token: current.auth.token } }))
+    setStructured(current => ({ ...template.platform, task_info_delay_seconds: template.platform.task_info_delay_seconds ?? 0, auth: { ...template.platform.auth, token: current.auth.token } }))
     setSampleResponse('')
     setPlatformValidation(null)
     setCurrentTaskResult(null)

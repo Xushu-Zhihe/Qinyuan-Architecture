@@ -258,21 +258,24 @@ class DirectLLMController:
             },
             "previous_rejection": rejection,
             "required_output": {
-                "result_ref": "string", "source_fact_ids": ["string"],
                 "content_type": "text|json|form", "text": None,
                 "json_value": None, "named_values": {}, "form_fields": [],
             },
         }
         content, _called_tools = await self._tool_loop("plan", json.dumps(instruction, ensure_ascii=False), self._no_tools, cancel_event=cancel_event)
         try:
-            plan = SubmissionPlan.from_dict(json.loads(content))
+            raw_plan = json.loads(content)
+            if not isinstance(raw_plan, Mapping):
+                raise TypeError("submission plan must be an object")
+            plan = SubmissionPlan.from_dict(
+                {
+                    **raw_plan,
+                    "result_ref": goal_result.result_ref,
+                    "source_fact_ids": [goal_result.fact.id],
+                }
+            )
         except (json.JSONDecodeError, TypeError, ValueError) as exc:
             raise DirectControllerError(f"invalid submission plan: {exc}") from exc
-        if plan.result_ref != goal_result.result_ref:
-            raise DirectControllerError("submission plan references a stale Goal result")
-        allowed = {goal_result.fact.id, *(fact.id for fact in goal_result.supporting_facts)}
-        if not set(plan.source_fact_ids).issubset(allowed):
-            raise DirectControllerError("submission plan references unavailable Facts")
         return plan
 
     @staticmethod

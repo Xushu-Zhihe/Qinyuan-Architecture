@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import httpx
 
@@ -52,6 +53,122 @@ class ModernContractTests(unittest.IsolatedAsyncioTestCase):
                 auth=AuthConfig(type="bearer"),
                 fetch_task=_endpoint("GET", "/tasks", headers={"Authorization": "Bearer fixed"}),
             )
+        for invalid_delay in (-1, float("inf"), float("nan")):
+            with self.subTest(invalid_delay=invalid_delay):
+                with self.assertRaises(ValueError):
+                    _platform_config(task_info_delay_seconds=invalid_delay)
+
+    async def test_task_info_delay_runs_between_fetch_and_detail(self) -> None:
+        events: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path.endswith("/next/"):
+                events.append("fetch")
+                return httpx.Response(
+                    200,
+                    json={"data": {"attempt": {"id": 123}}},
+                    request=request,
+                )
+            events.append("detail")
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "attempt": {
+                            "id": 123,
+                            "problem": {
+                                "type_label": "Pwn",
+                                "container": {
+                                    "url": ["nc://target.example:31337"]
+                                },
+                            },
+                        }
+                    }
+                },
+                request=request,
+            )
+
+        async def record_sleep(delay: float) -> None:
+            events.append(f"sleep:{delay:g}")
+
+        config = _platform_config(
+            fetch_task=_endpoint("POST", "/skill/agent/arena/next/"),
+            task_info=_endpoint(
+                "GET", "/skill/agent/arena/attempt/{{external_id}}/"
+            ),
+            task_info_delay_seconds=15,
+            mapping=FieldMapping(
+                task_list_path="data.attempt",
+                external_id_path="id",
+                name_path="problem.type_label",
+                goal_path="problem.content",
+                origin_path="problem.content",
+                origin_endpoint_path="problem.container.url.0|problem.container.url",
+                goal_format="flag_objective",
+                hints_path=None,
+            ),
+        )
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        adapter = StructuredPlatformAdapter(config, client=client)
+        try:
+            with mock.patch(
+                "autopilot.platform.asyncio.sleep", side_effect=record_sleep
+            ) as sleep:
+                result = await adapter.fetch_task()
+            self.assertEqual(result.status, "task")
+            self.assertEqual(result.task.origin, "nc://target.example:31337")
+            self.assertEqual(
+                result.task.goal.splitlines(),
+                [
+                    "题目：Pwn",
+                    "题面：Analyze the supplied challenge service endpoint and "
+                    "recover the requested result.",
+                    "目标：获取该题目的 flag 并作为最终答案提交。",
+                ],
+            )
+            self.assertEqual(events, ["fetch", "sleep:15", "detail"])
+            sleep.assert_awaited_once_with(15)
+        finally:
+            await adapter.close()
+            await client.aclose()
+
+    async def test_zero_task_info_delay_does_not_sleep(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            content = "fetch" if request.url.path.endswith("/next/") else "detail"
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "attempt": {
+                            "id": 123,
+                            "name": "Task",
+                            "goal": content,
+                            "origin": content,
+                        }
+                    }
+                },
+                request=request,
+            )
+
+        config = _platform_config(
+            fetch_task=_endpoint("POST", "/next/"),
+            task_info=_endpoint("GET", "/attempt/{{external_id}}/"),
+            task_info_delay_seconds=0,
+            mapping=FieldMapping(task_list_path="data.attempt", hints_path=None),
+        )
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        adapter = StructuredPlatformAdapter(config, client=client)
+        try:
+            with mock.patch(
+                "autopilot.platform.asyncio.sleep", new_callable=mock.AsyncMock
+            ) as sleep:
+                result = await adapter.fetch_task()
+            self.assertEqual(result.status, "task")
+            self.assertEqual(result.task.goal, "detail")
+            sleep.assert_not_awaited()
+        finally:
+            await adapter.close()
+            await client.aclose()
 
     async def test_structured_fetch_array_cursor_submit_skip_and_health(self) -> None:
         calls: list[tuple[str, str, object]] = []
@@ -348,6 +465,34 @@ class ModernContractTests(unittest.IsolatedAsyncioTestCase):
                 await adapter.close()
                 await client.aclose()
 
+    async def test_task_artifact_cleanup_is_scoped_and_idempotent(self) -> None:
+        adapter = StructuredPlatformAdapter(_platform_config())
+        with tempfile.TemporaryDirectory() as directory:
+            runtime_root = Path(directory) / "session"
+            adapter.set_runtime_root(runtime_root)
+            current = adapter.challenge_root("current")
+            other = adapter.challenge_root("other")
+            assert current is not None and other is not None
+            (current / "attachments").mkdir(parents=True)
+            (current / "attachments" / "challenge.bin").write_bytes(b"current")
+            (other / "attachments").mkdir(parents=True)
+            (other / "attachments" / "challenge.bin").write_bytes(b"other")
+            outside = Path(directory) / "outside"
+            outside.mkdir()
+            try:
+                adapter.cleanup_task_artifacts("current")
+                adapter.cleanup_task_artifacts("current")
+                self.assertFalse(current.exists())
+                self.assertTrue((other / "attachments" / "challenge.bin").is_file())
+                with mock.patch.object(
+                    adapter, "challenge_root", return_value=outside
+                ):
+                    with self.assertRaises(ValueError):
+                        adapter.cleanup_task_artifacts("current")
+                self.assertTrue(outside.is_dir())
+            finally:
+                await adapter.close()
+
     async def test_nssctf_origin_uses_container_url_when_present(self) -> None:
         def handler(request: httpx.Request) -> httpx.Response:
             return httpx.Response(
@@ -463,7 +608,6 @@ class ModernContractTests(unittest.IsolatedAsyncioTestCase):
                     "id": 5003,
                     "problem": {
                         "type_label": "Pwn",
-                        "content": "分析服务并获取 flag",
                         "container": {"url": ["nc://target.example:31337"]},
                         "annex": {
                             "name": "pwn.bin",
@@ -478,6 +622,37 @@ class ModernContractTests(unittest.IsolatedAsyncioTestCase):
                 [{"url": "/media/pwn.bin", "name": "pwn.bin"}],
             )
             self.assertIn("flag", task.goal)
+            self.assertIn("attachment(s) and service endpoint", task.goal)
+        finally:
+            await adapter.close()
+
+    async def test_nssctf_empty_task_without_resources_still_fails(self) -> None:
+        config = _platform_config(
+            mapping=FieldMapping(
+                task_list_path="data.attempt",
+                external_id_path="id",
+                name_path="problem.type_label",
+                goal_path="problem.content",
+                origin_path="problem.content",
+                origin_endpoint_path="problem.container.url.0|problem.container.url",
+                goal_format="flag_objective",
+                hints_path=None,
+                attachments_path="problem.annex",
+            ),
+        )
+        adapter = StructuredPlatformAdapter(config)
+        try:
+            with self.assertRaisesRegex(ValueError, "goal is empty"):
+                adapter._map_task(
+                    {
+                        "id": 5004,
+                        "problem": {
+                            "type_label": "Pwn",
+                            "content": "",
+                            "annex": None,
+                        },
+                    }
+                )
         finally:
             await adapter.close()
 
@@ -711,6 +886,74 @@ class ModernContractTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await status_controller.close()
             await status_client.aclose()
+
+    async def test_controller_binds_submission_plan_to_current_goal_result(self) -> None:
+        responses = [
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "content": (
+                                '{"result_ref":"stale","source_fact_ids":'
+                                '["fact-stale"],"content_type":"text",'
+                                '"text":"NSSCTF{answer}"}'
+                            )
+                        }
+                    }
+                ]
+            },
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "content": (
+                                '{"content_type":"text",'
+                                '"text":"NSSCTF{answer}"}'
+                            )
+                        }
+                    }
+                ]
+            },
+        ]
+        client = httpx.AsyncClient(
+            transport=httpx.MockTransport(
+                lambda request: httpx.Response(
+                    200, json=responses.pop(0), request=request
+                )
+            )
+        )
+        controller = DirectLLMController(
+            ControllerConfig("https://controller.example/v1", "model"),
+            RuntimeControllerSecret("key"),
+            client=client,
+        )
+        fact = type(
+            "Fact",
+            (),
+            {"id": "fact-current", "content": "NSSCTF{answer}"},
+        )()
+        goal_result = type(
+            "GoalResult",
+            (),
+            {
+                "result_ref": "project-current:1:fact-current",
+                "fact": fact,
+                "supporting_facts": (),
+            },
+        )()
+        task = AutoTask("5031", "Web", "Get flag", "https://target.example")
+        try:
+            stale = await controller.plan_submission(task, goal_result)
+            omitted = await controller.plan_submission(task, goal_result)
+            for plan in (stale, omitted):
+                self.assertEqual(
+                    plan.result_ref, "project-current:1:fact-current"
+                )
+                self.assertEqual(plan.source_fact_ids, ("fact-current",))
+                self.assertEqual(plan.text, "NSSCTF{answer}")
+        finally:
+            await controller.close()
+            await client.aclose()
 
     async def test_controller_enforces_phase_actions_and_tool_call_ids(self) -> None:
         responses = [{"choices": [{"message": {"content": '{"protocol_version":2,"action":"accepted"}'}}]}]

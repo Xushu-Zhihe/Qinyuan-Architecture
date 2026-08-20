@@ -410,6 +410,8 @@ class LocalExecutionBackend(ExecutionBackend):
         cancel_event: asyncio.Event | None = None,
         max_log_bytes: int = 8 * 1024 * 1024,
         origin_host: str | None = None,
+        agent_owner_id: str | None = None,
+        agent_work_dir: Path | None = None,
     ) -> WorkerResult:
         stdout_path = work_dir / "stdout.txt"
         stderr_path = work_dir / "stderr.txt"
@@ -430,6 +432,8 @@ class LocalExecutionBackend(ExecutionBackend):
                 challenge_dir,
                 work_dir,
                 origin_host=origin_host,
+                agent_owner_id=agent_owner_id,
+                agent_work_dir=agent_work_dir,
             )
             handle = await self.start(
                 provider,
@@ -530,6 +534,8 @@ async def execute_provider(
     cancel_event: asyncio.Event | None = None,
     max_log_bytes: int = 8 * 1024 * 1024,
     origin_host: str | None = None,
+    agent_owner_id: str | None = None,
+    agent_work_dir: Path | None = None,
 ) -> WorkerResult:
     """Backward-compatible local executor.
 
@@ -545,4 +551,6 @@ async def execute_provider(
         cancel_event=cancel_event,
         max_log_bytes=max_log_bytes,
         origin_host=origin_host,
+        agent_owner_id=agent_owner_id,
+        agent_work_dir=agent_work_dir,
     )

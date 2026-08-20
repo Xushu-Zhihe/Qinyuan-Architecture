@@ -1217,6 +1217,7 @@ class AutoManager:
     ) -> None:
         session.current_external_id = task.external_id
         session.current_task_name = task.name
+        project_id: str | None = None
         try:
             project = self.service.create_project(
                 name=f"Auto {session.completed_tasks + 1}: {task.name}",
@@ -1228,6 +1229,7 @@ class AutoManager:
                 agent_limit=session.config.agent_limit,
                 challenge_path=task.challenge_path,
             )
+            project_id = project.id
             session.current_project_id = project.id
             await self.service.start_project(project.id)
             deadline = asyncio.get_running_loop().time() + session.config.task_timeout_seconds
@@ -1241,15 +1243,18 @@ class AutoManager:
                 if status in {"degraded", "stopped"}:
                     raise AutoManagerError(f"solver_degraded: solver project ended with {status}")
                 if asyncio.get_running_loop().time() >= deadline:
-                    await self.service.stop_project(project.id)
                     raise AutoManagerError("solver_timeout: solver project timed out")
                 await self._sleep_or_cancel(
                     session.config.poll_interval_seconds, cancel_event
                 )
-        except asyncio.CancelledError:
-            if session.current_project_id is not None:
-                await self.service.stop_project(session.current_project_id)
-            raise
+        finally:
+            try:
+                if project_id is not None:
+                    await self.service.stop_project(project_id)
+            finally:
+                cleanup = getattr(self._adapter, "cleanup_task_artifacts", None)
+                if callable(cleanup):
+                    cleanup(task.external_id)
 
     def _project_answer(self, session: AutoSession) -> str:
         if session.current_project_id is None:

@@ -16,6 +16,8 @@ vi.mock('../api/client', () => ({
     stopAutopilot: vi.fn(),
     extendAutopilotTime: vi.fn(),
     skipAutopilotTask: vi.fn(),
+    submitAutopilotTask: vi.fn(),
+    getGraph: vi.fn(),
     testAutopilotController: vi.fn(),
     validateAutopilotPlatform: vi.fn(),
     validateAutopilotPrompt: vi.fn(),
@@ -119,7 +121,7 @@ describe('AutopilotPage', () => {
       max_tasks: 10,
       task_timeout_minutes: 60,
       poll_interval_seconds: 1,
-      rejected_action: 'fail',
+      rejected_action: 'pause',
       solver_failure_action: 'fail',
       stop_active_task_action: 'leave',
       max_replans_after_rejection: 1,
@@ -190,5 +192,44 @@ describe('AutopilotPage', () => {
     expect(screen.getByLabelText('拒绝结果值')).toHaveValue('false')
     await userEvent.selectOptions(screen.getByLabelText('拒绝结果值'), 'true')
     expect(screen.getByLabelText('拒绝结果值')).toHaveValue('true')
+  })
+
+  it('requires an explicit active Fact selection and supports continue or finish', async () => {
+    const paused: AutopilotSnapshot = {
+      ...empty,
+      session: {
+        id: 'auto-1', status: 'awaiting_manual_review', mode: 'structured',
+        controller_provider: null, controller: null, solver_providers: ['fake'], available_providers: ['fake'],
+        agent_limit: 1, max_tasks: 2, completed_tasks: 0, current_external_id: 'attempt-1',
+        current_task_name: 'Current challenge', current_project_id: 'project-1', current_task_status: 'awaiting_manual_review',
+        last_message: 'submission not accepted', last_error: null, history: [],
+      },
+    }
+    vi.mocked(api.getAutopilot).mockResolvedValue(paused)
+    vi.mocked(api.getGraph).mockResolvedValue({
+      project: {} as never,
+      nodes: [
+        { id: 'fact-active', type: 'fact', content: 'NSSCTF{correct}', state: 'active', generation: 0, created_at: 'now', sources: ['human'], produced_by: null },
+        { id: 'fact-archived', type: 'fact', content: 'old', state: 'archived', generation: 0, created_at: 'now', sources: ['human'], produced_by: null },
+      ],
+      edges: [], layout: { revision: 0, nodes: {}, edges: {}, viewport: {} }, candidates: [], highest_generation: 0, sequence: 0,
+      planning_attempts: [], provider_health: [], recovery: {} as never,
+    })
+    vi.mocked(api.submitAutopilotTask).mockResolvedValue({ ...paused, session: { ...paused.session!, status: 'submit_pending', current_task_status: 'submit_pending' } })
+
+    render(<AutopilotPage onBack={() => {}} onOpenProject={() => {}} />)
+
+    expect((await screen.findAllByText('等待人工处理')).length).toBeGreaterThan(0)
+    const selector = await screen.findByLabelText('提交 Fact')
+    expect(screen.getByRole('button', { name: '提交并继续' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: '提交并结束' })).toBeDisabled()
+    expect(within(selector).getByRole('option', { name: /fact-active/ })).toBeInTheDocument()
+    expect(within(selector).queryByRole('option', { name: /fact-archived/ })).not.toBeInTheDocument()
+    expect(screen.queryByText(/本题剩余/)).not.toBeInTheDocument()
+
+    await userEvent.selectOptions(selector, 'fact-active')
+    await userEvent.click(screen.getByRole('button', { name: '提交并结束' }))
+
+    expect(api.submitAutopilotTask).toHaveBeenCalledWith('fact-active', true)
   })
 })

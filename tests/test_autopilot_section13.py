@@ -1,10 +1,11 @@
+import asyncio
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from autopilot.manager import AutoManager
+from autopilot.manager import AutoManager, AutoManagerError
 from autopilot.models import AutoStartConfig, ControllerConfig, RuntimeControllerSecret, RuntimePlatformSecret
 from autopilot.platform_models import EndpointConfig, FieldMapping, StructuredPlatformConfig
 from autopilot.solver_result import SubmissionPlan
@@ -27,6 +28,7 @@ class _FakeService:
         self.coordinator = SimpleNamespace()
         self.handles: dict[str, object] = {}
         self.events: list[str] = []
+        self.manual_facts: dict[str, str] = {}
 
     def create_project(self, **_kwargs):
         project_id = f"project-{len(self.handles) + 1}"
@@ -54,15 +56,31 @@ class _FakeService:
             fact=fact,
         )
 
+    def get_submission_result(self, project_id: str, fact_id: str) -> GoalResult:
+        content = self.manual_facts.get(fact_id)
+        if content is None:
+            raise ValueError("selected Fact is not active in the current project")
+        fact = GoalResultFact(fact_id, content, sources=("human",))
+        return GoalResult(
+            project_id=project_id,
+            goal_version=1,
+            goal_node_id=f"{project_id}-goal",
+            result_ref=f"{project_id}:1:{fact.id}",
+            fact=fact,
+        )
+
 
 class _FakeController:
     def __init__(self, *_args, **_kwargs) -> None:
         self.plans: list[str] = []
+        self.plan_gate: asyncio.Event | None = None
 
     async def preflight(self):
         return {"status": "valid", "model": "fake"}
 
     async def plan_submission(self, _task, goal_result, **_kwargs):
+        if self.plan_gate is not None:
+            await self.plan_gate.wait()
         self.plans.append(goal_result.result_ref)
         return SubmissionPlan(
             result_ref=goal_result.result_ref,
@@ -76,10 +94,13 @@ class _FakeController:
 
 
 class _FakePlatform(StructuredPlatformAdapter):
-    def __init__(self, events: list[str]) -> None:
+    def __init__(self, events: list[str], outcomes: tuple[str, ...] = ()) -> None:
         self.events = events
         self.index = 0
         self.submitted: list[str] = []
+        self.submitted_facts: list[str] = []
+        self.outcomes = list(outcomes)
+        self.skip_calls = 0
 
     async def fetch_task(self):
         tasks = (
@@ -104,18 +125,25 @@ class _FakePlatform(StructuredPlatformAdapter):
             ),
         )
 
-    async def submit_result(self, task, _plan, _goal_result):
+    async def submit_result(self, task, _plan, goal_result):
         self.events.append(f"submit:{task.external_id}")
         self.submitted.append(task.external_id)
-        return PlatformResult("accepted")
+        self.submitted_facts.append(goal_result.fact.id)
+        status = self.outcomes.pop(0) if self.outcomes else "accepted"
+        return PlatformResult(status)
+
+    async def skip_task(self, _task, _reason):
+        self.skip_calls += 1
+        return PlatformResult("skipped")
 
     async def close(self):
         return None
 
 
 class AutopilotSection13Tests(unittest.IsolatedAsyncioTestCase):
-    async def test_modern_manager_completes_two_tasks_in_order_from_goal_result(self) -> None:
-        provider = ProviderConfig(
+    @staticmethod
+    def _provider() -> ProviderConfig:
+        return ProviderConfig(
             "fake",
             True,
             1,
@@ -132,12 +160,27 @@ class AutopilotSection13Tests(unittest.IsolatedAsyncioTestCase):
                 schema_version="2",
             ),
         )
-        platform_config = StructuredPlatformConfig(
+
+    @staticmethod
+    def _platform_config() -> StructuredPlatformConfig:
+        return StructuredPlatformConfig(
             base_url="https://platform.example/api",
             fetch_task=EndpointConfig("GET", "/tasks"),
             submit_result=EndpointConfig("POST", "/submit"),
             mapping=FieldMapping(),
         )
+
+    async def _wait_for_status(self, manager: AutoManager, status: str) -> dict[str, object]:
+        for _ in range(200):
+            snapshot = await manager.snapshot()
+            if snapshot["session"]["current_task_status"] == status:
+                return snapshot
+            await asyncio.sleep(0.01)
+        self.fail(f"automatic session did not reach {status}")
+
+    async def test_modern_manager_completes_two_tasks_in_order_from_goal_result(self) -> None:
+        provider = self._provider()
+        platform_config = self._platform_config()
         with tempfile.TemporaryDirectory() as directory:
             service = _FakeService(Path(directory))
             controller = _FakeController()
@@ -176,6 +219,118 @@ class AutopilotSection13Tests(unittest.IsolatedAsyncioTestCase):
                 ["fetch:one", "solve:project-1", "submit:one", "fetch:two"],
             )
             self.assertEqual(len(controller.plans), 2)
+            await manager.aclose()
+
+    async def test_rejection_pauses_and_selected_fact_acceptance_continues(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            service = _FakeService(Path(directory))
+            service.manual_facts["human-fact"] = "NSSCTF{corrected}"
+            controller = _FakeController()
+            platform = _FakePlatform(service.events, ("rejected", "accepted", "accepted"))
+            manager = AutoManager(
+                service=service,
+                provider_configs=(self._provider(),),
+                controller_factory=lambda *_args, **_kwargs: controller,
+                platform_adapter_factory=lambda *_args, **_kwargs: platform,
+            )
+            config = AutoStartConfig(
+                mode="structured",
+                controller=ControllerConfig("https://controller.example/v1", "model"),
+                platform=self._platform_config(),
+                solver_providers=("fake",),
+                agent_limit=1,
+                max_tasks=2,
+                poll_interval_seconds=0.001,
+            )
+            with patch(
+                "autopilot.manager.probe_provider_capabilities",
+                return_value={"auto_ready": True, "status": "ready"},
+            ):
+                await manager.start(
+                    config,
+                    controller_secret=RuntimeControllerSecret("controller-key"),
+                    platform_secret=RuntimePlatformSecret(token="platform-token"),
+                )
+                paused = await self._wait_for_status(manager, "awaiting_manual_review")
+                self.assertEqual(platform.index, 1)
+                await asyncio.sleep(0.03)
+                self.assertEqual(platform.index, 1, "paused task must not fetch the next task")
+
+                controller.plan_gate = asyncio.Event()
+                queued = await manager.submit_current_task("human-fact")
+                self.assertEqual(queued["session"]["current_task_status"], "submit_pending")
+                with self.assertRaisesRegex(AutoManagerError, "not awaiting"):
+                    await manager.submit_current_task("human-fact")
+                controller.plan_gate.set()
+                await manager._runner
+
+            snapshot = await manager.snapshot()
+            self.assertEqual(snapshot["session"]["status"], "finished", snapshot)
+            self.assertEqual(snapshot["session"]["completed_tasks"], 2)
+            self.assertEqual(
+                platform.submitted_facts,
+                ["project-1-fact", "human-fact", "project-2-fact"],
+            )
+            self.assertIn("fetch:two", service.events)
+            await manager.aclose()
+
+    async def test_manual_rejection_and_unknown_stay_paused_then_finish_without_skip(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            service = _FakeService(Path(directory))
+            service.manual_facts.update(
+                {
+                    "fact-one": "NSSCTF{wrong}",
+                    "fact-two": "NSSCTF{unknown}",
+                    "fact-three": "NSSCTF{correct}",
+                }
+            )
+            controller = _FakeController()
+            platform = _FakePlatform(
+                service.events,
+                ("rejected", "rejected", "fatal_error", "accepted"),
+            )
+            manager = AutoManager(
+                service=service,
+                provider_configs=(self._provider(),),
+                controller_factory=lambda *_args, **_kwargs: controller,
+                platform_adapter_factory=lambda *_args, **_kwargs: platform,
+            )
+            config = AutoStartConfig(
+                mode="structured",
+                controller=ControllerConfig("https://controller.example/v1", "model"),
+                platform=self._platform_config(),
+                solver_providers=("fake",),
+                agent_limit=1,
+                max_tasks=2,
+                poll_interval_seconds=0.001,
+            )
+            with patch(
+                "autopilot.manager.probe_provider_capabilities",
+                return_value={"auto_ready": True, "status": "ready"},
+            ):
+                await manager.start(
+                    config,
+                    controller_secret=RuntimeControllerSecret("controller-key"),
+                    platform_secret=RuntimePlatformSecret(token="platform-token"),
+                )
+                await self._wait_for_status(manager, "awaiting_manual_review")
+                await manager.submit_current_task("fact-one")
+                await self._wait_for_status(manager, "awaiting_manual_review")
+                self.assertEqual(platform.index, 1)
+
+                await manager.submit_current_task("fact-two")
+                await self._wait_for_status(manager, "awaiting_manual_review")
+                self.assertEqual(platform.index, 1)
+
+                await manager.submit_current_task("fact-three", finish_after_accept=True)
+                await manager._runner
+
+            snapshot = await manager.snapshot()
+            self.assertEqual(snapshot["session"]["status"], "finished", snapshot)
+            self.assertEqual(snapshot["session"]["completed_tasks"], 1)
+            self.assertEqual(platform.index, 1)
+            self.assertEqual(platform.skip_calls, 0)
+            self.assertIn("finished by user", snapshot["session"]["last_message"])
             await manager.aclose()
 
 

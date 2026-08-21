@@ -24,6 +24,7 @@ from autopilot.models import (
 )
 from autopilot.platform import PromptPlatformAdapter, StructuredPlatformAdapter
 from autopilot.platform_models import PlatformResult, StructuredPlatformConfig
+from orchestrator.models import GoalResult
 from orchestrator.projects import ProjectService
 from worker.models import AuditConfig, ProviderConfig
 from worker.capabilities import probe_provider_capabilities, static_capability_snapshot
@@ -48,11 +49,12 @@ TASK_TRANSITIONS = {
     "fetched": {"solving", "skipped", "failed", "stopped"},
     "solving": {"solver_achieved", "skipped", "failed", "stopped"},
     "solver_achieved": {"submit_pending", "failed", "stopped"},
-    "submit_pending": {"accepted", "rejected", "retry_wait", "failed", "stopped"},
-    "rejected": {"replanning", "skipped", "failed", "stopped"},
+    "submit_pending": {"accepted", "rejected", "awaiting_manual_review", "retry_wait", "failed", "stopped"},
+    "rejected": {"replanning", "awaiting_manual_review", "skipped", "failed", "stopped"},
     "replanning": {"submit_pending", "skipped", "failed", "stopped"},
     "retry_wait": {"queued", "submit_pending", "failed", "stopped"},
     "waiting": {"queued", "failed", "stopped"},
+    "awaiting_manual_review": {"submit_pending", "skipped", "failed", "stopped"},
 }
 
 TASK_REASON_CODES = frozenset(
@@ -135,6 +137,9 @@ class AutoManager:
         self._task_deadline_monotonic: float | None = None
         self._skip_requested: asyncio.Event | None = None
         self._skip_reason: str | None = None
+        self._manual_submission_event: asyncio.Event | None = None
+        self._manual_submission_goal_result: GoalResult | None = None
+        self._manual_finish_after_accept = False
         self._controller_health: dict[str, object] = {
             "status": "unknown",
             "last_error": None,
@@ -248,6 +253,9 @@ class AutoManager:
                 self._cancel_event = asyncio.Event()
                 self._skip_requested = asyncio.Event()
                 self._skip_reason = None
+                self._manual_submission_event = asyncio.Event()
+                self._manual_submission_goal_result = None
+                self._manual_finish_after_accept = False
                 self._runner = asyncio.create_task(
                     self._run(session, self._cancel_event)
                 )
@@ -367,6 +375,45 @@ class AutoManager:
             session.skip_requested = True
             session.last_message = "skip requested; releasing the current task"
             self._persist_session(session)
+            return self._snapshot_locked()
+
+    async def submit_current_task(
+        self,
+        fact_id: str,
+        *,
+        finish_after_accept: bool = False,
+    ) -> dict[str, object]:
+        """Queue one explicitly selected active Fact for the paused task."""
+        async with self._lock:
+            session = self._session
+            if session is None or not self._is_active():
+                raise AutoManagerError("no automatic session is running")
+            if session.current_task_status != "awaiting_manual_review":
+                raise AutoManagerError("the current task is not awaiting manual review")
+            if session.current_project_id is None or session.current_task is None:
+                raise AutoManagerError("there is no paused task to submit")
+            if self._manual_submission_event is None:
+                raise AutoManagerError("manual submission control is unavailable")
+            try:
+                goal_result = self.service.get_submission_result(
+                    session.current_project_id,
+                    fact_id,
+                )
+            except (KeyError, ValueError) as exc:
+                raise AutoManagerError(str(exc)) from exc
+            self._manual_submission_goal_result = goal_result
+            self._manual_finish_after_accept = bool(finish_after_accept)
+            session.current_result_ref = goal_result.result_ref
+            session.current_result_fact_id = goal_result.fact.id
+            session.current_result_preview = self._scrub_runtime_text(
+                session,
+                goal_result.fact.content[:500],
+            )
+            session.current_attempt_phase = "submit"
+            self._transition(session, "submit_pending")
+            session.last_message = "selected Fact queued for submission"
+            self._persist_session(session)
+            self._manual_submission_event.set()
             return self._snapshot_locked()
 
     async def aclose(self) -> None:
@@ -756,8 +803,20 @@ class AutoManager:
                     )
                     attempt_records.extend(added)
                     replans += 1
+                finish_after_accept = False
                 if submission.status == "rejected":
                     self._transition(session, "rejected", "platform_rejected")
+                    if session.config.rejected_action == "pause":
+                        self._pause_for_manual_review(session, submission)
+                        manual = await self._manual_review_loop(
+                            session,
+                            task,
+                            attempt_records,
+                            cancel_event,
+                        )
+                        if manual is None:
+                            continue
+                        submission, goal_result, attempt_records, finish_after_accept = manual
                     if session.config.rejected_action == "skip":
                         await self._skip_modern(
                             session,
@@ -767,34 +826,47 @@ class AutoManager:
                             attempts=attempt_records,
                         )
                         continue
-                    self._append_terminal_history(
-                        session,
-                        task,
-                        "rejected",
-                        self._scrub_runtime_text(session, submission.message),
-                        "platform_rejected",
-                        attempt_records,
-                    )
-                    raise AutoManagerError("platform rejected the Goal result")
+                    if session.config.rejected_action in {"fail", "replan"}:
+                        self._append_terminal_history(
+                            session,
+                            task,
+                            "rejected",
+                            self._scrub_runtime_text(session, submission.message),
+                            "platform_rejected",
+                            attempt_records,
+                        )
+                        raise AutoManagerError("platform rejected the Goal result")
                 if submission.status != "accepted":
                     reason_code = str(
                         submission.metadata.get("reason_code", "platform_submission_failed")
                     )
                     if reason_code not in TASK_REASON_CODES:
                         reason_code = "platform_submission_failed"
-                    self._append_terminal_history(
-                        session,
-                        task,
-                        "failed",
-                        self._scrub_runtime_text(session, submission.message),
-                        reason_code,
-                        attempt_records,
-                    )
-                    raise AutoManagerError(
-                        self._scrub_runtime_text(
-                            session, submission.message or "platform submission failed"
+                    if session.config.rejected_action == "pause":
+                        self._pause_for_manual_review(session, submission, reason_code)
+                        manual = await self._manual_review_loop(
+                            session,
+                            task,
+                            attempt_records,
+                            cancel_event,
                         )
-                    )
+                        if manual is None:
+                            continue
+                        submission, goal_result, attempt_records, finish_after_accept = manual
+                    else:
+                        self._append_terminal_history(
+                            session,
+                            task,
+                            "failed",
+                            self._scrub_runtime_text(session, submission.message),
+                            reason_code,
+                            attempt_records,
+                        )
+                        raise AutoManagerError(
+                            self._scrub_runtime_text(
+                                session, submission.message or "platform submission failed"
+                            )
+                        )
                 self._transition(session, "accepted")
                 finished_at = _timestamp()
                 session.history.append(AutoHistoryEntry(
@@ -820,6 +892,12 @@ class AutoManager:
                 session.completed_tasks += 1
                 session.processed_tasks += 1
                 self._clear_current_task(session)
+                session.last_error = None
+                if finish_after_accept:
+                    self._set_session_terminal(session, "finished")
+                    session.last_message = "answer accepted; automatic session finished by user"
+                    break
+                session.last_message = "answer accepted"
             if session.status not in {"finished", "failed", "stopped"}:
                 self._set_session_terminal(session, "finished")
                 session.last_message = "maximum task limit reached"
@@ -876,6 +954,92 @@ class AutoManager:
             if result.status != "retryable_error":
                 return result
         raise AutoManagerError("platform_retry_exhausted: platform fetch transport retries exhausted")
+
+    def _pause_for_manual_review(
+        self,
+        session: AutoSession,
+        submission: PlatformResult,
+        reason_code: str | None = None,
+    ) -> None:
+        reason_code = reason_code or (
+            "platform_rejected"
+            if submission.status == "rejected"
+            else "platform_submission_failed"
+        )
+        if reason_code not in TASK_REASON_CODES:
+            reason_code = "platform_submission_failed"
+        if submission.status == "rejected" and session.current_task_status == "submit_pending":
+            self._transition(session, "rejected", "platform_rejected")
+        self._transition(session, "awaiting_manual_review", reason_code)
+        self._task_deadline_monotonic = None
+        session.current_task_deadline_at = None
+        session.current_attempt_phase = None
+        message = self._scrub_runtime_text(session, submission.message)
+        session.last_message = message or "submission not accepted; select a Fact to retry"
+        self._persist_session(session)
+
+    async def _manual_review_loop(
+        self,
+        session: AutoSession,
+        task: AutoTask,
+        attempt_records: list[dict[str, object]],
+        cancel_event: asyncio.Event,
+    ) -> tuple[PlatformResult, GoalResult, list[dict[str, object]], bool] | None:
+        while True:
+            if self._skip_requested is not None and self._skip_requested.is_set():
+                await self._skip_modern(
+                    session,
+                    task,
+                    self._skip_reason or "user skipped",
+                    attempts=attempt_records,
+                )
+                return None
+            event = self._manual_submission_event
+            if event is None:
+                raise AutoManagerError("manual submission control is unavailable")
+            if not event.is_set():
+                await self._sleep_or_cancel(0.1, cancel_event)
+                continue
+            async with self._lock:
+                event.clear()
+                goal_result = self._manual_submission_goal_result
+                finish_after_accept = self._manual_finish_after_accept
+                self._manual_submission_goal_result = None
+                self._manual_finish_after_accept = False
+            if goal_result is None:
+                continue
+            assert self._controller is not None
+            try:
+                plan = await self._controller.plan_submission(
+                    task,
+                    goal_result,
+                    cancel_event=cancel_event,
+                )
+            except (DirectControllerError, ValueError) as exc:
+                self._pause_for_manual_review(
+                    session,
+                    PlatformResult("fatal_error", message=str(exc)),
+                )
+                continue
+            session.current_plan_fingerprint = plan.fingerprint
+            session.current_attempt_phase = "submit"
+            submission, added = await self._submit_modern(
+                session,
+                task,
+                goal_result,
+                plan,
+                cancel_event,
+            )
+            offset = len(attempt_records)
+            for index, record in enumerate(added, start=1):
+                record["attempt"] = offset + index
+            attempt_records.extend(added)
+            if submission.status == "accepted":
+                return submission, goal_result, attempt_records, finish_after_accept
+            reason_code = str(
+                submission.metadata.get("reason_code", "platform_submission_failed")
+            )
+            self._pause_for_manual_review(session, submission, reason_code)
 
     async def _submit_modern(
         self,
@@ -1032,7 +1196,13 @@ class AutoManager:
             raise AutoManagerError(
                 f"skip_failed: {result_message or 'platform skip failed'}"
             )
-        if session.current_task_status in {"fetched", "solving", "rejected", "replanning"}:
+        if session.current_task_status in {
+            "fetched",
+            "solving",
+            "rejected",
+            "replanning",
+            "awaiting_manual_review",
+        }:
             self._transition(
                 session,
                 "skipped",

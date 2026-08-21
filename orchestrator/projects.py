@@ -403,6 +403,10 @@ class ProjectService:
         handle = self.get_handle(project_id)
         return handle.store.goal_result(len(handle.record.providers))
 
+    def get_submission_result(self, project_id: str, fact_id: str) -> GoalResult:
+        handle = self.get_handle(project_id)
+        return handle.store.submission_result(fact_id)
+
     def goal_result_conflict(self, project_id: str) -> bool:
         """Return whether the current goal has multiple qualifying result groups."""
         handle = self.get_handle(project_id)

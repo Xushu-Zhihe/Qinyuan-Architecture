@@ -753,6 +753,21 @@ class BlackboardExecutionTests(StoreTestCase):
         self.assertEqual(result.supporting_providers, ("claude", "codex"))
         self.assertFalse(store.goal_result_conflict(available_providers=2))
 
+    def test_submission_result_projects_only_an_active_selected_fact(self) -> None:
+        store, fact_id = self.make_store_with_fact()
+
+        result = store.submission_result(fact_id)
+
+        self.assertEqual(result.fact.id, fact_id)
+        self.assertEqual(result.fact.content, "JWT uses HS256")
+        self.assertEqual(result.fact.sources, ("human",))
+        self.assertEqual(result.result_ref, f"project-1:1:{fact_id}")
+        self.assertIsNone(store.goal_result(available_providers=1))
+
+        store.archive_node(fact_id)
+        with self.assertRaisesRegex(ValueError, "not active"):
+            store.submission_result(fact_id)
+
     def test_v2_goal_result_merges_undirected_equivalent_components(self) -> None:
         store, intent = self.make_store_and_intent()
 

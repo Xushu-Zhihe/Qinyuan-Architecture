@@ -172,7 +172,7 @@ class AutoStartConfig:
     mode: Literal["prompt", "structured"] = "prompt"
     controller: ControllerConfig | None = None
     platform: object | None = None
-    rejected_action: Literal["replan", "skip", "fail"] = "fail"
+    rejected_action: Literal["pause", "replan", "skip", "fail"] = "pause"
     solver_failure_action: Literal["skip", "fail"] = "fail"
     stop_active_task_action: Literal["leave", "skip"] = "leave"
     max_replans_after_rejection: int = 1
@@ -226,7 +226,7 @@ class AutoStartConfig:
             )
         if not self.is_legacy and self.agent_limit > len(self.solver_providers):
             raise ValueError("agent_limit cannot exceed solver provider count")
-        if self.rejected_action not in {"replan", "skip", "fail"}:
+        if self.rejected_action not in {"pause", "replan", "skip", "fail"}:
             raise ValueError("invalid rejected_action")
         if self.solver_failure_action not in {"skip", "fail"}:
             raise ValueError("invalid solver_failure_action")

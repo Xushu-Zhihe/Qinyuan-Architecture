@@ -195,7 +195,7 @@ class AutoCommon(BaseModel):
     max_tasks: int = Field(default=10, ge=1, le=1000)
     task_timeout_minutes: float = Field(default=60, gt=0, le=1440)
     poll_interval_seconds: float = Field(default=1, gt=0, le=3600)
-    rejected_action: Literal["replan", "skip", "fail"] = "fail"
+    rejected_action: Literal["pause", "replan", "skip", "fail"] = "pause"
     solver_failure_action: Literal["skip", "fail"] = "fail"
     stop_active_task_action: Literal["leave", "skip"] = "leave"
     max_replans_after_rejection: int = Field(default=1, ge=0, le=10)
@@ -295,6 +295,13 @@ class AutopilotSkipRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     reason: str = Field(default="user skipped", max_length=500)
+
+
+class AutopilotSubmissionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    fact_id: str = Field(min_length=1, max_length=200)
+    finish_after_accept: bool = False
 
 
 PlatformValidation = Annotated[

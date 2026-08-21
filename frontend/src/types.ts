@@ -420,7 +420,7 @@ interface AutopilotStartCommon {
   max_tasks: number
   task_timeout_minutes: number
   poll_interval_seconds: number
-  rejected_action: 'replan' | 'skip' | 'fail'
+  rejected_action: 'pause' | 'replan' | 'skip' | 'fail'
   solver_failure_action: 'skip' | 'fail'
   stop_active_task_action: 'leave' | 'skip'
   max_replans_after_rejection: number

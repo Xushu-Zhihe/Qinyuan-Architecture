@@ -1987,6 +1987,66 @@ class BlackboardStore:
         details = self.consensus_details(available_providers)
         return str(details["answer"]) if details is not None else None
 
+    def submission_result(self, fact_id: str) -> GoalResult:
+        """Project one active Fact into a submission result without changing consensus."""
+        fact_id = fact_id.strip()
+        if not fact_id:
+            raise ValueError("submission Fact id must be non-empty")
+        project = self.connection.execute(
+            "SELECT goal_version FROM projects WHERE id = ?",
+            (self.project_id,),
+        ).fetchone()
+        if project is None:
+            raise KeyError(self.project_id)
+        goal = self.connection.execute(
+            """
+            SELECT id FROM nodes
+            WHERE project_id = ? AND type = 'goal' AND state = 'active'
+            ORDER BY generation DESC, created_at DESC, id DESC LIMIT 1
+            """,
+            (self.project_id,),
+        ).fetchone()
+        if goal is None:
+            raise ValueError("current Goal is missing")
+        fact = self.connection.execute(
+            """
+            SELECT id, content FROM nodes
+            WHERE id = ? AND project_id = ? AND type = 'fact' AND state = 'active'
+            """,
+            (fact_id, self.project_id),
+        ).fetchone()
+        if fact is None:
+            raise ValueError("selected Fact is not active in the current project")
+        provenance = tuple(
+            str(row["source"])
+            for row in self.connection.execute(
+                "SELECT DISTINCT source FROM node_provenance WHERE node_id = ? ORDER BY source",
+                (fact_id,),
+            ).fetchall()
+        )
+        produced = self.connection.execute(
+            """
+            SELECT intent_edge_id, execution_id FROM intent_outputs
+            WHERE node_id = ? ORDER BY rowid DESC LIMIT 1
+            """,
+            (fact_id,),
+        ).fetchone()
+        goal_version = int(project["goal_version"])
+        result_fact = GoalResultFact(
+            id=fact_id,
+            content=str(fact["content"]),
+            sources=provenance,
+            produced_by_intent_id=(str(produced["intent_edge_id"]) if produced else None),
+            produced_by_execution_id=(str(produced["execution_id"]) if produced else None),
+        )
+        return GoalResult(
+            project_id=self.project_id,
+            goal_version=goal_version,
+            goal_node_id=str(goal["id"]),
+            result_ref=f"{self.project_id}:{goal_version}:{fact_id}",
+            fact=result_fact,
+        )
+
     def goal_result(
         self,
         available_providers: int | None = None,

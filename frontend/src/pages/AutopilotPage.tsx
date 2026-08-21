@@ -1,14 +1,14 @@
-import { ArrowLeft, Bot, Check, Clock3, ExternalLink, FileJson2, MessageSquareText, Save, ScanSearch, SkipForward, Square, Trash2 } from 'lucide-react'
+import { ArrowLeft, Bot, Check, Clock3, ExternalLink, FileJson2, MessageSquareText, RefreshCw, Save, ScanSearch, SkipForward, Square, Trash2 } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
 
 import { api } from '../api/client'
 import { AutopilotControllerFields } from '../components/AutopilotControllerFields'
 import { StructuredPlatformForm } from '../components/StructuredPlatformForm'
-import type { AutopilotSnapshot, AutopilotStartPayload, ControllerInput, CurrentTaskResult, PlatformValidationPayload, StructuredPlatformInput, StructuredPlatformTemplate, ValidationResult } from '../types'
+import type { AutopilotSnapshot, AutopilotStartPayload, BlackboardNode, ControllerInput, CurrentTaskResult, PlatformValidationPayload, StructuredPlatformInput, StructuredPlatformTemplate, ValidationResult } from '../types'
 
 const statusLabel: Record<string, string> = {
   starting: '启动中', queued: '等待取题', fetched: '已取题', solving: '解题中', solver_achieved: '已生成结果',
-  submit_pending: '准备提交', replanning: '重新规划', retry_wait: '等待重试', waiting: '等待平台',
+  submit_pending: '准备提交', replanning: '重新规划', retry_wait: '等待重试', waiting: '等待平台', awaiting_manual_review: '等待人工处理',
   accepted: '已接受', rejected: '已拒绝', skipped: '已跳过', stopping: '停止中', finished: '已完成', failed: '失败', stopped: '已停止',
 }
 
@@ -51,7 +51,7 @@ export function AutopilotPage({ onBack, onOpenProject }: { onBack: () => void; o
   const [agentLimit, setAgentLimit] = useState(1)
   const [maxTasks, setMaxTasks] = useState(10)
   const [timeoutMinutes, setTimeoutMinutes] = useState(60)
-  const [rejectedAction, setRejectedAction] = useState<'replan' | 'skip' | 'fail'>('fail')
+  const [rejectedAction, setRejectedAction] = useState<'pause' | 'replan' | 'skip' | 'fail'>('pause')
   const [solverFailureAction, setSolverFailureAction] = useState<'skip' | 'fail'>('fail')
   const [stopActiveTaskAction, setStopActiveTaskAction] = useState<'leave' | 'skip'>('leave')
   const [maxReplans, setMaxReplans] = useState(1)
@@ -63,6 +63,8 @@ export function AutopilotPage({ onBack, onOpenProject }: { onBack: () => void; o
   const [controllerValidation, setControllerValidation] = useState<ValidationResult | null>(null)
   const [platformValidation, setPlatformValidation] = useState<ValidationResult | null>(null)
   const [currentTaskResult, setCurrentTaskResult] = useState<CurrentTaskResult | null>(null)
+  const [reviewFacts, setReviewFacts] = useState<BlackboardNode[]>([])
+  const [selectedFactId, setSelectedFactId] = useState('')
 
   async function refresh() {
     try {
@@ -108,6 +110,27 @@ export function AutopilotPage({ onBack, onOpenProject }: { onBack: () => void; o
   }, [session, clockTick])
   const taskControlReady = Boolean(active && session?.current_external_id && session.current_project_id && !session.skip_requested)
   const skipReady = taskControlReady && (mode === 'prompt' || structured.skip_task !== null)
+  const awaitingManualReview = session?.current_task_status === 'awaiting_manual_review'
+
+  async function loadReviewFacts(projectId = session?.current_project_id ?? null) {
+    if (!projectId) return
+    try {
+      const graph = await api.getGraph(projectId)
+      const facts = graph.nodes.filter(node => node.type === 'fact' && node.state === 'active')
+      setReviewFacts(facts)
+      setSelectedFactId(current => facts.some(fact => fact.id === current) ? current : '')
+      setError(null)
+    } catch (caught) { setError(caught instanceof Error ? caught.message : String(caught)) }
+  }
+
+  useEffect(() => {
+    if (awaitingManualReview && session?.current_project_id) {
+      void loadReviewFacts(session.current_project_id)
+      return
+    }
+    setReviewFacts([])
+    setSelectedFactId('')
+  }, [awaitingManualReview, session?.current_project_id])
 
   function toggleSolver(provider: string) { setSolvers(current => current.includes(provider) ? current.filter(item => item !== provider) : [...current, provider]) }
 
@@ -250,6 +273,17 @@ export function AutopilotPage({ onBack, onOpenProject }: { onBack: () => void; o
     finally { setBusy(false) }
   }
 
+  async function submitSelectedFact(finishAfterAccept: boolean) {
+    if (!awaitingManualReview || !selectedFactId || busy) return
+    try {
+      setBusy(true)
+      setError(null)
+      setSnapshot(await api.submitAutopilotTask(selectedFactId, finishAfterAccept))
+      setSelectedFactId('')
+    } catch (caught) { setError(caught instanceof Error ? caught.message : String(caught)) }
+    finally { setBusy(false) }
+  }
+
   const templateControls = <div className="platform-template-tools">
     <label className="auto-field platform-template-select"><span>结构化 API 模板</span><select aria-label="结构化 API 模板" value={selectedTemplateId} onChange={event => setSelectedTemplateId(event.target.value)} disabled={active || busy}><option value="">选择已保存模板</option>{templates.map(template => <option key={template.id} value={template.id}>{template.name}</option>)}</select></label>
     <div className="platform-template-actions"><button className="secondary-button" type="button" onClick={applyTemplate} disabled={active || busy || !selectedTemplateId}><Check size={15} /> 套用</button><button className="icon-button" type="button" aria-label="删除结构化 API 模板" title="删除模板" onClick={() => void deleteTemplate()} disabled={active || busy || !selectedTemplateId}><Trash2 size={16} /></button></div>
@@ -267,10 +301,33 @@ export function AutopilotPage({ onBack, onOpenProject }: { onBack: () => void; o
         <AutopilotControllerFields value={controller} disabled={active || busy} validation={controllerValidation} onChange={value => { setController(value); setControllerValidation(null) }} onTest={() => void testController()} />
         {mode === 'structured' && <section className="auto-config-section">{templateControls}</section>}
         <section className="auto-config-section"><div className="auto-section-heading"><h3>平台</h3><div className="auto-inline-actions"><button className="secondary-button" type="button" onClick={() => void validatePlatform()} disabled={active || busy || !platformReady}>验证配置</button>{mode === 'structured' && structured.current_task !== null && <button className="secondary-button" type="button" onClick={() => void inspectCurrentTask()} disabled={active || busy || !structured.base_url.trim()}><ScanSearch size={15} /> 查看当前题目</button>}{mode === 'structured' && structured.health_check !== null && <button className="secondary-button" type="button" onClick={() => void testPlatformHealth()} disabled={active || busy || !structured.base_url.trim()}>测试健康接口</button>}</div></div>{mode === 'prompt' ? <label className="auto-field auto-field--full"><span>平台说明 prompt</span><textarea value={prompt} onChange={event => { setPrompt(event.target.value); setPlatformValidation(null) }} placeholder="平台协议说明：URL、认证、取题、提交、结果判断与放弃规则" rows={9} disabled={active} /></label> : <><StructuredPlatformForm value={structured} disabled={active} onChange={value => { setStructured(value); setPlatformValidation(null); setCurrentTaskResult(null) }} /><label className="auto-field auto-field--full"><span>样例响应 JSON（可选）</span><textarea value={sampleResponse} onChange={event => { setSampleResponse(event.target.value); setPlatformValidation(null) }} placeholder="粘贴不含 token 的 fetch 样例响应" rows={6} disabled={active} /></label></>}{platformValidation && <p className={`validation-state validation-state--${platformValidation.status}`}>{platformValidation.status === 'valid' ? (platformValidation.mapping_preview ? '配置与样例映射有效' : '配置有效') : [...(platformValidation.missing ?? []).map(item => `缺少：${item}`), ...(platformValidation.warnings ?? []), ...(platformValidation.mapping_preview?.errors ?? [])].join('；')}</p>}{currentTaskResult && (currentTaskResult.task ? <div className="current-task-preview" aria-live="polite"><div><strong>{currentTaskResult.task.name}</strong><small>{currentTaskResult.task.external_id}</small></div><dl><div><dt>Goal</dt><dd>{currentTaskResult.task.goal}</dd></div><div><dt>Origin</dt><dd>{currentTaskResult.task.origin}</dd></div>{currentTaskResult.task.hints.length > 0 && <div><dt>提示</dt><dd>{currentTaskResult.task.hints.join('；')}</dd></div>}</dl></div> : <p className="validation-state validation-state--warning" aria-live="polite">{currentTaskResult.message ?? '当前没有题目'}</p>)}</section>
-        <section className="auto-config-section"><div className="auto-fields-grid"><label className="auto-field"><span>每题超时（分钟）</span><input type="number" min={1} max={1440} value={timeoutMinutes} onChange={event => setTimeoutMinutes(Number(event.target.value))} disabled={active} /></label><label className="auto-field"><span>最多题数</span><input type="number" min={1} max={1000} value={maxTasks} onChange={event => setMaxTasks(Number(event.target.value))} disabled={active} /></label><label className="auto-field"><span>拒答后动作</span><select value={rejectedAction} onChange={event => setRejectedAction(event.target.value as typeof rejectedAction)} disabled={active}><option value="fail">终止</option><option value="replan">重新规划</option><option value="skip">跳过</option></select></label><label className="auto-field"><span>业务重新规划次数</span><input type="number" min={0} max={10} value={maxReplans} onChange={event => setMaxReplans(Number(event.target.value))} disabled={active} /></label><label className="auto-field"><span>网络/限流传输重试</span><input type="number" min={0} max={10} value={maxTransportRetries} onChange={event => setMaxTransportRetries(Number(event.target.value))} disabled={active} /></label><label className="auto-field"><span>solver 失败动作</span><select value={solverFailureAction} onChange={event => setSolverFailureAction(event.target.value as typeof solverFailureAction)} disabled={active}><option value="fail">终止</option><option value="skip">跳过</option></select></label><label className="auto-field"><span>停止时 lease</span><select value={stopActiveTaskAction} onChange={event => setStopActiveTaskAction(event.target.value as typeof stopActiveTaskAction)} disabled={active}><option value="leave">保留</option><option value="skip">释放/跳过</option></select></label></div><p className="auto-help">拒答重新规划是业务策略；传输重试只处理网络/限流。solver 失败和停止行为按上方选择执行。</p><fieldset className="auto-provider-choices"><legend>Solver providers</legend>{available.map(provider => { const capability = snapshot?.provider_capabilities?.[provider]; const ready = capability?.auto_ready ?? true; return <label key={provider} className="choice-row"><input type="checkbox" checked={solvers.includes(provider)} onChange={() => toggleSolver(provider)} disabled={active || !ready} /><span>{provider}</span>{!ready && <small>{capability?.status ?? 'legacy-only'}</small>}</label> })}</fieldset><label className="auto-field"><span>每题 Agent 数量</span><input type="number" min={1} max={Math.max(1, solvers.length)} value={selectedLimit} onChange={event => setAgentLimit(Number(event.target.value))} disabled={active || solvers.length === 0} /></label></section>
+        <section className="auto-config-section"><div className="auto-fields-grid"><label className="auto-field"><span>每题超时（分钟）</span><input type="number" min={1} max={1440} value={timeoutMinutes} onChange={event => setTimeoutMinutes(Number(event.target.value))} disabled={active} /></label><label className="auto-field"><span>最多题数</span><input type="number" min={1} max={1000} value={maxTasks} onChange={event => setMaxTasks(Number(event.target.value))} disabled={active} /></label><label className="auto-field"><span>拒答后动作</span><select value={rejectedAction} onChange={event => setRejectedAction(event.target.value as typeof rejectedAction)} disabled={active}><option value="pause">暂停并人工处理</option><option value="fail">终止</option><option value="replan">重新规划</option><option value="skip">跳过</option></select></label><label className="auto-field"><span>业务重新规划次数</span><input type="number" min={0} max={10} value={maxReplans} onChange={event => setMaxReplans(Number(event.target.value))} disabled={active} /></label><label className="auto-field"><span>网络/限流传输重试</span><input type="number" min={0} max={10} value={maxTransportRetries} onChange={event => setMaxTransportRetries(Number(event.target.value))} disabled={active} /></label><label className="auto-field"><span>solver 失败动作</span><select value={solverFailureAction} onChange={event => setSolverFailureAction(event.target.value as typeof solverFailureAction)} disabled={active}><option value="fail">终止</option><option value="skip">跳过</option></select></label><label className="auto-field"><span>停止时 lease</span><select value={stopActiveTaskAction} onChange={event => setStopActiveTaskAction(event.target.value as typeof stopActiveTaskAction)} disabled={active}><option value="leave">保留</option><option value="skip">释放/跳过</option></select></label></div><p className="auto-help">拒答默认暂停并等待人工选择 Fact；传输重试只处理网络/限流。solver 失败和停止行为按上方选择执行。</p><fieldset className="auto-provider-choices"><legend>Solver providers</legend>{available.map(provider => { const capability = snapshot?.provider_capabilities?.[provider]; const ready = capability?.auto_ready ?? true; return <label key={provider} className="choice-row"><input type="checkbox" checked={solvers.includes(provider)} onChange={() => toggleSolver(provider)} disabled={active || !ready} /><span>{provider}</span>{!ready && <small>{capability?.status ?? 'legacy-only'}</small>}</label> })}</fieldset><label className="auto-field"><span>每题 Agent 数量</span><input type="number" min={1} max={Math.max(1, solvers.length)} value={selectedLimit} onChange={event => setAgentLimit(Number(event.target.value))} disabled={active || solvers.length === 0} /></label></section>
         <div className="auto-actions"><button className="primary-button" onClick={() => void start()} disabled={!canStart}>{busy ? '处理中...' : '启动全自动'}</button><button className="danger-button" onClick={() => void stop()} disabled={!active || busy}><Square size={16} /> 停止</button></div>
       </section>
-      <section className="auto-panel auto-progress-panel"><div className="auto-panel-heading"><div><span className="auto-panel-kicker">SESSION</span><h2>运行进度</h2></div>{session && <span className="auto-count">{session.completed_tasks} / {session.max_tasks}</span>}</div>{!session && <p className="empty-state">还没有自动会话。</p>}{session && <><dl className="auto-summary"><div><dt>阶段</dt><dd>{statusLabel[session.current_task_status ?? session.status] ?? session.current_task_status ?? session.status}</dd></div><div><dt>当前题目</dt><dd>{session.current_task_name ?? '等待下一题'}</dd></div><div><dt>外部 ID</dt><dd>{session.current_external_id ?? '未分配'}</dd></div><div><dt>黑板项目</dt><dd>{session.current_project_id ? <button className="text-button" onClick={() => onOpenProject(session.current_project_id!)}>{session.current_project_id}<ExternalLink size={14} /></button> : '未创建'}</dd></div></dl>{taskControlReady && <div className="auto-task-controls"><div className="auto-task-timer"><Clock3 size={16} /><span>本题剩余 {formatDuration(remainingSeconds)}</span></div><div className="auto-task-actions"><label className="auto-field"><span>增加秒数</span><input type="number" min={1} max={86400} step={60} value={extensionSeconds} onChange={event => setExtensionSeconds(Number(event.target.value))} disabled={busy} /></label><button className="secondary-button" type="button" onClick={() => void extendTime()} disabled={busy || extensionSeconds <= 0}><Clock3 size={15} /> 增加时间</button><button className="danger-button" type="button" onClick={() => void skipCurrentTask()} disabled={!skipReady || busy || ['submit_pending', 'accepted', 'skipped', 'stopped'].includes(session.current_task_status ?? '')}><SkipForward size={15} /> 放弃本题</button></div></div>}{session.current_goal_result && <div className="auto-result"><strong>结果 Fact</strong><span>{session.current_goal_result.fact_id ?? '未分配'}</span>{session.current_goal_result.preview && <p>{session.current_goal_result.preview}</p>}</div>}{snapshot?.controller_health && <p className="auto-message">Controller：{snapshot.controller_health.status}{snapshot.controller_health.model ? ` · ${snapshot.controller_health.model}` : ''}</p>}{session.last_message && <p className="auto-message">{session.last_message}</p>}{session.last_error && <p className="form-error">{session.last_error}</p>}<div className="auto-history"><h3>题目历史</h3>{history.length === 0 ? <p className="empty-state">暂无记录。</p> : <ol>{history.map((item, index) => <li key={`${item.external_id}-${index}`}><div><strong>{item.name}</strong><small>{statusLabel[item.status] ?? item.status} · {item.external_id}{item.reason_code ? ` · ${item.reason_code}` : ''}{item.attempt_count ? ` · ${item.attempt_count} 次提交` : ''}</small></div>{item.project_id && <button className="text-button" onClick={() => onOpenProject(item.project_id)}>{item.project_id}<ExternalLink size={13} /></button>}</li>)}</ol>}</div></>}</section>
+      <section className="auto-panel auto-progress-panel">
+        <div className="auto-panel-heading"><div><span className="auto-panel-kicker">SESSION</span><h2>运行进度</h2></div>{session && <span className="auto-count">{session.completed_tasks} / {session.max_tasks}</span>}</div>
+        {!session && <p className="empty-state">还没有自动会话。</p>}
+        {session && <>
+          <dl className="auto-summary"><div><dt>阶段</dt><dd>{statusLabel[session.current_task_status ?? session.status] ?? session.current_task_status ?? session.status}</dd></div><div><dt>当前题目</dt><dd>{session.current_task_name ?? '等待下一题'}</dd></div><div><dt>外部 ID</dt><dd>{session.current_external_id ?? '未分配'}</dd></div><div><dt>黑板项目</dt><dd>{session.current_project_id ? <button className="text-button" onClick={() => onOpenProject(session.current_project_id!)}>{session.current_project_id}<ExternalLink size={14} /></button> : '未创建'}</dd></div></dl>
+          {taskControlReady && <div className="auto-task-controls">
+            {!awaitingManualReview && <div className="auto-task-timer"><Clock3 size={16} /><span>本题剩余 {formatDuration(remainingSeconds)}</span></div>}
+            <div className="auto-task-actions">
+              {!awaitingManualReview && <><label className="auto-field"><span>增加秒数</span><input type="number" min={1} max={86400} step={60} value={extensionSeconds} onChange={event => setExtensionSeconds(Number(event.target.value))} disabled={busy} /></label><button className="secondary-button" type="button" onClick={() => void extendTime()} disabled={busy || extensionSeconds <= 0}><Clock3 size={15} /> 增加时间</button></>}
+              <button className="danger-button" type="button" onClick={() => void skipCurrentTask()} disabled={!skipReady || busy || ['submit_pending', 'accepted', 'skipped', 'stopped'].includes(session.current_task_status ?? '')}><SkipForward size={15} /> 放弃本题</button>
+            </div>
+          </div>}
+          {awaitingManualReview && <section className="auto-manual-review" aria-label="人工提交">
+            <div className="auto-manual-review-heading"><h3>人工提交</h3><button className="icon-button" type="button" aria-label="刷新 Fact" title="刷新 Fact" onClick={() => void loadReviewFacts()} disabled={busy}><RefreshCw size={16} /></button></div>
+            <label className="auto-field"><span>Fact</span><select aria-label="提交 Fact" value={selectedFactId} onChange={event => setSelectedFactId(event.target.value)} disabled={busy}><option value="">选择活动 Fact</option>{reviewFacts.map(fact => <option key={fact.id} value={fact.id}>{fact.id} · {fact.content.slice(0, 80)}</option>)}</select></label>
+            <div className="auto-manual-review-actions"><button className="primary-button" type="button" onClick={() => void submitSelectedFact(false)} disabled={busy || !selectedFactId}><Check size={15} /> 提交并继续</button><button className="secondary-button" type="button" onClick={() => void submitSelectedFact(true)} disabled={busy || !selectedFactId}><Square size={15} /> 提交并结束</button></div>
+          </section>}
+          {session.current_goal_result && <div className="auto-result"><strong>结果 Fact</strong><span>{session.current_goal_result.fact_id ?? '未分配'}</span>{session.current_goal_result.preview && <p>{session.current_goal_result.preview}</p>}</div>}
+          {snapshot?.controller_health && <p className="auto-message">Controller：{snapshot.controller_health.status}{snapshot.controller_health.model ? ` · ${snapshot.controller_health.model}` : ''}</p>}
+          {session.last_message && <p className="auto-message">{session.last_message}</p>}
+          {session.last_error && <p className="form-error">{session.last_error}</p>}
+          <div className="auto-history"><h3>题目历史</h3>{history.length === 0 ? <p className="empty-state">暂无记录。</p> : <ol>{history.map((item, index) => <li key={`${item.external_id}-${index}`}><div><strong>{item.name}</strong><small>{statusLabel[item.status] ?? item.status} · {item.external_id}{item.reason_code ? ` · ${item.reason_code}` : ''}{item.attempt_count ? ` · ${item.attempt_count} 次提交` : ''}</small></div>{item.project_id && <button className="text-button" onClick={() => onOpenProject(item.project_id)}>{item.project_id}<ExternalLink size={13} /></button>}</li>)}</ol>}</div>
+        </>}
+      </section>
     </div>
   </main>
 }

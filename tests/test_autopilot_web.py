@@ -2,11 +2,12 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from fastapi.testclient import TestClient
 
 from web.app import create_app
+from autopilot.manager import AutoManagerError
 from autopilot.models import AutoTask
 from autopilot.platform_models import PlatformResult
 from worker.models import ProviderCapabilities, ProviderConfig, WorkerResult
@@ -321,6 +322,36 @@ class AutopilotWebTests(unittest.TestCase):
                 self.assertEqual(current.json()["task"]["external_id"], "attempt-1")
                 self.assertEqual(calls, ["/current"])
                 self.assertNotIn("platform-secret", current.text)
+
+    def test_manual_submission_endpoint_queues_selected_fact_and_maps_conflict(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            with TestClient(create_app(Path(directory))) as client:
+                manager = client.app.state.autopilot
+                manager.submit_current_task = AsyncMock(
+                    return_value={"session": {"status": "submit_pending"}}
+                )
+
+                queued = client.post(
+                    "/api/autopilot/submit-current-task",
+                    json={"fact_id": "fact-1", "finish_after_accept": True},
+                )
+
+                self.assertEqual(queued.status_code, 200, queued.text)
+                manager.submit_current_task.assert_awaited_once_with(
+                    "fact-1",
+                    finish_after_accept=True,
+                )
+
+                manager.submit_current_task = AsyncMock(
+                    side_effect=AutoManagerError(
+                        "the current task is not awaiting manual review"
+                    )
+                )
+                conflict = client.post(
+                    "/api/autopilot/submit-current-task",
+                    json={"fact_id": "fact-1"},
+                )
+                self.assertEqual(conflict.status_code, 409, conflict.text)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,147 @@
+{
+  "manifest_version": 1,
+  "manifest_id": "example-platform-v1",
+  "platform": {
+    "name": "Example Competition Platform",
+    "base_url": "https://platform.example/api"
+  },
+  "operations": [
+    {
+      "id": "fetch-question",
+      "name": "Fetch the next question",
+      "description": "The platform returns the next available question and its attachments.",
+      "kind": "fetch",
+      "method": "GET",
+      "url": "https://platform.example/api/questions/next",
+      "headers": {
+        "Authorization": "Bearer {{platform_token}}"
+      },
+      "body_mode": "none",
+      "response_type": "json",
+      "success_condition": {
+        "kind": "status_code",
+        "status_codes": [200]
+      },
+      "source": {
+        "reference": "Contest manual, Question API",
+        "confidence": "high"
+      }
+    },
+    {
+      "id": "get-current-question",
+      "name": "Read the current question",
+      "kind": "current",
+      "method": "GET",
+      "url": "https://platform.example/api/questions/{{question_id}}",
+      "headers": {
+        "Authorization": "Bearer {{platform_token}}"
+      },
+      "body_mode": "none",
+      "response_type": "json",
+      "depends_on": ["fetch-question"],
+      "source": {
+        "reference": "Contest manual, Current question API",
+        "confidence": "high"
+      }
+    },
+    {
+      "id": "download-attachment",
+      "name": "Download a question attachment",
+      "kind": "attachment",
+      "method": "GET",
+      "url": "https://platform.example/api/attachments/{{attachment_id}}",
+      "headers": {
+        "Authorization": "Bearer {{platform_token}}"
+      },
+      "body_mode": "none",
+      "response_type": "bytes",
+      "depends_on": ["fetch-question"],
+      "source": {
+        "reference": "Contest manual, Attachment download API",
+        "confidence": "high"
+      }
+    },
+    {
+      "id": "submit-answer",
+      "name": "Submit the solved answer",
+      "kind": "submit",
+      "method": "POST",
+      "url": "https://platform.example/api/questions/{{question_id}}/submit",
+      "headers": {
+        "Authorization": "Bearer {{platform_token}}",
+        "Content-Type": "application/json"
+      },
+      "body": {
+        "answer": "{{answer}}"
+      },
+      "body_mode": "json",
+      "response_type": "json",
+      "depends_on": ["get-current-question"],
+      "side_effect": true,
+      "success_condition": {
+        "kind": "json_path_equals",
+        "path": "accepted",
+        "expected": true
+      },
+      "answer_mapping": {
+        "mode": "raw",
+        "fields": [
+          {
+            "target": "answer",
+            "source_path": "fact.content",
+            "required": true
+          }
+        ]
+      },
+      "source": {
+        "reference": "Contest manual, Submit API response section",
+        "confidence": "high"
+      }
+    },
+    {
+      "id": "skip-question",
+      "name": "Skip the current question",
+      "kind": "skip",
+      "method": "POST",
+      "url": "https://platform.example/api/questions/{{question_id}}/skip",
+      "headers": {
+        "Authorization": "Bearer {{platform_token}}"
+      },
+      "body": {
+        "reason": "{{reason}}"
+      },
+      "body_mode": "json",
+      "response_type": "json",
+      "side_effect": true,
+      "source": {
+        "reference": "Contest manual, Skip API",
+        "confidence": "medium",
+        "note": "Confirm whether the response contains a required success field before relying on it."
+      }
+    },
+    {
+      "id": "abandon-question",
+      "name": "Abandon the current question",
+      "kind": "abandon",
+      "method": "DELETE",
+      "url": "https://platform.example/api/questions/{{question_id}}/lease",
+      "headers": {
+        "Authorization": "Bearer {{platform_token}}"
+      },
+      "body_mode": "none",
+      "response_type": "json",
+      "side_effect": true,
+      "source": {
+        "reference": "Contest manual, Abandon API",
+        "confidence": "medium",
+        "note": "Confirm the documented lease-release response before using this operation."
+      }
+    }
+  ],
+  "sources": [
+    {
+      "reference": "Contest manual, platform API chapter",
+      "confidence": "high"
+    }
+  ]
+}

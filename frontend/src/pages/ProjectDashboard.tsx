@@ -13,14 +13,14 @@ export function ProjectDashboard({
   onCreate,
   onDelete,
   runtime,
-  onOpenAutopilot,
+  onOpenAutomation,
 }: {
   projects: ProjectSummary[]
   onOpen: (id: string) => void
   onCreate: () => void
   onDelete: (projectId: string) => Promise<void>
   runtime: RuntimeSnapshot | null
-  onOpenAutopilot: () => void
+  onOpenAutomation: () => void
 }) {
   const [filter, setFilter] = useState<Filter>('all')
   const [query, setQuery] = useState('')
@@ -62,7 +62,7 @@ export function ProjectDashboard({
           <p>{projects.filter(project => project.status === 'running').length} 个项目运行中</p>
         </div>
         <div className="dashboard-header__actions">
-          <button className="secondary-button" onClick={onOpenAutopilot}>
+          <button className="secondary-button" onClick={onOpenAutomation}>
             <Bot size={18} /> 全自动模式
           </button>
           <button className="primary-button" onClick={onCreate}>

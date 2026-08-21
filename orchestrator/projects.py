@@ -401,12 +401,12 @@ class ProjectService:
 
     def get_goal_result(self, project_id: str) -> GoalResult | None:
         handle = self.get_handle(project_id)
-        return handle.store.goal_result(len(handle.record.providers))
+        return handle.store.goal_result(handle.record.agent_limit)
 
     def goal_result_conflict(self, project_id: str) -> bool:
         """Return whether the current goal has multiple qualifying result groups."""
         handle = self.get_handle(project_id)
-        return handle.store.goal_result_conflict(len(handle.record.providers))
+        return handle.store.goal_result_conflict(handle.record.agent_limit)
 
     def list_projects(self) -> tuple[dict[str, object], ...]:
         with self._lock:

@@ -20,7 +20,7 @@ Web 工作区使用节点表示 `Goal`、`Origin`、`Fact` 和 `Hint`，使用�
 - 从全局运行面板查看配额、排队任务、活动任务和 provider 健康状态。
 - 在项目诊断侧栏筛选规划/执行记录、查看日志、人工重试和受控重新打开项目。
 - 同时运行多个相互隔离的项目。
-- 在“全自动答题”页面粘贴平台 API prompt，由控制器 LLM 逐题取题和提交；每题自动创建独立黑板项目，只有平台确认接受后才进入下一题。
+- 在“全自动答题”页面粘贴平台 API 手册，由离线解析器 LLM 生成 Manifest，再由独立调度器 LLM 逐题取题和提交；每题自动创建独立黑板项目，只有平台确认接受后才进入下一题。
 - 项目可安全移入 `web-data/.trash/`，不会触碰外部 `challenge_path` 或 workspace。
 - 编辑模式可归档/恢复人工 Fact、Hint，并删除没有执行历史的边；浏览模式为只读。
 - 通过 FastAPI 提供 REST、WebSocket 和生产前端静态资源。
@@ -185,20 +185,21 @@ Vite 默认地址为 `http://127.0.0.1:5173`，并将 `/api` 和 `/ws` 代理到
 
 ### 全自动答题
 
-打开首页的“全自动模式”进入 `/auto`。这是现有 Web 服务下的独立页面，不会新增后端服务或端口；例如后端运行在 `127.0.0.1:8000` 时，页面就是 `http://127.0.0.1:8000/auto`。
+打开首页的“全自动模式”进入 `/automation`。解析器页面接收人工粘贴的比赛手册或 Skills，使用独立 LLM 离线生成 `manifest.json` 和 `manifest.md`；解析器不会访问比赛平台。
 
-自动模式有两种接入方式：
+调度器使用另一套独立的 Base URL、API key、模型、超时和重试设置，只能读取当前 Manifest、当前工作组结果、平台响应和人工指令。它通过通用 HTTP 执行器调用 Manifest 已声明或人工追加的任意方法、URL、请求头、查询参数、请求体和附件下载操作；不会扫描或猜测 Manifest 外接口。平台 Token 仅在运行时注入，不能进入 Manifest、Fact、日志、Prompt 快照或审计数据。提交只有在 Manifest 声明的成功条件匹配后才算成功。
 
-- Prompt：输入平台说明 prompt，由独立的 Direct LLM Controller 使用当前阶段允许的 HTTP 工具取题、提交和放弃。
-- 结构化 API：填写平台 URL/token、current/fetch/info/submit/skip/health endpoint、字段映射、游标、结果判断、超时与重试；取题和响应判定由 `StructuredPlatformAdapter` 确定性执行。可选的 current endpoint 由“查看当前题目”按钮只读调用，不领取下一题、不创建 solver 项目，也不修改平台 lease。配置完成后可以保存为具名模板并在后续会话直接套用；模板持久化 endpoint、字段映射和结果判断，但始终排除平台 token。
+每道题创建独立黑板工作组，多个 Solver 可并行运行。工作组继续使用 `BLACKBOARD_RESULT v2` 和 `GoalResult v2` 的事实与来源追踪，Solver 不接触平台 Token，也不上传文件结果。调度器负责从字符串、JSON、表单或多字段工作组结果中提取提交内容。页面提供两个 LLM 的“一键增加超时”按钮、Manifest JSON 人工编辑/校验、平台 Token 临时输入、人工自然语言调度指令和显式命令/平台请求事件流。
 
-两种模式都单独填写 controller LLM 的 API key、base URL、model 和高级选项；controller 不占用 solver provider。solver provider 仍由现有 `ProjectService`/`Supervisor` 创建独立黑板项目。solver 完成后必须产生协议 v2 的 Goal Result Fact，controller 根据完整 Fact 和有限支持 Fact 生成 `SubmissionPlan`，支持 text、JSON 和 form 结果；平台明确返回 `accepted` 后才进入下一题。业务 `rejected` 只会按 `replan`、`skip` 或 `fail` 处理，429/5xx/网络错误只重试同一个 plan。
+对应接口为 `POST /api/automation/manifests/parse`、`GET /api/automation/manifests`、`GET /api/automation/manifests/{id}`、`PUT /api/automation/manifests/{id}`、`POST /api/automation/manifests/{id}/validate`、`POST /api/automation/runs`、`GET /api/automation/runs/current`、`GET /api/automation/runs/{id}`、`POST /api/automation/runs/{id}/stop`、`POST /api/automation/runs/{id}/commands` 和 `GET /api/automation/runs/{id}/events`。第一版只运行一个任务，题目串行推进，题目内部支持多个 Solver 并行；不支持结果文件上传或跨任务恢复。
 
-协议 v2 使用 `goal_result_ref`、completion claim 和 `GoalResult`，不再把 `answer_key`/`final_answer` 当作新自动模式的结果入口。qinyuan-agent 与 q-subagent 通过 required Skill、stdout 前 validator gate 和 capability probe 提供 v2 provider 能力；未满足 v2 能力的 provider 不会被新自动模式选中。旧 provider-controller payload 保留为兼容入口，但新 UI 不使用它。
+完整的无凭据示例位于 `automation/examples/manifest.example.json` 和配套的 `manifest.example.md`。人工修改流程为：先粘贴手册并生成 Manifest，审查 Markdown，再在 JSON 编辑区增加、修改或删除 operation；人工补充的接口仍需填写来源、置信度、URL、Method、参数和成功条件。点击“保存人工修改”后，后端刷新 `updated_at`、重新生成 Markdown，最后点击“校验执行条件”；校验通过前不能启动调度器。
 
-controller key、平台 token 和完整 prompt 只存在于当前 React state/运行时 session；启动后输入立即清空，snapshot/history/SQLite 不包含凭据。服务重启不会恢复自动 session 或平台 lease。首版不支持 controller streaming、并行题目或结果 artifact/文件上传。
+附件先下载到当前题目的暂存目录，题目确定后移动到独立的 `automation/runs/<run-id>/attachments/question-*/` 目录，并仅把该目录交给对应黑板工作组。结构化命令、平台请求摘要和人工指令会在运行目录写入脱敏 `events.jsonl`；该文件不包含平台 Token、LLM API key、Prompt 快照或原始 LLM 响应。
 
-对应接口为 `GET /api/autopilot`、`POST /api/autopilot/start`、`POST /api/autopilot/stop`、`POST /api/autopilot/extend-time`、`POST /api/autopilot/skip-current-task`、`POST /api/autopilot/test-controller`、`POST /api/autopilot/validate-platform`，以及结构化模式的 `POST /api/autopilot/current-task` 和 `POST /api/autopilot/test-platform-health`。current/health 查询只调用用户显式配置的对应 endpoint，不会取题或消耗 lease。运行中的题目可以通过 `extend-time` 追加本地 solver 时限；`skip-current-task` 会调用平台 skip endpoint，记录跳过并继续下一题。
+真实平台只允许使用非生产隔离环境验证。项目提供了可选的
+`tests/test_automation_platform_integration.py`，默认跳过网络请求；只有同时设置
+`AUTOMATION_PLATFORM_E2E=1` 和 `AUTOMATION_PLATFORM_ISOLATED=1`，并人工提供 Manifest、Token、operation ID、题目决策和工作组结果后才会运行。所需变量示例位于 `automation/examples/real-platform-e2e.env.example`，测试只调用 Manifest 中明确给出的 operation，不扫描或猜测接口。该测试使用确定性调度器响应验证真实 HTTP 边界，不代表真实 LLM 效果验证。
 
 ### 删除项目
 
@@ -561,7 +562,7 @@ python main.py --goal "Recover the flag" --origin "Challenge statement" --challe
 
 ```powershell
 python -m unittest discover -s tests -v
-python -m compileall main.py web_main.py autopilot orchestrator worker web tests
+python -m compileall main.py web_main.py automation orchestrator worker web tools tests
 ```
 
 前端单元测试和构建：
@@ -621,7 +622,7 @@ provider 凭据只应存在于用户自己的环境变量或专用配置文件�
   `server restarted` 事件，并把遗留的
   `running` 项目恢复为 `idle`。恢复事件可通过 WebSocket `after` 参数重放；
   外部 CLI 不会自动重启，必须由用户再次启动项目。
-- v2 Goal Result Fact 共识只认可同一 Fact 或显式 `equivalent_to` 连通分量；多个不等价结果进入 `degraded/result_conflict`。新自动模式可按平台契约提交，手动项目不会自动提交。
+- v2 Goal Result Fact 共识只认可同一 Fact 或显式 `equivalent_to` 连通分量；多个不等价结果进入 `degraded/result_conflict`。Manifest 全自动模式可按平台契约提交，手动项目不会自动提交。
 - 相似 Fact 不自动合并，只保守地保留独立命题和关系。
 
 ## 来源与致谢

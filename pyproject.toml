@@ -38,7 +38,7 @@ py-modules = ["main", "web_main"]
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["autopilot*", "experiments*", "orchestrator*", "web*", "worker*"]
+include = ["automation*", "experiments*", "orchestrator*", "web*", "worker*"]
 exclude = ["tests*"]
 
 [tool.setuptools.package-data]

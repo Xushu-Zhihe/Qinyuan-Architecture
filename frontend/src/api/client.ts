@@ -8,14 +8,11 @@ import type {
   ProjectSummary,
   RuntimeSnapshot,
   SyncedExecutionLogs,
-  AutopilotSnapshot,
-  AutopilotStartPayload,
-  ControllerInput,
-  CurrentTaskResult,
-  PlatformValidationPayload,
-  StructuredPlatformInput,
-  StructuredPlatformTemplate,
-  ValidationResult,
+  AutomationLLMInput,
+  AutomationManifestDocument,
+  AutomationRunSnapshot,
+  AutomationStartPayload,
+  AutomationEvent,
 } from '../types'
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -103,54 +100,40 @@ export const api = {
   planningAttempts: (projectId: string) =>
     request<PlanningAttempt[]>(`/api/projects/${projectId}/planning-attempts`),
   auditExportUrl: (projectId: string) => `/api/projects/${projectId}/audit/export`,
-  getAutopilot: () => request<AutopilotSnapshot>('/api/autopilot'),
-  listAutopilotTemplates: () => request<StructuredPlatformTemplate[]>('/api/autopilot/templates'),
-  saveAutopilotTemplate: (payload: { name: string; platform: StructuredPlatformInput }) =>
-    request<StructuredPlatformTemplate>('/api/autopilot/templates', {
+  parseAutomationManifest: (payload: { source_text: string; parser_llm: AutomationLLMInput }) =>
+    request<AutomationManifestDocument>('/api/automation/manifests/parse', {
       method: 'POST',
       body: JSON.stringify(payload),
     }),
-  deleteAutopilotTemplate: (templateId: string) =>
-    request<void>(`/api/autopilot/templates/${templateId}`, { method: 'DELETE' }),
-  startAutopilot: (payload: AutopilotStartPayload) =>
-    request<AutopilotSnapshot>('/api/autopilot/start', {
+  listAutomationManifests: () =>
+    request<AutomationManifestDocument[]>('/api/automation/manifests'),
+  getAutomationManifest: (manifestId: string) =>
+    request<AutomationManifestDocument>(`/api/automation/manifests/${manifestId}`),
+  updateAutomationManifest: (manifestId: string, manifest: Record<string, unknown>) =>
+    request<AutomationManifestDocument>(`/api/automation/manifests/${manifestId}`, {
+      method: 'PUT',
+      body: JSON.stringify(manifest),
+    }),
+  validateAutomationManifest: (manifestId: string) =>
+    request<{ valid: boolean; manifest_id: string; errors: string[] }>(`/api/automation/manifests/${manifestId}/validate`, {
+      method: 'POST',
+    }),
+  startAutomation: (payload: AutomationStartPayload) =>
+    request<AutomationRunSnapshot>('/api/automation/runs', {
       method: 'POST',
       body: JSON.stringify(payload),
     }),
-  stopAutopilot: () => request<AutopilotSnapshot>('/api/autopilot/stop', { method: 'POST' }),
-  extendAutopilotTime: (seconds: number) =>
-    request<AutopilotSnapshot>('/api/autopilot/extend-time', {
+  getAutomationRun: (runId: string) =>
+    request<AutomationRunSnapshot>(`/api/automation/runs/${runId}`),
+  getCurrentAutomationRun: () =>
+    request<AutomationRunSnapshot>('/api/automation/runs/current'),
+  stopAutomation: (runId: string) =>
+    request<AutomationRunSnapshot>(`/api/automation/runs/${runId}/stop`, { method: 'POST' }),
+  sendAutomationInstruction: (runId: string, instruction: string) =>
+    request<AutomationRunSnapshot>(`/api/automation/runs/${runId}/commands`, {
       method: 'POST',
-      body: JSON.stringify({ seconds }),
+      body: JSON.stringify({ instruction }),
     }),
-  skipAutopilotTask: (reason = 'user skipped') =>
-    request<AutopilotSnapshot>('/api/autopilot/skip-current-task', {
-      method: 'POST',
-      body: JSON.stringify({ reason }),
-    }),
-  testAutopilotController: (payload: ControllerInput) =>
-    request<ValidationResult>('/api/autopilot/test-controller', {
-      method: 'POST',
-      body: JSON.stringify(payload),
-    }),
-  validateAutopilotPlatform: (payload: PlatformValidationPayload) =>
-    request<ValidationResult>('/api/autopilot/validate-platform', {
-      method: 'POST',
-      body: JSON.stringify(payload),
-    }),
-  validateAutopilotPrompt: (controller: ControllerInput, prompt: string) =>
-    request<ValidationResult>('/api/autopilot/validate-prompt', {
-      method: 'POST',
-      body: JSON.stringify({ controller, prompt }),
-    }),
-  testAutopilotPlatformHealth: (platform: StructuredPlatformInput) =>
-    request<ValidationResult>('/api/autopilot/test-platform-health', {
-      method: 'POST',
-      body: JSON.stringify({ mode: 'structured', platform }),
-    }),
-  getAutopilotCurrentTask: (platform: StructuredPlatformInput) =>
-    request<CurrentTaskResult>('/api/autopilot/current-task', {
-      method: 'POST',
-      body: JSON.stringify({ mode: 'structured', platform }),
-    }),
+  automationEvents: (runId: string) =>
+    request<AutomationEvent[]>(`/api/automation/runs/${runId}/events`),
 }

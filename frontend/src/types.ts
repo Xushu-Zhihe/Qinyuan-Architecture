@@ -240,219 +240,56 @@ export interface RuntimeSnapshot {
   active_tasks: RuntimeTask[]
 }
 
-export interface AutoHistoryEntry {
-  external_id: string
-  name: string
-  project_id: string
-  answer: string
-  status: string
-  message: string | null
-  result_ref?: string | null
-  result_fact_id?: string | null
-  reason_code?: string | null
-  attempt_count?: number
-  accepted_at?: string | null
-  finished_at?: string | null
-  attempts?: Array<Record<string, unknown>>
-}
-
-export interface ControllerSummary {
-  configured: boolean
+export interface AutomationLLMInput {
   base_url: string
+  api_key: string
   model: string
-}
-
-export interface PlatformTaskSnapshot {
-  external_id: string | null
-  name: string | null
-  status: string | null
-  project_id: string | null
-}
-
-export interface GoalResultSnapshot {
-  result_ref: string | null
-  fact_id: string | null
-  preview: string | null
-}
-
-export interface ProviderCapability {
-  request_protocol_versions: number[]
-  result_protocol_versions: number[]
-  skill_mode: 'none' | 'inline' | 'required' | 'tool'
-  available_skills: string[]
-  validates_result_locally: boolean
-  supports_result_fact: boolean
-  schema_version: string | null
-  fixture_digest: string | null
-  auto_ready: boolean
-  status: string
-}
-
-export interface AutoSession {
-  id: string
-  status: string
-  mode?: 'prompt' | 'structured'
-  controller_provider?: string | null
-  controller?: ControllerSummary | null
-  solver_providers: string[]
-  available_providers: string[]
-  agent_limit: number
-  max_tasks: number
-  completed_tasks: number
-  processed_tasks?: number
-  current_external_id: string | null
-  current_task_name: string | null
-  current_project_id: string | null
-  skip_requested?: boolean
-  current_task_started_at?: string | null
-  current_task_deadline_at?: string | null
-  current_task_remaining_seconds?: number | null
-  last_message: string | null
-  last_error: string | null
-  current_task_status?: string | null
-  reason_code?: string | null
-  current_goal_result?: GoalResultSnapshot | null
-  current_attempt?: {
-    phase: string | null
-    retry_count: number
-    replan_count: number
-    plan_fingerprint: string | null
-  }
-  history: AutoHistoryEntry[]
-}
-
-export interface AutopilotSnapshot {
-  session: AutoSession | null
-  providers: string[]
-  provider_capabilities?: Record<string, ProviderCapability>
-  controller_health?: { status: string; last_error: string | null; checked_at: string | null; model: string | null }
-}
-
-export interface ControllerAdvancedInput {
   timeout_seconds: number
-  max_rounds: number
   max_transport_retries: number
   temperature: number | null
-  max_output_tokens: number | null
-  reasoning_effort: string | null
-  extra_headers: Record<string, string>
-  extra_body: Record<string, unknown>
 }
 
-export interface ControllerInput {
-  api_key: string
-  base_url: string
-  model: string
-  advanced: ControllerAdvancedInput
+export interface AutomationManifestDocument {
+  manifest_id: string
+  manifest_hash: string
+  manifest: Record<string, unknown>
+  json: string
+  markdown: string
 }
 
-export interface EndpointInput {
-  method: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE'
-  path: string
-  query: Record<string, unknown>
-  headers: Record<string, string>
-  body: unknown
-  form: Record<string, string> | null
-  timeout_seconds: number
-  max_retries: number
-  retry_status_codes: number[]
-}
-
-export interface OutcomeConditionInput {
-  path?: string | null
-  equals?: unknown
-  status_codes?: number[]
-}
-
-export interface StructuredPlatformInput {
-  base_url: string
-  auth: {
-    type: 'bearer' | 'header' | 'query' | 'cookie'
-    token: string
-    header_name: string
-    prefix: string
-    parameter_name: string
-  }
-  default_headers: Record<string, string>
-  fetch_task: EndpointInput
-  current_task: EndpointInput | null
-  task_info: EndpointInput | null
-  submit_result: EndpointInput
-  skip_task: EndpointInput | null
-  mapping: {
-    task_list_path: string | null
-    external_id_path: string
-    name_path: string
-    goal_path: string
-    origin_path: string
-    origin_endpoint_path: string | null
-    goal_format: 'plain' | 'flag_objective'
-    hints_path: string | null
-    hints_item_path: string | null
-    attachments_path: string | null
-    cursor_path: string | null
-    lease_id_path: string | null
-  }
-  outcomes: {
-    fetch: { finished: OutcomeConditionInput | null; empty: OutcomeConditionInput | null }
-    submit: { accepted: OutcomeConditionInput | null; rejected: OutcomeConditionInput | null; retryable: OutcomeConditionInput }
-    skip: { succeeded: OutcomeConditionInput | null }
-  }
-  health_check: EndpointInput | null
-  task_info_mode: 'always' | 'when_incomplete'
-  task_info_failure_action: 'fail_task' | 'use_fetch_payload' | 'skip_task'
-  task_info_delay_seconds: number
-  initial_cursor: string | null
-}
-
-export interface StructuredPlatformTemplate {
-  id: string
-  name: string
+export interface AutomationEvent {
+  event_id: string
+  event_type: 'command' | 'operation' | 'message' | 'error'
+  command_id: string | null
+  operation_id: string | null
+  status: 'planned' | 'running' | 'succeeded' | 'failed' | 'unknown'
+  detail: Record<string, unknown>
   created_at: string
-  updated_at: string
-  platform: StructuredPlatformInput
 }
 
-interface AutopilotStartCommon {
-  controller: ControllerInput
+export interface AutomationRunSnapshot {
+  run_id: string
+  manifest_id: string
+  manifest_hash: string
+  status: string
+  processed_tasks: number
+  max_tasks: number
+  current_question: Record<string, unknown> | null
+  workgroup_project_id: string | null
+  workgroup_result: Record<string, unknown> | null
+  stop_after_current: boolean
+  error: string
+  started_at: string
+  events: AutomationEvent[]
+}
+
+export interface AutomationStartPayload {
+  manifest_id: string
+  dispatcher_llm: AutomationLLMInput
+  platform_token: string
   solver_providers: string[]
   agent_limit: number
   max_tasks: number
-  task_timeout_minutes: number
+  task_timeout_seconds: number
   poll_interval_seconds: number
-  rejected_action: 'replan' | 'skip' | 'fail'
-  solver_failure_action: 'skip' | 'fail'
-  stop_active_task_action: 'leave' | 'skip'
-  max_replans_after_rejection: number
-  max_transport_retries: number
-}
-
-export type AutopilotStartPayload =
-  | (AutopilotStartCommon & { mode: 'prompt'; platform: { prompt: string } })
-  | (AutopilotStartCommon & { mode: 'structured'; platform: StructuredPlatformInput })
-
-export type PlatformValidationPayload =
-  | { mode: 'prompt'; platform: { prompt: string } }
-  | { mode: 'structured'; platform: StructuredPlatformInput; sample_response?: unknown }
-
-export interface ValidationResult {
-  ok: boolean
-  status: 'valid' | 'warning' | 'invalid'
-  category: string
-  model?: string
-  warnings?: string[]
-  missing?: string[]
-  mapping_preview?: { status: string; errors?: string[]; task?: Record<string, unknown>; configured_outcomes?: Record<string, boolean> }
-}
-
-export interface CurrentTaskResult extends ValidationResult {
-  message?: string | null
-  task: {
-    external_id: string
-    name: string
-    goal: string
-    origin: string
-    hints: string[]
-    lease_id: string | null
-  } | null
 }

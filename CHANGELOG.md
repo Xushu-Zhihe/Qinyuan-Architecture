@@ -21,10 +21,10 @@
   `project_id + provider` 的短进程通过稳定 owner ID 和 workspace 接管同一容器，
   并在项目 achieved/stop/delete 收尾后执行可审计的显式释放。
 - 新增 `BLACKBOARD_RESULT` v2、`goal_result_ref`、Goal Result Fact、completion claim、SQLite schema v5 和 `ProjectService.get_goal_result()`；多 provider 通过同一 Fact 或显式 `equivalent_to` 达成结果共识，不等价结果进入 `result_conflict`。
-- 全自动模式新增独立 OpenAI-compatible Direct LLM Controller，并支持 Prompt/结构化 API 两种平台接入；新 UI 不再选择 provider 作为 controller，旧 provider-controller payload 仅作为兼容入口保留。
-- 新增 text/JSON/form `SubmissionPlan`、冻结 plan fingerprint、rejected/replan 与传输重试分流、题目级状态/history、显式平台 health endpoint 测试和运行时 controller/platform secret 清理。
-- provider 配置新增 result protocol capability、runtime probe、required Skill 和协议参数；qinyuan-agent/q-subagent 可被确定性识别为 v2 auto-ready。
-- 首版明确不支持结果 artifact/文件上传、controller streaming、并行题目和自动 session/lease 恢复。
+- 全自动模式重构为离线解析器、Manifest 调度器和黑板工作组三段式链路；解析器与调度器使用隔离的 LLM 配置和项目级 Skill。
+- Manifest 支持平台手册中声明的任意 HTTP 方法、请求、响应成功条件、附件下载和字符串/JSON/form 答案映射；Manifest 外接口、无成功条件提交和敏感信息持久化都会被拒绝。
+- 每道题创建独立黑板项目，多个 Solver 并行运行并返回 `BLACKBOARD_RESULT v2`/`GoalResult v2`；页面提供人工调度指令、显式命令事件和 LLM 超时增加按钮。
+- 首版不支持结果文件上传、题目并行、跨任务恢复或真实平台/真实 LLM 集成验证。
 - 项目支持可恢复删除：运行项目会先停止并清理，项目目录移动到
   `web-data/.trash/`，注册表删除失败会自动回滚。
 - 编辑模式支持 Fact/Hint 归档、恢复、无执行历史边删除；浏览模式锁定语义修改，

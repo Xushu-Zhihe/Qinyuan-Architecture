@@ -21,6 +21,7 @@ export function RuntimeOverview({ runtime }: { runtime: RuntimeSnapshot | null }
   const projectNames = new Map(runtime.projects.map(project => [project.id, project.name]))
   const active = runtime.active_tasks.slice(0, 4)
   const pending = runtime.coordinator.pending.items.slice(0, 4)
+  const recentProjects = runtime.projects.slice(0, 10)
 
   return (
     <section className="runtime-overview" aria-label="全局运行状态">
@@ -68,7 +69,7 @@ export function RuntimeOverview({ runtime }: { runtime: RuntimeSnapshot | null }
         </section>
       </div>
       <div className="runtime-provider-grid" aria-label="Provider 健康状态">
-        {runtime.projects.map(project => (
+        {recentProjects.map(project => (
           <div className="runtime-provider-row" key={project.id}>
             <strong title={project.name}>{project.name}</strong>
             <span title={`WebSocket 队列 ${project.event_metrics.queue_depth}/${project.event_metrics.queue_capacity}，丢弃 ${project.event_metrics.dropped_events}，补读 ${project.event_metrics.backfilled_events}`}>

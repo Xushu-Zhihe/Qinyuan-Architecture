@@ -198,7 +198,7 @@ Vite 默认地址为 `http://127.0.0.1:5173`，并将 `/api` 和 `/ws` 代理到
 
 controller key、平台 token 和完整 prompt 只存在于当前 React state/运行时 session；启动后输入立即清空，snapshot/history/SQLite 不包含凭据。服务重启不会恢复自动 session 或平台 lease。首版不支持 controller streaming、并行题目或结果 artifact/文件上传。
 
-对应接口为 `GET /api/autopilot`、`POST /api/autopilot/start`、`POST /api/autopilot/stop`、`POST /api/autopilot/extend-time`、`POST /api/autopilot/skip-current-task`、`POST /api/autopilot/test-controller`、`POST /api/autopilot/validate-platform`，以及结构化模式的 `POST /api/autopilot/current-task` 和 `POST /api/autopilot/test-platform-health`。current/health 查询只调用用户显式配置的对应 endpoint，不会取题或消耗 lease。运行中的题目可以通过 `extend-time` 追加本地 solver 时限；`skip-current-task` 会调用平台 skip endpoint，记录跳过并继续下一题。
+对应接口为 `GET /api/autopilot`、`POST /api/autopilot/start`、`POST /api/autopilot/stop`、`POST /api/autopilot/extend-time`、`POST /api/autopilot/skip-current-task`、`POST /api/autopilot/finish-after-current-task`、`POST /api/autopilot/submit-current-task`、`POST /api/autopilot/test-controller`、`POST /api/autopilot/validate-platform`，以及结构化模式的 `POST /api/autopilot/current-task` 和 `POST /api/autopilot/test-platform-health`。current/health 查询只调用用户显式配置的对应 endpoint，不会取题或消耗 lease。运行中的题目可以通过 `extend-time` 追加本地 solver 时限；`skip-current-task` 会调用平台 skip endpoint，记录跳过并继续下一题；`finish-after-current-task` 只记录“当前题交付后停止”，当前题仍会正常求解、提交和重试，平台接受后自动模式结束，不会领取下一题。暂停人工处理时仍可使用 `submit-current-task` 的 `finish_after_accept` 选项在本题接受后结束。
 
 ### 删除项目
 

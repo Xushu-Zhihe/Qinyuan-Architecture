@@ -273,6 +273,16 @@ export function AutopilotPage({ onBack, onOpenProject }: { onBack: () => void; o
     finally { setBusy(false) }
   }
 
+  async function finishAfterCurrentTask() {
+    if (!taskControlReady || busy || session?.finish_after_current_task_requested) return
+    try {
+      setBusy(true)
+      setError(null)
+      setSnapshot(await api.finishAfterCurrentAutopilotTask())
+    } catch (caught) { setError(caught instanceof Error ? caught.message : String(caught)) }
+    finally { setBusy(false) }
+  }
+
   async function submitSelectedFact(finishAfterAccept: boolean) {
     if (!awaitingManualReview || !selectedFactId || busy) return
     try {
@@ -313,6 +323,7 @@ export function AutopilotPage({ onBack, onOpenProject }: { onBack: () => void; o
             {!awaitingManualReview && <div className="auto-task-timer"><Clock3 size={16} /><span>本题剩余 {formatDuration(remainingSeconds)}</span></div>}
             <div className="auto-task-actions">
               {!awaitingManualReview && <><label className="auto-field"><span>增加秒数</span><input type="number" min={1} max={86400} step={60} value={extensionSeconds} onChange={event => setExtensionSeconds(Number(event.target.value))} disabled={busy} /></label><button className="secondary-button" type="button" onClick={() => void extendTime()} disabled={busy || extensionSeconds <= 0}><Clock3 size={15} /> 增加时间</button></>}
+              <button className="secondary-button" type="button" onClick={() => void finishAfterCurrentTask()} disabled={busy || Boolean(session.finish_after_current_task_requested) || ['submit_pending', 'accepted', 'skipped', 'stopped'].includes(session.current_task_status ?? '')}><Check size={15} /> 本题完成后停止</button>
               <button className="danger-button" type="button" onClick={() => void skipCurrentTask()} disabled={!skipReady || busy || ['submit_pending', 'accepted', 'skipped', 'stopped'].includes(session.current_task_status ?? '')}><SkipForward size={15} /> 放弃本题</button>
             </div>
           </div>}

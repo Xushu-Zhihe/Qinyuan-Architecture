@@ -377,6 +377,23 @@ class AutoManager:
             self._persist_session(session)
             return self._snapshot_locked()
 
+    async def finish_after_current_task(self) -> dict[str, object]:
+        """Keep the current task running, then finish after its terminal result."""
+        async with self._lock:
+            session = self._session
+            if session is None or not self._is_active():
+                raise AutoManagerError("no automatic session is running")
+            if session.current_external_id is None:
+                raise AutoManagerError("there is no active task to finish")
+            if session.current_task_status in {"accepted", "skipped", "stopped"}:
+                raise AutoManagerError("the current task can no longer be finished")
+            session.finish_after_current_task_requested = True
+            session.last_message = (
+                "current task will be submitted before automatic session finishes"
+            )
+            self._persist_session(session)
+            return self._snapshot_locked()
+
     async def submit_current_task(
         self,
         fact_id: str,
@@ -571,6 +588,7 @@ class AutoManager:
                 )
                 if submission.result.action != "accepted":
                     raise AutoManagerError("platform rejected the answer")
+                finish_after_accept = session.finish_after_current_task_requested
                 session.history.append(
                     AutoHistoryEntry(
                         external_id=task.external_id,
@@ -586,7 +604,12 @@ class AutoManager:
                 session.current_external_id = None
                 session.current_task_name = None
                 session.current_project_id = None
+                session.finish_after_current_task_requested = False
                 session.last_message = "answer accepted"
+                if finish_after_accept:
+                    session.status = "finished"
+                    session.last_message = "answer accepted; automatic session finished by user"
+                    break
             if session.status not in {"finished", "failed", "stopped"}:
                 session.status = "finished"
                 session.last_message = "maximum task limit reached"
@@ -803,7 +826,7 @@ class AutoManager:
                     )
                     attempt_records.extend(added)
                     replans += 1
-                finish_after_accept = False
+                finish_after_accept = session.finish_after_current_task_requested
                 if submission.status == "rejected":
                     self._transition(session, "rejected", "platform_rejected")
                     if session.config.rejected_action == "pause":
@@ -1035,7 +1058,12 @@ class AutoManager:
                 record["attempt"] = offset + index
             attempt_records.extend(added)
             if submission.status == "accepted":
-                return submission, goal_result, attempt_records, finish_after_accept
+                return (
+                    submission,
+                    goal_result,
+                    attempt_records,
+                    bool(finish_after_accept or session.finish_after_current_task_requested),
+                )
             reason_code = str(
                 submission.metadata.get("reason_code", "platform_submission_failed")
             )
@@ -1386,6 +1414,7 @@ class AutoManager:
         session.current_task_name = None
         session.current_project_id = None
         session.skip_requested = False
+        session.finish_after_current_task_requested = False
         session.current_task_started_at = None
         session.current_task_deadline_at = None
         session.current_task_status = None

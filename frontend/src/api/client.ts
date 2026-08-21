@@ -128,6 +128,11 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ reason }),
     }),
+  finishAfterCurrentAutopilotTask: () =>
+    request<AutopilotSnapshot>('/api/autopilot/finish-after-current-task', {
+      method: 'POST',
+      body: JSON.stringify({}),
+    }),
   submitAutopilotTask: (factId: string, finishAfterAccept = false) =>
     request<AutopilotSnapshot>('/api/autopilot/submit-current-task', {
       method: 'POST',

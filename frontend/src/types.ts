@@ -304,6 +304,7 @@ export interface AutoSession {
   current_task_name: string | null
   current_project_id: string | null
   skip_requested?: boolean
+  finish_after_current_task_requested?: boolean
   current_task_started_at?: string | null
   current_task_deadline_at?: string | null
   current_task_remaining_seconds?: number | null

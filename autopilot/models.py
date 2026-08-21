@@ -393,6 +393,7 @@ class AutoSession:
     consecutive_duplicate_ids: int = 0
     stop_release_attempted: bool = False
     skip_requested: bool = False
+    finish_after_current_task_requested: bool = False
     current_task_started_at: str | None = None
     current_task_deadline_at: str | None = None
 
@@ -418,6 +419,7 @@ class AutoSession:
             "current_task_name": self.current_task_name,
             "current_project_id": self.current_project_id,
             "skip_requested": self.skip_requested,
+            "finish_after_current_task_requested": self.finish_after_current_task_requested,
             "current_task_started_at": self.current_task_started_at,
             "current_task_deadline_at": self.current_task_deadline_at,
             "current_task_remaining_seconds": self._remaining_task_seconds(),

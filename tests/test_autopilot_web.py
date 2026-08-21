@@ -353,6 +353,31 @@ class AutopilotWebTests(unittest.TestCase):
                 )
                 self.assertEqual(conflict.status_code, 409, conflict.text)
 
+    def test_finish_after_current_task_endpoint_queues_finish_and_maps_conflict(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            with TestClient(create_app(Path(directory))) as client:
+                manager = client.app.state.autopilot
+                manager.finish_after_current_task = AsyncMock(
+                    return_value={"session": {"status": "solving"}}
+                )
+
+                queued = client.post(
+                    "/api/autopilot/finish-after-current-task",
+                    json={},
+                )
+
+                self.assertEqual(queued.status_code, 200, queued.text)
+                manager.finish_after_current_task.assert_awaited_once_with()
+
+                manager.finish_after_current_task = AsyncMock(
+                    side_effect=AutoManagerError("there is no active task to finish")
+                )
+                conflict = client.post(
+                    "/api/autopilot/finish-after-current-task",
+                    json={},
+                )
+                self.assertEqual(conflict.status_code, 409, conflict.text)
+
 
 if __name__ == "__main__":
     unittest.main()

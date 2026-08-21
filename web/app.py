@@ -60,6 +60,7 @@ from web.schemas import (
     StructuredPlatformValidation,
     AutopilotTimeAdjustment,
     AutopilotSkipRequest,
+    AutopilotFinishAfterCurrentTaskRequest,
     AutopilotSubmissionRequest,
 )
 from worker.models import AuditConfig, CoordinatorConfig, ProviderConfig
@@ -386,6 +387,15 @@ def create_app(
     async def skip_autopilot_task(payload: AutopilotSkipRequest):
         try:
             return await autopilot.skip_current_task(payload.reason)
+        except AutoManagerError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/api/autopilot/finish-after-current-task")
+    async def finish_after_current_autopilot_task(
+        _payload: AutopilotFinishAfterCurrentTaskRequest,
+    ):
+        try:
+            return await autopilot.finish_after_current_task()
         except AutoManagerError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 

@@ -28,4 +28,19 @@ describe('RuntimeOverview', () => {
     expect(screen.getByText('project_limit')).toBeInTheDocument()
     expect(screen.getByText('codex · 健康')).toBeInTheDocument()
   })
+
+  it('shows only the ten most recent projects in provider health', () => {
+    const projects = Array.from({ length: 12 }, (_, index) => ({
+      ...runtime.projects[0],
+      id: `project-${index + 1}`,
+      name: `Runtime project ${index + 1}`,
+    }))
+
+    render(<RuntimeOverview runtime={{ ...runtime, projects }} />)
+
+    expect(screen.getByText('Runtime project 1')).toBeInTheDocument()
+    expect(screen.getByText('Runtime project 10')).toBeInTheDocument()
+    expect(screen.queryByText('Runtime project 11')).not.toBeInTheDocument()
+    expect(screen.queryByText('Runtime project 12')).not.toBeInTheDocument()
+  })
 })

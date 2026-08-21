@@ -16,6 +16,7 @@ vi.mock('../api/client', () => ({
     stopAutopilot: vi.fn(),
     extendAutopilotTime: vi.fn(),
     skipAutopilotTask: vi.fn(),
+    finishAfterCurrentAutopilotTask: vi.fn(),
     submitAutopilotTask: vi.fn(),
     getGraph: vi.fn(),
     testAutopilotController: vi.fn(),
@@ -231,5 +232,30 @@ describe('AutopilotPage', () => {
     await userEvent.click(screen.getByRole('button', { name: '提交并结束' }))
 
     expect(api.submitAutopilotTask).toHaveBeenCalledWith('fact-active', true)
+  })
+
+  it('offers finish-after-current-task while a task is running', async () => {
+    const running: AutopilotSnapshot = {
+      ...empty,
+      session: {
+        id: 'auto-1', status: 'solving', mode: 'structured',
+        controller_provider: null, controller: null, solver_providers: ['fake'], available_providers: ['fake'],
+        agent_limit: 1, max_tasks: 10, completed_tasks: 6, current_external_id: 'attempt-7',
+        current_task_name: 'Seventh challenge', current_project_id: 'project-7', current_task_status: 'solving',
+        finish_after_current_task_requested: false, last_message: null, last_error: null, history: [],
+      },
+    }
+    vi.mocked(api.getAutopilot).mockResolvedValue(running)
+    vi.mocked(api.finishAfterCurrentAutopilotTask).mockResolvedValue({
+      ...running,
+      session: { ...running.session!, finish_after_current_task_requested: true },
+    })
+
+    render(<AutopilotPage onBack={() => {}} onOpenProject={() => {}} />)
+
+    const finishButton = await screen.findByRole('button', { name: /完成后停止/ })
+    expect(finishButton).toBeEnabled()
+    await userEvent.click(finishButton)
+    expect(api.finishAfterCurrentAutopilotTask).toHaveBeenCalledOnce()
   })
 })

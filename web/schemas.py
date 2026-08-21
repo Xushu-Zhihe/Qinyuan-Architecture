@@ -297,6 +297,10 @@ class AutopilotSkipRequest(BaseModel):
     reason: str = Field(default="user skipped", max_length=500)
 
 
+class AutopilotFinishAfterCurrentTaskRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
 class AutopilotSubmissionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

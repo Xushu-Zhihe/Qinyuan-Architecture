@@ -221,6 +221,55 @@ class AutopilotSection13Tests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(controller.plans), 2)
             await manager.aclose()
 
+    async def test_finish_after_current_task_submits_then_stops_without_fetching_next(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            service = _FakeService(Path(directory))
+            controller = _FakeController()
+            controller.plan_gate = asyncio.Event()
+            platform = _FakePlatform(service.events)
+            manager = AutoManager(
+                service=service,
+                provider_configs=(self._provider(),),
+                controller_factory=lambda *_args, **_kwargs: controller,
+                platform_adapter_factory=lambda *_args, **_kwargs: platform,
+            )
+            config = AutoStartConfig(
+                mode="structured",
+                controller=ControllerConfig("https://controller.example/v1", "model"),
+                platform=self._platform_config(),
+                solver_providers=("fake",),
+                agent_limit=1,
+                max_tasks=10,
+                poll_interval_seconds=0.001,
+            )
+            with patch(
+                "autopilot.manager.probe_provider_capabilities",
+                return_value={"auto_ready": True, "status": "ready"},
+            ):
+                await manager.start(
+                    config,
+                    controller_secret=RuntimeControllerSecret("controller-key"),
+                    platform_secret=RuntimePlatformSecret(token="platform-token"),
+                )
+                await self._wait_for_status(manager, "solver_achieved")
+                requested = await manager.finish_after_current_task()
+                self.assertTrue(
+                    requested["session"]["finish_after_current_task_requested"]
+                )
+                controller.plan_gate.set()
+                await manager._runner
+
+            snapshot = await manager.snapshot()
+            self.assertEqual(snapshot["session"]["status"], "finished", snapshot)
+            self.assertEqual(snapshot["session"]["completed_tasks"], 1)
+            self.assertEqual(platform.submitted, ["one"])
+            self.assertEqual(
+                service.events,
+                ["fetch:one", "solve:project-1", "submit:one"],
+            )
+            self.assertIn("finished by user", snapshot["session"]["last_message"])
+            await manager.aclose()
+
     async def test_rejection_pauses_and_selected_fact_acceptance_continues(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             service = _FakeService(Path(directory))

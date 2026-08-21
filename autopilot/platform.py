@@ -583,24 +583,14 @@ class StructuredPlatformAdapter:
                     )
         else:
             context = self._task_context(task)
-        if self.config.task_info_delay_seconds > 0:
-            await asyncio.sleep(self.config.task_info_delay_seconds)
-        info_response, info_payload, info_error = await self._request(
-            self.config.task_info,
-            context,
-        )
-        if (
-            info_response is not None
-            and info_response.status_code in RETRYABLE_STATUS_CODES
-        ):
-            return PlatformResult(
-                "retryable_error",
-                message=f"task info HTTP {info_response.status_code}",
-                retry_after_seconds=_retry_delay(info_response, 0),
-            )
-        if info_error or info_response is None or info_response.is_error:
-            if self.config.task_info_failure_action == "use_fetch_payload" and task is not None:
-                prepared = await self._prepare_task(task)
+
+        async def task_info_failure(
+            message: str,
+            result: PlatformResult | None = None,
+        ) -> PlatformResult:
+            fallback_task = task
+            if self.config.task_info_failure_action == "use_fetch_payload" and fallback_task is not None:
+                prepared = await self._prepare_task(fallback_task)
                 if prepared.status == "task":
                     return PlatformResult(
                         "task",
@@ -610,7 +600,7 @@ class StructuredPlatformAdapter:
                     )
                 return prepared
             if self.config.task_info_failure_action == "skip_task":
-                if task is None:
+                if fallback_task is None:
                     try:
                         external_id = str(
                             _extract(item, self.config.mapping.external_id_path)
@@ -618,44 +608,71 @@ class StructuredPlatformAdapter:
                     except (KeyError, IndexError, TypeError, ValueError):
                         external_id = ""
                     if external_id:
-                        task = AutoTask(
+                        fallback_task = AutoTask(
                             external_id=external_id,
                             name=external_id,
                             goal="",
                             origin="",
                         )
                 return PlatformResult(
-                    "skip_required" if task is not None else "fatal_error",
-                    task=task,
-                    message="task info failed and task requires skip",
+                    "skip_required" if fallback_task is not None else "fatal_error",
+                    task=fallback_task,
+                    message=message,
                     metadata={"reason_code": "task_info_skip_required"},
                 )
-            return info_error or PlatformResult(
-                "fatal_error",
-                message=f"task info HTTP {info_response.status_code}",
+            return result or PlatformResult("fatal_error", message=message)
+
+        if self.config.task_info_delay_seconds > 0:
+            await asyncio.sleep(self.config.task_info_delay_seconds)
+        readiness_retries = self.config.task_info.max_retries
+        for readiness_attempt in range(readiness_retries + 1):
+            info_response, info_payload, info_error = await self._request(
+                self.config.task_info,
+                context,
             )
-        # Keep the complete payload available for diagnostics when the
-        # configured item path itself is absent or malformed.
-        info_item: object = info_payload
-        try:
-            # Field mappings are relative to the configured task item. Detail
-            # endpoints often keep that item under the same path as fetch.
-            info_item = _extract(
-                info_payload,
-                self.config.mapping.task_list_path,
-            )
-            if isinstance(info_item, list):
-                if not info_item:
-                    raise ValueError("task info response contains no task")
-                info_item = info_item[0]
-            info_task = self._map_task(info_item, fallback=task)
-        except (KeyError, IndexError, TypeError, ValueError) as exc:
-            fields = _non_empty_scalar_paths(info_item)
-            detail = f"; non-empty fields: {', '.join(fields)}" if fields else ""
-            return PlatformResult(
-                "fatal_error", message=f"task info mapping failed: {exc}{detail}"
-            )
-        return await self._prepare_task(info_task)
+            if (
+                info_response is not None
+                and info_response.status_code in RETRYABLE_STATUS_CODES
+            ):
+                return PlatformResult(
+                    "retryable_error",
+                    message=f"task info HTTP {info_response.status_code}",
+                    retry_after_seconds=_retry_delay(info_response, 0),
+                )
+            if info_error or info_response is None or info_response.is_error:
+                status_message = (
+                    f"task info HTTP {info_response.status_code}"
+                    if info_response is not None
+                    else "task info request failed"
+                )
+                return await task_info_failure(status_message, info_error)
+
+            # Keep the complete payload available for diagnostics when the
+            # configured item path itself is absent or malformed.
+            info_item: object = info_payload
+            try:
+                # Field mappings are relative to the configured task item.
+                info_item = _extract(
+                    info_payload,
+                    self.config.mapping.task_list_path,
+                )
+                if isinstance(info_item, list):
+                    if not info_item:
+                        raise ValueError("task info response contains no task")
+                    info_item = info_item[0]
+                info_task = self._map_task(info_item, fallback=task)
+            except (KeyError, IndexError, TypeError, ValueError) as exc:
+                if readiness_attempt < readiness_retries:
+                    await asyncio.sleep(
+                        max(0.1, self.config.task_info_delay_seconds)
+                    )
+                    continue
+                fields = _non_empty_scalar_paths(info_item)
+                detail = f"; non-empty fields: {', '.join(fields)}" if fields else ""
+                message = f"task info mapping failed: {exc}{detail}"
+                return await task_info_failure(message)
+            return await self._prepare_task(info_task)
+        raise AssertionError("task info readiness loop exhausted unexpectedly")
 
     async def health_check(self) -> PlatformResult:
         if self.config.health_check is None:

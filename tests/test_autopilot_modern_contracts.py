@@ -638,6 +638,127 @@ class ModernContractTests(unittest.IsolatedAsyncioTestCase):
             await adapter.close()
             await client.aclose()
 
+    async def test_nssctf_service_only_task_waits_for_container_url(self) -> None:
+        detail_calls = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal detail_calls
+            if request.url.path.endswith("/next/"):
+                attempt = {"id": 5002}
+            else:
+                detail_calls += 1
+                attempt = {
+                    "id": 5002,
+                    "problem": {
+                        "type_label": "Pwn",
+                        "content": "",
+                        "container": {
+                            "state": "running",
+                            **(
+                                {"url": ["http://target.example:31337"]}
+                                if detail_calls > 1
+                                else {}
+                            ),
+                        },
+                    },
+                }
+            return httpx.Response(
+                200,
+                json={"data": {"attempt": attempt}},
+                request=request,
+            )
+
+        config = _platform_config(
+            fetch_task=_endpoint("POST", "/skill/agent/arena/next/"),
+            task_info=_endpoint(
+                "GET",
+                "/skill/agent/arena/attempt/{{external_id}}/",
+                max_retries=1,
+            ),
+            mapping=FieldMapping(
+                task_list_path="data.attempt",
+                external_id_path="id",
+                name_path="problem.type_label",
+                goal_path="problem.content",
+                origin_path="problem.content",
+                origin_endpoint_path="problem.container.url.0|problem.container.url",
+                goal_format="flag_objective",
+                hints_path=None,
+            ),
+        )
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        adapter = StructuredPlatformAdapter(config, client=client)
+        try:
+            with mock.patch(
+                "autopilot.platform.asyncio.sleep", new_callable=mock.AsyncMock
+            ) as sleep:
+                result = await adapter.fetch_task()
+            self.assertEqual(result.status, "task")
+            self.assertEqual(detail_calls, 2)
+            self.assertEqual(result.task.origin, "http://target.example:31337")
+            self.assertIn("service endpoint", result.task.goal)
+            sleep.assert_awaited_once_with(0.1)
+        finally:
+            await adapter.close()
+            await client.aclose()
+
+    async def test_nssctf_service_only_task_skips_when_port_never_arrives(self) -> None:
+        detail_calls = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal detail_calls
+            if request.url.path.endswith("/next/"):
+                attempt = {"id": 5003}
+            else:
+                detail_calls += 1
+                attempt = {
+                    "id": 5003,
+                    "problem": {
+                        "type_label": "Pwn",
+                        "content": "",
+                        "container": {"state": "creating"},
+                    },
+                }
+            return httpx.Response(
+                200,
+                json={"data": {"attempt": attempt}},
+                request=request,
+            )
+
+        config = _platform_config(
+            fetch_task=_endpoint("POST", "/skill/agent/arena/next/"),
+            task_info=_endpoint(
+                "GET",
+                "/skill/agent/arena/attempt/{{external_id}}/",
+                max_retries=1,
+            ),
+            task_info_failure_action="skip_task",
+            mapping=FieldMapping(
+                task_list_path="data.attempt",
+                external_id_path="id",
+                name_path="problem.type_label",
+                goal_path="problem.content",
+                origin_path="problem.content",
+                origin_endpoint_path="problem.container.url.0|problem.container.url",
+                goal_format="flag_objective",
+                hints_path=None,
+            ),
+        )
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        adapter = StructuredPlatformAdapter(config, client=client)
+        try:
+            with mock.patch(
+                "autopilot.platform.asyncio.sleep", new_callable=mock.AsyncMock
+            ):
+                result = await adapter.fetch_task()
+            self.assertEqual(result.status, "skip_required")
+            self.assertEqual(result.task.external_id, "5003")
+            self.assertEqual(detail_calls, 2)
+            self.assertIn("goal is empty", result.message)
+        finally:
+            await adapter.close()
+            await client.aclose()
+
     async def test_nssctf_uses_question_as_origin_without_endpoint(self) -> None:
         def handler(request: httpx.Request) -> httpx.Response:
             return httpx.Response(

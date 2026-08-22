@@ -9,6 +9,7 @@ from uuid import uuid4
 
 from orchestrator.coordinator import ExecutionCoordinator
 from orchestrator.events import ProjectEventHub
+from orchestrator.fact_compaction_repository import FactCompactionRepository
 from orchestrator.health import HealthProbe
 from orchestrator.layout import LayoutStore
 from orchestrator.migrations import apply_migrations
@@ -18,6 +19,7 @@ from orchestrator.supervisor import ProjectSupervisor
 from worker.models import (
     AuditConfig,
     CoordinatorConfig,
+    FactCompactionConfig,
     ProviderConfig,
     WorkerResult,
 )
@@ -271,6 +273,7 @@ class ProjectService:
         health_probe: HealthProbe | None = None,
         coordinator_config: CoordinatorConfig | None = None,
         audit_config: AuditConfig | None = None,
+        fact_compaction_config: FactCompactionConfig | None = None,
     ) -> None:
         self.registry = ProjectRegistry(data_root)
         self.provider_configs = {
@@ -278,6 +281,7 @@ class ProjectService:
         }
         self.coordinator = ExecutionCoordinator(coordinator_config)
         self.audit_config = audit_config or AuditConfig()
+        self.fact_compaction_config = fact_compaction_config
         self.execute = execute
         self.health_probe = health_probe
         self._handles: dict[str, ProjectHandle] = {}
@@ -307,6 +311,54 @@ class ProjectService:
             )
             result.append(enriched)
         return tuple(result)
+
+    def fact_compaction_status(self, handle: ProjectHandle) -> dict[str, object]:
+        config = self.fact_compaction_config
+        configured = config is not None and (
+            config.provider is not None or config.llm is not None
+        )
+        if config is None or not config.enabled or not configured:
+            return {
+                "enabled": False,
+                "status": "disabled",
+                "provider": (
+                    config.provider.name
+                    if config is not None and config.provider is not None
+                    else "summary-llm"
+                    if configured
+                    else None
+                ),
+                "model": (
+                    config.llm.model
+                    if config is not None and config.llm is not None
+                    else None
+                ),
+                "pending_groups": 0,
+                "rejected_batches": 0,
+                "last_error": None,
+            }
+        supervisor = self._supervisors.get(handle.id)
+        compactor = supervisor.fact_compactor if supervisor is not None else None
+        if compactor is not None:
+            return compactor.status()
+        pending = len(
+            FactCompactionRepository(
+                handle.store.connection,
+                handle.store.project_id,
+            ).candidates(
+                min_facts=config.min_facts,
+                max_facts=config.max_facts,
+            )
+        )
+        return {
+            "enabled": True,
+            "status": "stopped",
+            "provider": config.provider.name if config.provider else "summary-llm",
+            "model": config.provider.name if config.provider else config.llm.model,
+            "pending_groups": pending,
+            "rejected_batches": 0,
+            "last_error": None,
+        }
 
     def _set_project_status(
         self,
@@ -430,6 +482,7 @@ class ProjectService:
                             edge["type"] == "intent" for edge in snapshot["edges"]
                         ),
                         "highest_generation": snapshot["highest_generation"],
+                        "fact_compaction": self.fact_compaction_status(handle),
                     }
                 )
             return tuple(result)
@@ -455,6 +508,7 @@ class ProjectService:
             hub=handle.hub,
             coordinator=self.coordinator,
             audit_config=self.audit_config,
+            fact_compaction_config=self.fact_compaction_config,
             project_status_writer=lambda status, final_answer: (
                 self._set_project_status(handle, status, final_answer)
             ),

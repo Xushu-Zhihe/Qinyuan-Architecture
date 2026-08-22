@@ -1,5 +1,7 @@
 from dataclasses import asdict, dataclass, field
 from typing import Literal
+from urllib.parse import urlsplit
+import re
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,6 +73,74 @@ class ProviderConfig:
     capability_probe: CapabilityProbeConfig | None = None
     protocol_arguments: tuple[str, ...] = ()
     agent_lifecycle: AgentLifecycleConfig | None = None
+
+
+_FACT_COMPACTION_MODEL_PATTERN = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$"
+)
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class FactCompactionLLMConfig:
+    base_url: str
+    api_key: str
+    model: str
+    timeout_seconds: float = 120.0
+
+    def __post_init__(self) -> None:
+        base_url = self.base_url.strip().rstrip("/")
+        if base_url.endswith("/chat/completions"):
+            base_url = base_url[: -len("/chat/completions")]
+        parsed = urlsplit(base_url)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ValueError("fact compaction llm base_url must be an absolute HTTP URL")
+        api_key = self.api_key.strip()
+        if not api_key:
+            raise ValueError("fact compaction llm api_key must be non-empty")
+        model = self.model.strip()
+        if not model or _FACT_COMPACTION_MODEL_PATTERN.fullmatch(model) is None:
+            raise ValueError("fact compaction llm model is invalid")
+        if self.timeout_seconds <= 0 or self.timeout_seconds > 1800:
+            raise ValueError("fact compaction llm timeout_seconds must be between 0 and 1800")
+        object.__setattr__(self, "base_url", base_url)
+        object.__setattr__(self, "api_key", api_key)
+        object.__setattr__(self, "model", model)
+
+    @property
+    def chat_completions_url(self) -> str:
+        return f"{self.base_url}/chat/completions"
+
+    def __repr__(self) -> str:
+        return (
+            "FactCompactionLLMConfig("
+            f"base_url={self.base_url!r}, model={self.model!r}, "
+            f"timeout_seconds={self.timeout_seconds!r}, api_key='[redacted]')"
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class FactCompactionConfig:
+    enabled: bool = False
+    provider: ProviderConfig | None = None
+    llm: FactCompactionLLMConfig | None = None
+    min_facts: int = 3
+    max_facts: int = 16
+    poll_interval_seconds: float = 1.0
+    max_summary_chars: int = 4_000
+
+    def __post_init__(self) -> None:
+        if self.enabled and self.provider is None and self.llm is None:
+            raise ValueError("enabled fact compaction requires a provider or llm")
+        if self.provider is not None and self.llm is not None:
+            raise ValueError("fact compaction cannot configure both provider and llm")
+        if self.min_facts < 2:
+            raise ValueError("fact compaction min_facts must be at least 2")
+        if self.max_facts < self.min_facts:
+            raise ValueError("fact compaction max_facts must be at least min_facts")
+        if self.poll_interval_seconds <= 0:
+            raise ValueError("fact compaction poll interval must be positive")
+        if self.max_summary_chars <= 0:
+            raise ValueError("fact compaction max_summary_chars must be positive")
 
 
 @dataclass(frozen=True, slots=True)

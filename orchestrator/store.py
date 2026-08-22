@@ -1,13 +1,15 @@
-import hashlib
 import json
 import sqlite3
-import unicodedata
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
 from pathlib import Path
-from uuid import uuid4
 
+from orchestrator.fact_compaction_schema import (
+    FACT_COMPACTION_REQUIRED_SCHEMA,
+    FACT_COMPACTION_SCHEMA,
+    migrate_fact_compaction_v6,
+)
 from orchestrator.health import HEALTH_STATUSES, redact_error
 from orchestrator.migrations import apply_migrations, stamp_new_schema
 from orchestrator.models import (
@@ -16,6 +18,13 @@ from orchestrator.models import (
     MAX_SUPPORTING_FACT_CONTENT_LENGTH,
     IntentProposal,
     RELATION_EDGE_TYPES,
+)
+from orchestrator.persistence_utils import (
+    content_fingerprint,
+    new_id,
+    normalize_text,
+    raw_fingerprint,
+    utc_now,
 )
 
 
@@ -226,7 +235,7 @@ CREATE TABLE events (
     payload_json TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
-""" + PROVIDER_HEALTH_SCHEMA + AUDIT_SCHEMA
+""" + PROVIDER_HEALTH_SCHEMA + AUDIT_SCHEMA + FACT_COMPACTION_SCHEMA
 
 
 @dataclass(frozen=True, slots=True)
@@ -247,11 +256,11 @@ class ExecutionRecord:
 
 
 def _id(prefix: str) -> str:
-    return f"{prefix}-{uuid4().hex}"
+    return new_id(prefix)
 
 
 def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return utc_now()
 
 
 def _timestamp_after(value: str, seconds: float) -> str:
@@ -265,7 +274,7 @@ def _timestamp_after(value: str, seconds: float) -> str:
     ).isoformat()
 
 
-BLACKBOARD_SCHEMA_VERSION = 5
+BLACKBOARD_SCHEMA_VERSION = 6
 
 
 def _add_columns(
@@ -391,6 +400,7 @@ BLACKBOARD_MIGRATIONS = {
     3: ("execution backend audit", _migrate_blackboard_v3),
     4: ("canonical final answer consensus", _migrate_blackboard_v4),
     5: ("goal result completion claims", _migrate_blackboard_v5),
+    6: ("asynchronous fact compaction", migrate_fact_compaction_v6),
 }
 
 
@@ -434,6 +444,7 @@ BLACKBOARD_REQUIRED_SCHEMA = {
     "goal_completion_claims": {
         "id", "goal_version", "provider", "execution_id", "fact_node_id"
     },
+    "fact_compactions": FACT_COMPACTION_REQUIRED_SCHEMA,
 }
 
 
@@ -482,12 +493,11 @@ def _backend_metadata_json(metadata: dict[str, object] | None) -> str:
 
 
 def _normalize(content: str) -> str:
-    normalized = unicodedata.normalize("NFKC", content)
-    return " ".join(normalized.strip().split())
+    return normalize_text(content)
 
 
 def _fingerprint(content: str) -> str:
-    return hashlib.sha256(_normalize(content).encode("utf-8")).hexdigest()
+    return content_fingerprint(content)
 
 
 def _intent_fingerprint(proposal: IntentProposal) -> str:
@@ -498,7 +508,7 @@ def _intent_fingerprint(proposal: IntentProposal) -> str:
             _normalize(proposal.content),
         )
     )
-    return hashlib.sha256(material.encode("utf-8")).hexdigest()
+    return raw_fingerprint(material)
 
 
 class BlackboardStore:

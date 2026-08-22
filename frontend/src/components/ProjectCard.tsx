@@ -1,4 +1,4 @@
-import { Activity, ArrowUpRight, Bot, GitBranch, Trash2 } from 'lucide-react'
+import { Activity, ArrowUpRight, Bot, BrainCircuit, GitBranch, Trash2 } from 'lucide-react'
 
 import type { ProjectSummary } from '../types'
 
@@ -8,6 +8,13 @@ const statusLabel: Record<string, string> = {
   degraded: '有失败',
   achieved: '已完成',
   stopped: '已停止',
+}
+
+const compactionStatusLabel: Record<string, string> = {
+  stopped: '未运行',
+  waiting: '等待候选',
+  compacting: '正在摘要',
+  error: '摘要异常',
 }
 
 function getStatusLabel(project: Pick<ProjectSummary, 'mode' | 'status'>) {
@@ -45,6 +52,13 @@ export function ProjectCard({
           <span><GitBranch size={15} /> <strong>{project.intent_count ?? 0}</strong> Intent</span>
           <span><Bot size={15} /> G{project.highest_generation ?? 0}</span>
         </span>
+        {project.fact_compaction?.enabled && (
+          <span className={`project-card__compaction project-card__compaction--${project.fact_compaction.status}`}>
+            <BrainCircuit size={14} />
+            Fact 摘要 · {compactionStatusLabel[project.fact_compaction.status] ?? project.fact_compaction.status}
+            {project.fact_compaction.pending_groups > 0 && ` · ${project.fact_compaction.pending_groups} 组待处理`}
+          </span>
+        )}
         <span className="project-card__footer">
           <span>{project.providers.length ? project.providers.join(' · ') : '未配置 Agent'}</span>
           <ArrowUpRight size={17} aria-hidden="true" />

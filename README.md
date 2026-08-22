@@ -231,6 +231,19 @@ Codex 使用纯文本流式适配器，Kimi 默认仅在任务完成后输出。
     "default_log_page_bytes": 262144,
     "max_log_page_bytes": 1048576
   },
+  "fact_compaction": {
+    "enabled_env": "BLACKBOARD_FACT_COMPACTION_ENABLED",
+    "min_facts": 3,
+    "max_facts": 16,
+    "poll_interval_seconds": 1,
+    "max_summary_chars": 4000,
+    "llm": {
+      "base_url_env": "BLACKBOARD_SUMMARY_BASE_URL",
+      "api_key_env": "BLACKBOARD_SUMMARY_API_KEY",
+      "model_env": "BLACKBOARD_SUMMARY_MODEL",
+      "timeout_seconds": 120
+    }
+  },
   "providers": [
     {
       "name": "codex",
@@ -258,6 +271,52 @@ Codex 使用纯文本流式适配器，Kimi 默认仅在任务完成后输出。
   ]
 }
 ```
+
+### 异步 Fact 合并
+
+`fact_compaction` 可配置一个独立直连 LLM，在后台合并相似的 agent Fact。该
+LLM 不进入 solver 列表，不生成 Intent，也不参与答案 quorum。默认关闭；启用时填写
+`base_url`、`api_key` 和 `model` 全部放在项目根目录 `.env`，配置文件只保存对应的
+环境变量名。进程环境变量会覆盖 `.env`。请求使用兼容 OpenAI
+`/chat/completions` 的接口：
+
+```json
+{
+  "fact_compaction": {
+    "enabled_env": "BLACKBOARD_FACT_COMPACTION_ENABLED",
+    "min_facts": 3,
+    "max_facts": 16,
+    "poll_interval_seconds": 1,
+    "max_summary_chars": 4000,
+    "llm": {
+      "base_url_env": "BLACKBOARD_SUMMARY_BASE_URL",
+      "api_key_env": "BLACKBOARD_SUMMARY_API_KEY",
+      "model_env": "BLACKBOARD_SUMMARY_MODEL",
+      "timeout_seconds": 120
+    }
+  }
+}
+```
+
+项目根目录 `.env`：
+
+```dotenv
+BLACKBOARD_SUMMARY_BASE_URL=https://api.example.com/v1
+BLACKBOARD_SUMMARY_API_KEY=your-api-key
+BLACKBOARD_SUMMARY_MODEL=your-model-name
+BLACKBOARD_FACT_COMPACTION_ENABLED=false
+```
+
+候选集由现有 `similar_to` 图和保守的文本相似度预筛选。LLM 只能返回 `merge` 或
+`skip`。`merge` 使用 `groups` 列出多个原子重点，每组明确列出实际覆盖的
+`source_ids` 和单一 `summary`；同一个来源 Fact 可以出现在多个组中，因为一条 Fact
+可能同时包含多个重点。合并成功会为每组创建（或幂等复用）来源为
+`fact-summarizer` 的摘要 Fact，以 `derived_from` 指向该组原 Fact，将原有
+`addresses`、`supports`、`contradicts` 关系投影到对应摘要节点，再在同一事务中归档
+所有被至少一个组覆盖的 agent Fact。人工 Fact 和当前 goal completion claim 使用的
+Fact 不会被自动归档。压缩调用共享全局执行配额，失败只记录事件，不阻塞 solver。
+黑板工作区顶部的 `Fact 摘要` 状态会显示该独立 LLM 是否已启用、provider/model、当前
+是等待候选还是正在摘要、待处理候选组数量及最近错误。
 
 ### Persistent provider lifecycle
 
@@ -622,7 +681,8 @@ provider 凭据只应存在于用户自己的环境变量或专用配置文件�
   `running` 项目恢复为 `idle`。恢复事件可通过 WebSocket `after` 参数重放；
   外部 CLI 不会自动重启，必须由用户再次启动项目。
 - v2 Goal Result Fact 共识只认可同一 Fact 或显式 `equivalent_to` 连通分量；多个不等价结果进入 `degraded/result_conflict`。新自动模式可按平台契约提交，手动项目不会自动提交。
-- 相似 Fact 不自动合并，只保守地保留独立命题和关系。
+- 默认不自动合并相似 Fact；启用 `fact_compaction` 后，独立摘要 provider 会以多组
+  原子重点的方式保守压缩，并保留来源和关系追溯。
 
 ## 来源与致谢
 

@@ -14,6 +14,7 @@ from orchestrator.coordinator import (
     PermitLease,
 )
 from orchestrator.events import ProjectEventHub
+from orchestrator.fact_compactor import FactCompactor
 from orchestrator.health import (
     TERMINAL_HEALTH_STATUSES,
     HealthProbe,
@@ -35,7 +36,13 @@ from orchestrator.protocol import (
 from orchestrator.store import BlackboardStore, ExecutionRecord, IntentRecord
 from worker.agent_lifecycle import release_agent_lifecycle
 from worker.executor import execute_provider
-from worker.models import AuditConfig, LogChunk, ProviderConfig, WorkerResult
+from worker.models import (
+    AuditConfig,
+    FactCompactionConfig,
+    LogChunk,
+    ProviderConfig,
+    WorkerResult,
+)
 from worker.provider_adapters import get_provider_adapter
 
 
@@ -203,6 +210,7 @@ class ProjectSupervisor:
         audit_config: AuditConfig | None = None,
         policy: SupervisorPolicy | None = None,
         answer_quorum_provider_count: int | None = None,
+        fact_compaction_config: FactCompactionConfig | None = None,
     ) -> None:
         self.store = store
         self.providers = {
@@ -262,6 +270,21 @@ class ProjectSupervisor:
         }
         self._released_agent_lifecycles: set[str] = set()
         self._lifecycle_cleanup_task: asyncio.Task[None] | None = None
+        self.fact_compactor = (
+            FactCompactor(
+                store=self.store,
+                project_dir=self.project_dir,
+                config=fact_compaction_config,
+                hub=self.hub,
+                coordinator=self.coordinator,
+                execute=self.execute,
+                write_lock=self.write_lock,
+                on_graph_changed=self.wake_event.set,
+            )
+            if fact_compaction_config is not None
+            and fact_compaction_config.enabled
+            else None
+        )
         self.store.ensure_provider_health(tuple(self.providers))
 
     @staticmethod
@@ -1598,6 +1621,8 @@ class ProjectSupervisor:
             await self.hub.publish(event)
         await self._prune_finished_logs()
         self.wake_event.set()
+        if self.fact_compactor is not None:
+            self.fact_compactor.wake()
         project_status = str(self.store.snapshot()["project"]["status"])
         if self.cancel_event.is_set() and project_status in {
             "achieved",
@@ -1831,6 +1856,8 @@ class ProjectSupervisor:
             name: asyncio.create_task(self._agent_loop(name))
             for name in runnable
         }
+        if self.fact_compactor is not None:
+            await self.fact_compactor.start()
 
     async def wait_until_idle(self, timeout: float | None = None) -> None:
         if self.tasks:
@@ -1841,6 +1868,8 @@ class ProjectSupervisor:
         project = self.store.snapshot()["project"]
         if project["status"] == "running":
             await self._set_project_status("idle")
+        if self.fact_compactor is not None:
+            await self.fact_compactor.wait_until_idle(timeout=timeout)
 
     async def stop(self) -> None:
         self.cancel_event.set()
@@ -1852,6 +1881,8 @@ class ProjectSupervisor:
                 *self.manual_tasks.values(),
                 return_exceptions=True,
             )
+        if self.fact_compactor is not None:
+            await self.fact_compactor.stop()
         if self.store.snapshot()["project"]["status"] != "achieved":
             await self._set_project_status("stopped")
         await self._release_agent_lifecycles()

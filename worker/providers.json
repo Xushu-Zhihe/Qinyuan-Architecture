@@ -16,6 +16,19 @@
     "default_log_page_bytes": 262144,
     "max_log_page_bytes": 1048576
   },
+  "fact_compaction": {
+    "enabled_env": "BLACKBOARD_FACT_COMPACTION_ENABLED",
+    "min_facts": 3,
+    "max_facts": 16,
+    "poll_interval_seconds": 1,
+    "max_summary_chars": 4000,
+    "llm": {
+      "base_url_env": "BLACKBOARD_SUMMARY_BASE_URL",
+      "api_key_env": "BLACKBOARD_SUMMARY_API_KEY",
+      "model_env": "BLACKBOARD_SUMMARY_MODEL",
+      "timeout_seconds": 120
+    }
+  },
   "providers": [
     {
       "name": "codex",

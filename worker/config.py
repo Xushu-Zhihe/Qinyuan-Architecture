@@ -1,7 +1,10 @@
 import json
+import os
 import re
 from pathlib import Path
 from string import Formatter
+
+from dotenv import dotenv_values
 
 from worker.models import (
     AgentLifecycleConfig,
@@ -10,6 +13,8 @@ from worker.models import (
     ContainerBackendConfig,
     CoordinatorConfig,
     ExecutionConfig,
+    FactCompactionConfig,
+    FactCompactionLLMConfig,
     HealthCheckConfig,
     ProviderConfig,
     ProviderCapabilities,
@@ -365,6 +370,50 @@ def _load_payload(path: Path) -> dict[str, object]:
     return payload
 
 
+def _load_dotenv_values(config_path: Path) -> dict[str, str]:
+    """Load values from the nearest project .env file.
+
+    Process environment variables remain authoritative; this file is only a
+    local configuration fallback and is never written back to disk.
+    """
+    for directory in (config_path.resolve().parent, *config_path.resolve().parents):
+        dotenv_path = directory / ".env"
+        if not dotenv_path.is_file():
+            continue
+        try:
+            return {
+                name: value
+                for name, value in dotenv_values(dotenv_path, encoding="utf-8").items()
+                if isinstance(value, str)
+            }
+        except OSError as exc:
+            raise ConfigError(f"cannot read dotenv file: {dotenv_path}") from exc
+    return {}
+
+
+def _dotenv_bool(
+    raw: object,
+    values: dict[str, str],
+    field: str,
+    *,
+    default: bool = False,
+) -> bool:
+    if raw is None:
+        return default
+    if not isinstance(raw, str) or not raw.strip():
+        raise ConfigError(f"{field} must be a non-empty environment variable name")
+    name = raw.strip()
+    value = os.environ.get(name, values.get(name))
+    if value is None:
+        return default
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ConfigError(f"{field} value must be a boolean")
+
+
 def _resolve_provider_config_paths(value: object, config_dir: Path) -> object:
     if isinstance(value, str):
         return value.replace("{config_dir}", str(config_dir))
@@ -490,6 +539,116 @@ def load_provider_configs(path: Path) -> tuple[ProviderConfig, ...]:
     if len(names) != len(set(names)):
         raise ConfigError("duplicate provider name in provider config")
     return providers
+
+
+def load_fact_compaction_config(path: Path) -> FactCompactionConfig:
+    payload = _load_payload(path)
+    dotenv_config = _load_dotenv_values(path)
+    raw = payload.get("fact_compaction", {})
+    if not isinstance(raw, dict):
+        raise ConfigError("fact_compaction must be an object")
+    enabled_env = raw.get("enabled_env")
+    if enabled_env is not None:
+        enabled = _dotenv_bool(
+            enabled_env,
+            dotenv_config,
+            "fact_compaction.enabled_env",
+        )
+    else:
+        enabled = raw.get("enabled", False)
+        if not isinstance(enabled, bool):
+            raise ConfigError("fact_compaction.enabled must be a boolean")
+    provider_raw = raw.get("provider")
+    provider = None
+    if provider_raw is not None:
+        provider = _parse_provider(
+            _resolve_provider_config_paths(provider_raw, path.resolve().parent),
+            0,
+        )
+    llm_raw = raw.get("llm")
+    llm = None
+    if llm_raw is not None:
+        if not isinstance(llm_raw, dict):
+            raise ConfigError("fact_compaction.llm must be an object")
+        def setting(name: str, env_name: str) -> str | None:
+            direct = llm_raw.get(name)
+            reference = llm_raw.get(env_name)
+            if reference is not None:
+                if not isinstance(reference, str) or not reference.strip():
+                    raise ConfigError(
+                        f"fact_compaction.llm.{env_name} must be a non-empty string"
+                    )
+                key = reference.strip()
+                return os.environ.get(key, dotenv_config.get(key))
+            if direct is not None and not isinstance(direct, str):
+                raise ConfigError(f"fact_compaction.llm.{name} must be a string")
+            return direct.strip() if isinstance(direct, str) else None
+
+        base_url = setting("base_url", "base_url_env")
+        api_key = setting("api_key", "api_key_env")
+        model = setting("model", "model_env")
+        if enabled and not base_url:
+            raise ConfigError("fact_compaction.llm.base_url is missing from .env")
+        if enabled and not api_key:
+            raise ConfigError("fact_compaction.llm.api_key is missing from .env")
+        if enabled and not model:
+            raise ConfigError("fact_compaction.llm.model is missing from .env")
+        base_url = base_url or "https://disabled.invalid/v1"
+        api_key = api_key or "__disabled_fact_compaction_key__"
+        model = model or "disabled-fact-compaction-model"
+        try:
+            llm = FactCompactionLLMConfig(
+                base_url=base_url,
+                api_key=api_key,
+                model=model,
+                timeout_seconds=_positive_number(
+                    llm_raw.get("timeout_seconds", 120),
+                    "fact_compaction.llm.timeout_seconds",
+                ),
+            )
+        except ValueError as exc:
+            raise ConfigError(str(exc)) from exc
+        if not enabled and api_key == "__disabled_fact_compaction_key__":
+            llm = None
+    if enabled and provider is None and llm is None:
+        raise ConfigError("enabled fact_compaction requires provider or llm")
+    if provider is not None and llm is not None:
+        raise ConfigError("fact_compaction cannot configure both provider and llm")
+    if provider is not None and not provider.enabled:
+        raise ConfigError("fact_compaction.provider must be enabled")
+    if provider is not None and provider.agent_lifecycle is not None:
+        raise ConfigError(
+            "fact_compaction.provider cannot declare agent_lifecycle"
+        )
+    min_facts = _positive_integer(
+        raw.get("min_facts", 3),
+        "fact_compaction.min_facts",
+    )
+    if min_facts < 2:
+        raise ConfigError("fact_compaction.min_facts must be at least 2")
+    max_facts = _positive_integer(
+        raw.get("max_facts", 16),
+        "fact_compaction.max_facts",
+    )
+    if max_facts < min_facts:
+        raise ConfigError(
+            "fact_compaction.max_facts must be at least min_facts"
+        )
+    return FactCompactionConfig(
+        enabled=enabled,
+        provider=provider,
+        llm=llm,
+        min_facts=min_facts,
+        max_facts=max_facts,
+        poll_interval_seconds=_positive_number(
+            raw.get("poll_interval_seconds", 1.0),
+            "fact_compaction.poll_interval_seconds",
+        ),
+        max_summary_chars=_positive_integer(
+            raw.get("max_summary_chars", 4_000),
+            "fact_compaction.max_summary_chars",
+        ),
+    )
 
 
 def _string_list(value: object, field: str) -> tuple[str, ...]:

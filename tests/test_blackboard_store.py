@@ -232,7 +232,6 @@ class BlackboardStoreTests(StoreTestCase):
         )
         self.assertEqual(fact["sources"], ["claude", "codex"])
 
-
 class BlackboardExecutionTests(StoreTestCase):
     def test_provider_health_is_persisted_redacted_and_evented(self) -> None:
         store = self.make_store()
@@ -273,7 +272,7 @@ class BlackboardExecutionTests(StoreTestCase):
             reopened.provider_health_for("codex")["status"],
             "unknown",
         )
-        backups = tuple(path.parent.glob("blackboard.db.pre-v0-to-v4-*.bak"))
+        backups = tuple(path.parent.glob("blackboard.db.pre-v0-to-v6-*.bak"))
         self.assertEqual(len(backups), 1)
         backup = sqlite3.connect(backups[0])
         try:
@@ -333,7 +332,7 @@ class BlackboardExecutionTests(StoreTestCase):
                 )
             },
         )
-        backups = tuple(path.parent.glob("blackboard.db.pre-v1-to-v4-*.bak"))
+        backups = tuple(path.parent.glob("blackboard.db.pre-v1-to-v6-*.bak"))
         self.assertEqual(len(backups), 1)
 
     def test_open_migrates_v2_backend_audit_database(self) -> None:
@@ -370,7 +369,7 @@ class BlackboardExecutionTests(StoreTestCase):
                 )
             }
             self.assertTrue(set(backend_columns).issubset(columns))
-        backups = tuple(path.parent.glob("blackboard.db.pre-v2-to-v4-*.bak"))
+        backups = tuple(path.parent.glob("blackboard.db.pre-v2-to-v6-*.bak"))
         self.assertEqual(len(backups), 1)
 
     def test_open_migrates_v3_answers_to_canonical_schema(self) -> None:
@@ -401,7 +400,7 @@ class BlackboardExecutionTests(StoreTestCase):
 
         self.assertEqual(row["answer_key"], "flag{legacy}")
         self.assertTrue(row["answer_fingerprint"])
-        backups = tuple(path.parent.glob("blackboard.db.pre-v3-to-v4-*.bak"))
+        backups = tuple(path.parent.glob("blackboard.db.pre-v3-to-v6-*.bak"))
         self.assertEqual(len(backups), 1)
 
     def test_latest_version_schema_drift_is_rejected(self) -> None:

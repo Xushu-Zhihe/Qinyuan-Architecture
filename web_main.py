@@ -9,6 +9,7 @@ from worker.config import (
     load_audit_config,
     load_coordinator_config,
     load_execution_config,
+    load_fact_compaction_config,
     load_provider_configs,
 )
 
@@ -32,6 +33,7 @@ def create_server_app(
         provider_configs=load_provider_configs(resolved_config),
         coordinator_config=load_coordinator_config(resolved_config),
         audit_config=load_audit_config(resolved_config),
+        fact_compaction_config=load_fact_compaction_config(resolved_config),
         execute=build_execution_backend(
             load_execution_config(resolved_config)
         ).execute,

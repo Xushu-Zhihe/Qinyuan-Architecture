@@ -11,6 +11,7 @@ from worker.config import (
     load_audit_config,
     load_coordinator_config,
     load_execution_config,
+    load_fact_compaction_config,
     load_provider_configs,
 )
 
@@ -95,6 +96,9 @@ def run_cli(
                 max_iterations=args.max_iterations,
                 coordinator_config=coordinator_config,
                 audit_config=audit_config,
+                fact_compaction_config=load_fact_compaction_config(
+                    args.config.resolve()
+                ),
                 execute=execution_backend.execute,
             )
         )

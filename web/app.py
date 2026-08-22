@@ -63,7 +63,12 @@ from web.schemas import (
     AutopilotFinishAfterCurrentTaskRequest,
     AutopilotSubmissionRequest,
 )
-from worker.models import AuditConfig, CoordinatorConfig, ProviderConfig
+from worker.models import (
+    AuditConfig,
+    CoordinatorConfig,
+    FactCompactionConfig,
+    ProviderConfig,
+)
 
 
 DEFAULT_DATA_ROOT = Path(__file__).resolve().parents[1] / "web-data"
@@ -166,6 +171,7 @@ def create_app(
     health_probe=None,
     coordinator_config: CoordinatorConfig | None = None,
     audit_config: AuditConfig | None = None,
+    fact_compaction_config: FactCompactionConfig | None = None,
     frontend_dist: Path | None = None,
 ) -> FastAPI:
     service = ProjectService(
@@ -175,6 +181,7 @@ def create_app(
         health_probe=health_probe,
         coordinator_config=coordinator_config,
         audit_config=audit_config,
+        fact_compaction_config=fact_compaction_config,
     )
     autopilot = AutoManager(
         service=service,
@@ -615,6 +622,7 @@ def create_app(
             "goal_version": snapshot["project"]["goal_version"],
             "final_answer": snapshot["project"]["final_answer"],
             "provider_health": list(service.provider_health(project)),
+            "fact_compaction": service.fact_compaction_status(project),
             "recovery": project.store.recovery_summary(),
         }
 
@@ -627,6 +635,7 @@ def create_app(
         project = handle(project_id)
         snapshot = project.store.snapshot()
         snapshot["provider_health"] = list(service.provider_health(project))
+        snapshot["fact_compaction"] = service.fact_compaction_status(project)
         if not include_archived:
             active_nodes = {
                 str(node["id"])
@@ -648,6 +657,7 @@ def create_app(
             "status": graph_project["status"],
             "final_answer": graph_project.get("final_answer"),
             "goal_version": graph_project["goal_version"],
+            "fact_compaction": snapshot["fact_compaction"],
         }
         return {
             **snapshot,

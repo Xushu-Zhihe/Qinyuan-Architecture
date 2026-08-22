@@ -11,6 +11,7 @@ from worker.executor import execute_provider
 from worker.models import (
     AuditConfig,
     CoordinatorConfig,
+    FactCompactionConfig,
     ProviderConfig,
     WorkerResult,
 )
@@ -35,6 +36,7 @@ async def run_orchestration(
     execute: Executor = execute_provider,
     coordinator_config: CoordinatorConfig | None = None,
     audit_config: AuditConfig | None = None,
+    fact_compaction_config: FactCompactionConfig | None = None,
 ) -> OrchestrationResult:
     project_id = _new_project_id()
     run_dir = runs_root / project_id
@@ -61,6 +63,7 @@ async def run_orchestration(
         execute=execute,
         coordinator=ExecutionCoordinator(coordinator_config),
         audit_config=audit_config,
+        fact_compaction_config=fact_compaction_config,
         max_iterations=max_iterations,
     )
     try:
@@ -75,6 +78,8 @@ async def run_orchestration(
         store.export_snapshot(run_dir / "snapshots")
         return _result(run_dir, snapshot)
     finally:
+        if supervisor.fact_compactor is not None:
+            await supervisor.fact_compactor.stop()
         store.close()
 
 

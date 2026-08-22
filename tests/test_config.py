@@ -1,4 +1,5 @@
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -8,6 +9,7 @@ from worker.config import (
     load_audit_config,
     load_coordinator_config,
     load_execution_config,
+    load_fact_compaction_config,
     load_provider_configs,
 )
 
@@ -46,6 +48,109 @@ class ProviderConfigTests(unittest.TestCase):
             self.assertEqual(providers[0].planning_timeout_seconds, 30)
             self.assertIsNone(providers[0].health_check)
             self.assertTrue(providers[0].streaming_supported)
+
+    def test_loads_independent_fact_compaction_provider(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = self.write_config(
+                directory,
+                {
+                    "fact_compaction": {
+                        "enabled": True,
+                        "min_facts": 4,
+                        "max_facts": 12,
+                        "poll_interval_seconds": 2,
+                        "max_summary_chars": 3000,
+                        "provider": {
+                            "name": "summary-llm",
+                            "enabled": True,
+                            "priority": -100,
+                            "max_running": 1,
+                            "command": ["summary-llm", "{work_dir}"],
+                            "timeout_seconds": 60,
+                        },
+                    },
+                    "providers": [],
+                },
+            )
+
+            config = load_fact_compaction_config(path)
+
+            self.assertTrue(config.enabled)
+            self.assertEqual(config.min_facts, 4)
+            self.assertEqual(config.max_facts, 12)
+            self.assertEqual(config.max_summary_chars, 3000)
+            assert config.provider is not None
+            self.assertEqual(config.provider.name, "summary-llm")
+
+    def test_loads_direct_fact_compaction_llm_from_environment(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = self.write_config(
+                directory,
+                {
+                    "fact_compaction": {
+                        "enabled": True,
+                        "llm": {
+                            "base_url": "https://llm.example/v1/",
+                            "api_key_env": "TEST_BLACKBOARD_SUMMARY_KEY",
+                            "model": "compact-model",
+                            "timeout_seconds": 45,
+                        },
+                    },
+                    "providers": [],
+                },
+            )
+            previous = os.environ.get("TEST_BLACKBOARD_SUMMARY_KEY")
+            os.environ["TEST_BLACKBOARD_SUMMARY_KEY"] = "secret-key"
+            self.addCleanup(
+                lambda: (
+                    os.environ.__setitem__(
+                        "TEST_BLACKBOARD_SUMMARY_KEY", previous
+                    )
+                    if previous is not None
+                    else os.environ.pop("TEST_BLACKBOARD_SUMMARY_KEY", None)
+                )
+            )
+
+            config = load_fact_compaction_config(path)
+
+            self.assertTrue(config.enabled)
+            assert config.llm is not None
+            self.assertEqual(config.llm.base_url, "https://llm.example/v1")
+            self.assertEqual(config.llm.chat_completions_url, "https://llm.example/v1/chat/completions")
+            self.assertEqual(config.llm.model, "compact-model")
+            self.assertEqual(config.llm.api_key, "secret-key")
+            self.assertNotIn("secret-key", repr(config.llm))
+
+    def test_loads_direct_fact_compaction_llm_from_dotenv(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = self.write_config(
+                directory,
+                {
+                        "fact_compaction": {
+                        "enabled_env": "TEST_BLACKBOARD_FACT_COMPACTION_ENABLED",
+                        "llm": {
+                            "base_url_env": "BLACKBOARD_SUMMARY_BASE_URL",
+                            "api_key_env": "BLACKBOARD_SUMMARY_API_KEY",
+                            "model_env": "BLACKBOARD_SUMMARY_MODEL",
+                        },
+                    },
+                    "providers": [],
+                },
+            )
+            root.joinpath(".env").write_text(
+                "# local secret\n"
+                "TEST_BLACKBOARD_FACT_COMPACTION_ENABLED=true\n"
+                "BLACKBOARD_SUMMARY_BASE_URL=https://llm.example/v1\n"
+                "BLACKBOARD_SUMMARY_API_KEY='dotenv-secret'\n"
+                "BLACKBOARD_SUMMARY_MODEL=compact-model\n",
+                encoding="utf-8",
+            )
+
+            config = load_fact_compaction_config(path)
+
+            assert config.llm is not None
+            self.assertEqual(config.llm.api_key, "dotenv-secret")
 
     def test_resolves_config_dir_in_all_provider_commands(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

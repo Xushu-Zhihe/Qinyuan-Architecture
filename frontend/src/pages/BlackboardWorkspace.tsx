@@ -5,6 +5,7 @@ import { api } from '../api/client'
 import { connectProjectSocket, type ProjectSocketStatus } from '../api/projectSocket'
 import { GraphToolbar } from '../components/GraphToolbar'
 import { DiagnosticsPanel } from '../components/DiagnosticsPanel'
+import { FactCompactionStatus } from '../components/FactCompactionStatus'
 import { InspectorPanel, type InspectorSelection } from '../components/InspectorPanel'
 import { LogConsole } from '../components/LogConsole'
 import {
@@ -274,6 +275,7 @@ export function BlackboardWorkspace({ projectId, onBack }: { projectId: string; 
       <header className="workspace-header">
         <button className="icon-button" aria-label="返回项目总览" onClick={onBack}><ArrowLeft size={20} /></button>
         <div className="workspace-title"><strong>{snapshot.project.name}</strong><span className={`status status--${snapshot.project.status}`}>{snapshot.project.status}</span></div>
+        <FactCompactionStatus value={snapshot.project.fact_compaction} />
         <div className="generation-chip">最新一轮 · G{snapshot.highest_generation}</div>
         <div className="token-chip" title="当前项目所有 Fact 内容的估算 token 总量"><Hash size={14} /><span className="token-chip__label">Fact tokens ·</span><span>~{factTokenTotal}</span></div>
         <div className="workspace-actions">

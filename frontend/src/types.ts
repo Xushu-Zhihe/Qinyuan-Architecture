@@ -88,6 +88,16 @@ export interface RecoverySummary {
   latest_at: string | null
 }
 
+export interface FactCompactionStatus {
+  enabled: boolean
+  status: 'disabled' | 'stopped' | 'waiting' | 'compacting' | 'error' | string
+  provider: string | null
+  model?: string | null
+  pending_groups: number
+  rejected_batches: number
+  last_error: string | null
+}
+
 export interface BlackboardEdge {
   id: string
   type: string
@@ -118,6 +128,7 @@ export interface ProjectSummary {
   final_answer?: string | null
   goal_version?: number
   recovery?: RecoverySummary
+  fact_compaction?: FactCompactionStatus
 }
 
 export interface LayoutSnapshot {
@@ -138,6 +149,7 @@ export interface ProjectSnapshot {
   planning_attempts: PlanningAttempt[]
   provider_health: ProviderHealth[]
   recovery: RecoverySummary
+  fact_compaction?: FactCompactionStatus
 }
 
 export interface ProjectEvent {

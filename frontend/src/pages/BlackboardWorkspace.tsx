@@ -1,4 +1,4 @@
-import { Activity, AlertTriangle, ArrowLeft, Download, Eye, Pencil, Play, RotateCcw, Square, X } from 'lucide-react'
+import { Activity, AlertTriangle, ArrowLeft, Download, Eye, Hash, Pencil, Play, RotateCcw, Square, X } from 'lucide-react'
 import { useEffect, useReducer, useRef, useState } from 'react'
 
 import { api } from '../api/client'
@@ -16,6 +16,7 @@ import {
 } from '../graph/BlackboardGraph'
 import { createProjectState, reduceProjectEvent, replaceRecordLogs, replaceSnapshot } from '../state/projectStore'
 import type { GraphTool, IntentExecution, PlanningAttempt, WorkspaceMode } from '../types'
+import { sumFactTokens } from '../utils/tokenEstimate'
 
 export function BlackboardWorkspace({ projectId, onBack }: { projectId: string; onBack: () => void }) {
   const [state, dispatch] = useReducer((current: ReturnType<typeof createProjectState>, action: { type: 'snapshot'; value: any } | { type: 'event'; value: any } | { type: 'logs'; id: string; value: any }) => action.type === 'snapshot' ? replaceSnapshot(current, action.value) : action.type === 'logs' ? replaceRecordLogs(current, action.id, action.value.logs, action.value.offsets) : reduceProjectEvent(current, action.value), createProjectState())
@@ -35,11 +36,11 @@ export function BlackboardWorkspace({ projectId, onBack }: { projectId: string; 
   const syncingLogs = useRef(new Set<string>())
   const snapshot = state.snapshot
 
-  async function refresh(includeArchived = showArchived) {
-    dispatch({ type: 'snapshot', value: await api.getGraph(projectId, includeArchived) })
+  async function refresh() {
+    dispatch({ type: 'snapshot', value: await api.getGraph(projectId, true) })
   }
 
-  useEffect(() => { void refresh(showArchived) }, [projectId, showArchived])
+  useEffect(() => { void refresh() }, [projectId])
   useEffect(() => {
     if (!state.snapshot) return
     const socket = connectProjectSocket(projectId, state.sequence, event => dispatch({ type: 'event', value: event }), setSocketStatus)
@@ -109,6 +110,7 @@ export function BlackboardWorkspace({ projectId, onBack }: { projectId: string; 
 
   if (!snapshot) return <main className="workspace-loading">正在加载黑板...</main>
   const currentSnapshot = snapshot
+  const factTokenTotal = sumFactTokens(snapshot.nodes)
 
   async function saveNodePosition(nodeId: string, position: { x: number; y: number }) {
     if (mode !== 'edit') return
@@ -178,7 +180,7 @@ export function BlackboardWorkspace({ projectId, onBack }: { projectId: string; 
     if (mode !== 'edit') return
     await api.restoreNode(projectId, nodeId)
     setSelection(null)
-    await refresh(true)
+    await refresh()
   }
 
   async function deleteEdge(edgeId: string) {
@@ -273,6 +275,7 @@ export function BlackboardWorkspace({ projectId, onBack }: { projectId: string; 
         <button className="icon-button" aria-label="返回项目总览" onClick={onBack}><ArrowLeft size={20} /></button>
         <div className="workspace-title"><strong>{snapshot.project.name}</strong><span className={`status status--${snapshot.project.status}`}>{snapshot.project.status}</span></div>
         <div className="generation-chip">最新一轮 · G{snapshot.highest_generation}</div>
+        <div className="token-chip" title="当前项目所有 Fact 内容的估算 token 总量"><Hash size={14} /><span className="token-chip__label">Fact tokens ·</span><span>~{factTokenTotal}</span></div>
         <div className="workspace-actions">
           <button className={mode === 'browse' ? 'mode-button is-active' : 'mode-button'} onClick={() => changeMode('browse')}><Eye size={16} /> 浏览</button>
           <button className={mode === 'edit' ? 'mode-button is-active' : 'mode-button'} onClick={() => changeMode('edit')}><Pencil size={16} /> 编辑</button>

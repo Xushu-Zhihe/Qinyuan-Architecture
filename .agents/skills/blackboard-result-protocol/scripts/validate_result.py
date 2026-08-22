@@ -9,6 +9,10 @@ LEGACY_RESULT_FIELDS = {"intent_id", "facts", "edges", "goal_achieved", "final_a
 FACT_FIELDS = {"ref", "content"}
 EDGE_FIELDS = {"type", "from", "to"}
 EDGE_TYPES = {"supports", "contradicts", "derived_from", "addresses", "similar_to", "equivalent_to"}
+MAX_FACTS = 4
+MAX_FACT_LENGTH = 800
+MAX_RESULT_FACT_LENGTH = 4000
+MAX_TOTAL_FACT_LENGTH = 6000
 
 
 def _pair(value: str, label: str) -> tuple[str, str]:
@@ -30,9 +34,12 @@ def validate_payload(payload: object, *, intent_id: str, goal_node_id: str, exis
         raise ValueError("result must reference the assigned intent")
     if not isinstance(payload["facts"], list) or not isinstance(payload["edges"], list):
         raise ValueError("facts and edges must be lists")
+    if len(payload["facts"]) > MAX_FACTS:
+        raise ValueError(f"result contains more than {MAX_FACTS} facts")
     if not isinstance(payload["goal_achieved"], bool):
         raise ValueError("goal_achieved must be a boolean")
     refs: set[str] = set()
+    fact_contents: dict[str, str] = {}
     for fact in payload["facts"]:
         if not isinstance(fact, dict):
             raise ValueError("fact proposal must be an object")
@@ -44,6 +51,9 @@ def validate_payload(payload: object, *, intent_id: str, goal_node_id: str, exis
         if not isinstance(content, str) or not content.strip():
             raise ValueError("fact content must be a non-empty string")
         refs.add(ref)
+        fact_contents[ref] = content.strip()
+    if sum(len(content) for content in fact_contents.values()) > MAX_TOTAL_FACT_LENGTH:
+        raise ValueError(f"total fact content exceeds {MAX_TOTAL_FACT_LENGTH} characters")
     known = set(existing_nodes) | refs
     edges: set[tuple[str, str, str]] = set()
     for edge in payload["edges"]:
@@ -62,14 +72,25 @@ def validate_payload(payload: object, *, intent_id: str, goal_node_id: str, exis
             raise ValueError("final_answer must be null or a non-empty string")
         if achieved and answer is None:
             raise ValueError("goal_achieved requires final_answer")
+        for content in fact_contents.values():
+            if len(content) > MAX_FACT_LENGTH:
+                raise ValueError(f"fact content exceeds {MAX_FACT_LENGTH} characters")
         return
     result_ref = payload["goal_result_ref"]
     if not achieved:
+        for content in fact_contents.values():
+            if len(content) > MAX_FACT_LENGTH:
+                raise ValueError(f"fact content exceeds {MAX_FACT_LENGTH} characters")
         if result_ref is not None:
             raise ValueError("goal_result_ref must be null when goal is not achieved")
         return
     if not isinstance(result_ref, str) or not result_ref.strip():
         raise ValueError("goal_achieved requires goal_result_ref")
+    for ref, content in fact_contents.items():
+        maximum = MAX_RESULT_FACT_LENGTH if ref == result_ref else MAX_FACT_LENGTH
+        if len(content) > maximum:
+            label = "goal result Fact" if ref == result_ref else "fact"
+            raise ValueError(f"{label} content exceeds {maximum} characters")
     if result_ref not in refs and existing_nodes.get(result_ref) != "fact":
         raise ValueError("goal_result_ref must reference a Fact")
     if (result_ref, goal_node_id) not in existing_addresses and ("addresses", result_ref, goal_node_id) not in edges:

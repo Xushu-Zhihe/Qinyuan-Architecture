@@ -3,8 +3,16 @@ import json
 import unittest
 
 import orchestrator.protocol as protocol
-from orchestrator.models import RELATION_EDGE_TYPES
+from orchestrator.models import (
+    MAX_FACT_CONTENT_LENGTH,
+    MAX_FACTS_PER_RESULT,
+    MAX_NEW_RESULT_FACT_CONTENT_LENGTH,
+    RELATION_EDGE_TYPES,
+)
 from orchestrator.protocol import (
+    MAX_PROMPT_FACTS,
+    MAX_PROMPT_FACT_TOTAL_LENGTH,
+    build_prompt_snapshot,
     parse_intent,
     parse_result,
     render_execution_request,
@@ -88,7 +96,7 @@ class IntentProtocolTests(unittest.TestCase):
         )
 
         self.assertIn("BLACKBOARD_INTENT:", request)
-        self.assertIn('"id": "goal-1"', request)
+        self.assertIn('"id":"goal-1"', request)
         self.assertIn("E:/ctf/task", request)
         self.assertIn("authoritative target endpoint", request)
         self.assertIn("Do not call tools", request)
@@ -96,6 +104,135 @@ class IntentProtocolTests(unittest.TestCase):
 
 
 class ResultProtocolTests(unittest.TestCase):
+    @staticmethod
+    def v2_payload(
+        facts: list[dict[str, str]],
+        *,
+        achieved: bool = False,
+        result_ref: str | None = None,
+    ) -> dict[str, object]:
+        edges = (
+            [{"type": "addresses", "from": result_ref, "to": "goal-1"}]
+            if achieved and result_ref is not None
+            else []
+        )
+        return {
+            "protocol_version": 2,
+            "intent_id": "intent-1",
+            "facts": facts,
+            "edges": edges,
+            "goal_achieved": achieved,
+            "goal_result_ref": result_ref,
+        }
+
+    def parse_v2(self, payload: dict[str, object]):
+        return parse_result(
+            "BLACKBOARD_RESULT: " + json.dumps(payload),
+            assigned_intent_id="intent-1",
+            existing_node_ids={"goal-1"},
+            node_types={"goal-1": "goal"},
+            current_goal_node_id="goal-1",
+            existing_addresses=set(),
+        )
+
+    def test_prompt_snapshot_is_active_relevant_and_bounded(self) -> None:
+        nodes: list[dict[str, object]] = [
+            {"id": "goal-1", "type": "goal", "content": "goal", "state": "active"},
+            {"id": "origin-1", "type": "origin", "content": "origin", "state": "active"},
+            {"id": "archived", "type": "fact", "content": "old", "state": "archived"},
+        ]
+        nodes.extend(
+            {
+                "id": f"fact-{index}",
+                "type": "fact",
+                "content": str(index) * 1_500,
+                "state": "active",
+                "generation": index,
+            }
+            for index in range(14)
+        )
+        edges = [
+            {
+                "id": f"edge-{index}",
+                "type": "supports",
+                "from_node": f"fact-{index}",
+                "to_node": "goal-1",
+            }
+            for index in range(14)
+        ]
+        edges.append(
+            {
+                "id": "similar",
+                "type": "similar_to",
+                "from_node": "fact-0",
+                "to_node": "fact-1",
+            }
+        )
+        compact = build_prompt_snapshot(
+            {
+                "project": {"id": "project-1", "status": "running", "secret": "drop"},
+                "nodes": nodes,
+                "edges": edges,
+                "planning_attempts": [{"large": "drop"}],
+                "provider_health": [{"large": "drop"}],
+                "highest_generation": 13,
+            },
+            {"source_node_id": "fact-1", "target_node_id": "goal-1"},
+        )
+
+        fact_nodes = [node for node in compact["nodes"] if node["type"] == "fact"]
+        self.assertLessEqual(len(fact_nodes), MAX_PROMPT_FACTS)
+        self.assertLessEqual(
+            sum(len(str(node["content"])) for node in fact_nodes),
+            MAX_PROMPT_FACT_TOTAL_LENGTH,
+        )
+        self.assertIn("fact-1", {node["id"] for node in fact_nodes})
+        self.assertNotIn("fact-0", {node["id"] for node in fact_nodes})
+        self.assertNotIn("archived", {node["id"] for node in compact["nodes"]})
+        self.assertNotIn("planning_attempts", compact)
+        self.assertNotIn("provider_health", compact)
+        self.assertEqual(compact["project"], {"id": "project-1", "status": "running"})
+        self.assertGreater(compact["context_omissions"]["facts"], 0)
+
+    def test_rejects_too_many_facts(self) -> None:
+        payload = self.v2_payload(
+            [
+                {"ref": f"fact-{index}", "content": "verified"}
+                for index in range(MAX_FACTS_PER_RESULT + 1)
+            ]
+        )
+        result = self.parse_v2(payload)
+        self.assertEqual(result.status, "protocol_error")
+        self.assertIn("more than", result.error)
+
+    def test_rejects_oversized_evidence_but_allows_bounded_result(self) -> None:
+        oversized = self.v2_payload(
+            [{"ref": "evidence", "content": "x" * (MAX_FACT_CONTENT_LENGTH + 1)}]
+        )
+        self.assertIn("exceeds", self.parse_v2(oversized).error)
+
+        bounded_result = self.v2_payload(
+            [{"ref": "result", "content": "x" * MAX_NEW_RESULT_FACT_CONTENT_LENGTH}],
+            achieved=True,
+            result_ref="result",
+        )
+        self.assertEqual(self.parse_v2(bounded_result).status, "valid")
+
+    def test_rejects_total_fact_content_over_budget(self) -> None:
+        payload = self.v2_payload(
+            [
+                {"ref": "result", "content": "r" * 4_000},
+                {"ref": "evidence-1", "content": "a" * 700},
+                {"ref": "evidence-2", "content": "b" * 700},
+                {"ref": "evidence-3", "content": "c" * 700},
+            ],
+            achieved=True,
+            result_ref="result",
+        )
+        result = self.parse_v2(payload)
+        self.assertEqual(result.status, "protocol_error")
+        self.assertIn("total fact content", result.error)
+
     def test_parses_fact_and_relation_result(self) -> None:
         payload = {
             "intent_id": "intent-1",
@@ -305,6 +442,18 @@ class ResultProtocolTests(unittest.TestCase):
         self.assertIn("fact proposal must be an object", request)
         self.assertIn(json.dumps(rejected), request)
         self.assertIn("Do not create or plan another Intent", request)
+
+    def test_render_execution_request_bounds_rejected_result(self) -> None:
+        request = render_execution_request(
+            snapshot={"nodes": []},
+            intent={"id": "intent-1", "content": "Recover the flag"},
+            challenge_dir=None,
+            protocol_error="fact content exceeds budget",
+            rejected_result_line="x" * 10_000,
+        )
+
+        self.assertIn("...[omitted]...", request)
+        self.assertNotIn("x" * 2_049, request)
 
     def test_last_result_line_returns_last_prefixed_line(self) -> None:
         self.assertTrue(hasattr(protocol, "last_result_line"))

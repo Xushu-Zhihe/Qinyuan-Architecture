@@ -44,7 +44,7 @@ ProjectStatusWriter = Callable[[str, str | None], None]
 PermitCallback = Callable[[PermitLease], Awaitable[None] | None]
 
 TIMEOUT_SUMMARY_SECONDS = 30.0
-TIMEOUT_SUMMARY_MAX_CHARS = 128 * 1024
+TIMEOUT_SUMMARY_MAX_CHARS = 12 * 1024
 
 
 @dataclass(frozen=True, slots=True)

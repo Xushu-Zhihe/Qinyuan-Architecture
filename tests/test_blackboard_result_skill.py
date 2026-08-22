@@ -131,6 +131,25 @@ class BlackboardResultSkillTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn("fact proposal must be an object", result.stderr)
 
+    def test_validator_rejects_fact_budget_overflow(self) -> None:
+        result = self.run_validator(
+            {
+                "protocol_version": 2,
+                "intent_id": "intent-1",
+                "facts": [
+                    {"ref": f"fact-{index}", "content": "verified"}
+                    for index in range(5)
+                ],
+                "edges": [],
+                "goal_achieved": False,
+                "goal_result_ref": None,
+            },
+            goal_node_id="goal-1",
+        )
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("more than 4 facts", result.stderr)
+
     def test_validator_rejects_unknown_edge_reference(self) -> None:
         self.assertTrue(VALIDATOR.is_file())
         if not VALIDATOR.is_file():

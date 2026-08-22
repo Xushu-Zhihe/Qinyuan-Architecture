@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from worker.models import LogChunk, ProviderConfig, WorkerResult
+from worker.models import LogChunk, ProviderConfig, StreamOutput, WorkerResult
 
 
 @dataclass(slots=True)
@@ -65,7 +65,11 @@ class ExecutionBackend(ABC):
         stderr_path: Path,
         on_chunk: Any,
         max_log_bytes: int,
-    ) -> tuple[asyncio.Task[None], asyncio.Task[str], asyncio.Task[str]]:
+    ) -> tuple[
+        asyncio.Task[None],
+        asyncio.Task[StreamOutput],
+        asyncio.Task[StreamOutput],
+    ]:
         raise NotImplementedError
 
     @abstractmethod

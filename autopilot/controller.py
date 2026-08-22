@@ -134,7 +134,7 @@ class AutoController:
                 raise AutoControllerError(
                     f"controller execution returned {result.status}"
                 )
-            parsed = parse_controller_result(result.output)
+            parsed = parse_controller_result(result.protocol_text)
             if parsed.status != "valid" or parsed.result is None:
                 raise AutoControllerError(parsed.error or "invalid controller result")
             if parsed.result.action == "task":

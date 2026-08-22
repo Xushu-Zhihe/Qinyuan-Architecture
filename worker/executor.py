@@ -18,7 +18,7 @@ from worker.backend import (
     ExecutionBackend,
 )
 from worker.commands import local_command
-from worker.models import LogChunk, ProviderConfig, WorkerResult
+from worker.models import LogChunk, ProviderConfig, StreamOutput, WorkerResult
 from worker.output_adapters import OutputAdapter, build_output_adapter
 from worker.redaction import redact_text
 
@@ -58,11 +58,13 @@ async def _read_stream(
     max_log_bytes: int,
     adapter: OutputAdapter | None = None,
     raw_path: Path | None = None,
-) -> str:
+) -> StreamOutput:
     decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
-    parts: list[str] = []
+    audit_parts: list[str] = []
+    protocol_parts: list[str] = []
     pending = ""
     written_bytes = 0
+    protocol_bytes = 0
     raw_written_bytes = 0
     transform = adapter or build_output_adapter("text")
 
@@ -79,9 +81,17 @@ async def _read_stream(
         handle.write(safe)
         handle.flush()
 
-    async def write_safe(text: str, handle) -> None:
-        nonlocal written_bytes
-        if not text or written_bytes >= max_log_bytes:
+    async def write_visible(text: str, handle) -> None:
+        nonlocal protocol_bytes, written_bytes
+        if not text:
+            return
+        if protocol_bytes < max_log_bytes:
+            encoded_protocol = text.encode("utf-8")[: max_log_bytes - protocol_bytes]
+            protocol_text = encoded_protocol.decode("utf-8", errors="ignore")
+            if protocol_text:
+                protocol_bytes += len(protocol_text.encode("utf-8"))
+                protocol_parts.append(protocol_text)
+        if written_bytes >= max_log_bytes:
             return
         safe = redact_text(text)
         encoded = safe.encode("utf-8")
@@ -94,7 +104,7 @@ async def _read_stream(
         written_bytes += len(encoded)
         handle.write(safe)
         handle.flush()
-        parts.append(safe)
+        audit_parts.append(safe)
         await _emit(on_chunk, LogChunk(stream_name, safe))
 
     raw_context = (
@@ -115,7 +125,7 @@ async def _read_stream(
             except TimeoutError:
                 if pending:
                     for visible in transform.feed(pending):
-                        await write_safe(visible, handle)
+                        await write_visible(visible, handle)
                     pending = ""
                 continue
             read_task = None
@@ -124,7 +134,7 @@ async def _read_stream(
             text = decoder.decode(raw)
             write_raw(text, raw_handle)
             pending += text
-            if written_bytes >= max_log_bytes:
+            if written_bytes >= max_log_bytes and protocol_bytes >= max_log_bytes:
                 pending = ""
                 continue
             lines = pending.splitlines(keepends=True)
@@ -134,20 +144,20 @@ async def _read_stream(
                 pending = ""
             for line in lines:
                 for visible in transform.feed(line):
-                    await write_safe(visible, handle)
+                    await write_visible(visible, handle)
             if len(pending.encode("utf-8")) >= 16 * 1024:
                 for visible in transform.feed(pending):
-                    await write_safe(visible, handle)
+                    await write_visible(visible, handle)
                 pending = ""
         final_text = decoder.decode(b"", final=True)
         write_raw(final_text, raw_handle)
         pending += final_text
         if pending:
             for visible in transform.feed(pending):
-                await write_safe(visible, handle)
+                await write_visible(visible, handle)
         for visible in transform.finish():
-            await write_safe(visible, handle)
-    return "".join(parts)
+            await write_visible(visible, handle)
+    return StreamOutput("".join(audit_parts), "".join(protocol_parts))
 
 
 async def _write_stdin(
@@ -285,7 +295,11 @@ class LocalExecutionBackend(ExecutionBackend):
         stderr_path: Path,
         on_chunk: ChunkCallback | None,
         max_log_bytes: int,
-    ) -> tuple[asyncio.Task[None], asyncio.Task[str], asyncio.Task[str]]:
+    ) -> tuple[
+        asyncio.Task[None],
+        asyncio.Task[StreamOutput],
+        asyncio.Task[StreamOutput],
+    ]:
         process = handle.process
         assert process.stdin is not None
         assert process.stdout is not None
@@ -418,7 +432,7 @@ class LocalExecutionBackend(ExecutionBackend):
         started = time.monotonic()
         outcome = BackendOutcome("unavailable", None)
         cleanup = CleanupOutcome(None, "not_applicable")
-        stdout_text = ""
+        stdout_stream = StreamOutput("", "")
         handle: BackendHandle | None = None
         command: tuple[str, ...] = ()
         startup_error: str | None = None
@@ -457,7 +471,7 @@ class LocalExecutionBackend(ExecutionBackend):
                 cancel_event,
             )
             await asyncio.gather(stdin_task, return_exceptions=True)
-            stdout_text, _ = await asyncio.gather(stdout_task, stderr_task)
+            stdout_stream, _ = await asyncio.gather(stdout_task, stderr_task)
             if outcome.diagnostic is not None:
                 await _append_stderr(
                     stderr_path,
@@ -490,7 +504,7 @@ class LocalExecutionBackend(ExecutionBackend):
             status=outcome.status,
             exit_code=outcome.exit_code,
             duration_seconds=round(time.monotonic() - started, 3),
-            output=(stdout_text.strip() or startup_error or ""),
+            output=(stdout_stream.audit.strip() or redact_text(startup_error or "")),
             stdout_path=str(stdout_path.resolve()),
             stderr_path=str(stderr_path.resolve()),
             work_dir=str(work_dir.resolve()),
@@ -519,6 +533,7 @@ class LocalExecutionBackend(ExecutionBackend):
                     else {}
                 ),
             },
+            protocol_output=stdout_stream.protocol.strip() or None,
         )
 
 

@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import sys
 import tempfile
@@ -162,6 +163,45 @@ class BackendExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(container.cleanup_status, "removed")
         self.assertTrue(any(chunk.stream == "stdout" for chunk in local_chunks))
         self.assertTrue(any(chunk.stream == "stdout" for chunk in container_chunks))
+
+    async def test_local_and_container_keep_secret_protocol_text_out_of_logs(self) -> None:
+        request = "BLACKBOARD_RESULT: " + json.dumps(
+            {
+                "facts": [
+                    {
+                        "ref": "fact-correct-password",
+                        "content": "password=nss826312",
+                    }
+                ]
+            }
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            local = await LocalExecutionBackend().execute(
+                provider(
+                    (sys.executable, "-c", "import sys; sys.stdout.write(sys.stdin.read())"),
+                    image=None,
+                ),
+                request,
+                None,
+                root / "local-secret",
+            )
+            container = await self.fake_backend(root / "secret-state").execute(
+                provider(("fake-echo",)),
+                request,
+                None,
+                root / "container-secret",
+            )
+
+            for result in (local, container):
+                with self.subTest(backend=result.execution_backend):
+                    self.assertEqual(result.protocol_text, request)
+                    self.assertIn("fact-correct-password", result.output)
+                    self.assertNotIn("nss826312", result.output)
+                    self.assertNotIn(
+                        "nss826312",
+                        Path(result.stdout_path).read_text(encoding="utf-8"),
+                    )
 
     async def test_cleanup_policies_record_actual_outcomes(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

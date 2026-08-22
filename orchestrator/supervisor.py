@@ -968,7 +968,7 @@ class ProjectSupervisor:
             return "health_failure"
 
         parsed_intent = parse_intent(
-            planning.output,
+            planning.protocol_text,
             planning_node_types,
         )
         if parsed_intent.status != "valid" or parsed_intent.decision is None:
@@ -1260,7 +1260,7 @@ class ProjectSupervisor:
     ) -> WorkerResult | None:
         existing_node_ids = set(self.store.node_types())
         parsed = parse_result(
-            timed_out.output,
+            timed_out.protocol_text,
             assigned_intent_id=intent.id,
             existing_node_ids=existing_node_ids,
             node_types=self.store.node_types(),
@@ -1338,7 +1338,7 @@ class ProjectSupervisor:
             )
             return None
         parsed = parse_result(
-            summary.output,
+            summary.protocol_text,
             assigned_intent_id=intent.id,
             existing_node_ids=set(self.store.node_types()),
             node_types=self.store.node_types(),
@@ -1476,7 +1476,7 @@ class ProjectSupervisor:
             return IntentAttemptResult("health_failure")
 
         parsed_result = parse_result(
-            result.output,
+            result.protocol_text,
             assigned_intent_id=intent.id,
             existing_node_ids=set(self.store.node_types()),
             node_types=self.store.node_types(),
@@ -1513,7 +1513,7 @@ class ProjectSupervisor:
             return IntentAttemptResult(
                 status="protocol_error",
                 protocol_error=error,
-                rejected_result_line=last_result_line(result.output),
+                rejected_result_line=last_result_line(result.protocol_text),
             )
 
         async with self.write_lock:

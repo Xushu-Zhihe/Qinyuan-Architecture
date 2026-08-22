@@ -24,7 +24,12 @@ from worker.executor import (
     _write_stdin,
 )
 from worker.output_adapters import build_output_adapter
-from worker.models import ContainerBackendConfig, ProviderConfig, WorkerResult
+from worker.models import (
+    ContainerBackendConfig,
+    ProviderConfig,
+    StreamOutput,
+    WorkerResult,
+)
 from worker.redaction import redact_text
 
 
@@ -219,7 +224,11 @@ class ContainerExecutionBackend(ExecutionBackend):
         stderr_path: Path,
         on_chunk: ChunkCallback | None,
         max_log_bytes: int,
-    ) -> tuple[asyncio.Task[None], asyncio.Task[str], asyncio.Task[str]]:
+    ) -> tuple[
+        asyncio.Task[None],
+        asyncio.Task[StreamOutput],
+        asyncio.Task[StreamOutput],
+    ]:
         process = handle.process
         assert process.stdin is not None
         assert process.stdout is not None
@@ -412,7 +421,7 @@ class ContainerExecutionBackend(ExecutionBackend):
         started = time.monotonic()
         outcome = BackendOutcome("unavailable", None)
         cleanup = CleanupOutcome(self.config.cleanup_policy, "not_started")
-        stdout_text = ""
+        stdout_stream = StreamOutput("", "")
         handle: BackendHandle | None = None
         try:
             handle = await self.start(
@@ -436,7 +445,7 @@ class ContainerExecutionBackend(ExecutionBackend):
                 cancel_event,
             )
             await asyncio.gather(stdin_task, return_exceptions=True)
-            stdout_text, _ = await asyncio.gather(stdout_task, stderr_task)
+            stdout_stream, _ = await asyncio.gather(stdout_task, stderr_task)
             if outcome.diagnostic is not None:
                 await _append_stderr(
                     stderr_path,
@@ -481,7 +490,7 @@ class ContainerExecutionBackend(ExecutionBackend):
             status=outcome.status,
             exit_code=outcome.exit_code,
             duration_seconds=round(time.monotonic() - started, 3),
-            output=stdout_text.strip(),
+            output=stdout_stream.audit.strip(),
             stdout_path=str(stdout_path.resolve()),
             stderr_path=str(stderr_path.resolve()),
             work_dir=str(work_dir.resolve()),
@@ -495,4 +504,5 @@ class ContainerExecutionBackend(ExecutionBackend):
             cleanup_status=cleanup.status,
             cleanup_detail=cleanup.detail,
             backend_metadata=metadata,
+            protocol_output=stdout_stream.protocol.strip() or None,
         )

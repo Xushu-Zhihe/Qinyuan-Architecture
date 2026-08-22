@@ -66,6 +66,8 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         work_dir: Path,
         output: str,
         status: str = "success",
+        *,
+        protocol_output: str | None = None,
     ) -> WorkerResult:
         work_dir.mkdir(parents=True, exist_ok=True)
         stdout = work_dir / "stdout.txt"
@@ -82,6 +84,7 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             stdout_path=str(stdout),
             stderr_path=str(stderr),
             work_dir=str(work_dir),
+            protocol_output=protocol_output,
         )
 
     async def test_agent_plans_before_execution_and_streams_log(self) -> None:
@@ -1141,6 +1144,90 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
                 if event["type"] == "intent.execution_finished"
             ],
             ["protocol_error", "completed"],
+        )
+
+    async def test_parses_unredacted_protocol_channel_not_audit_output(self) -> None:
+        store, root = self.make_store()
+
+        async def execute(config, request, challenge_dir, work_dir, **kwargs):
+            if "BLACKBOARD_INTENT:" in request:
+                intent_output = "BLACKBOARD_INTENT: " + json.dumps(
+                    {
+                        "action": "plan",
+                        "source_node_id": store.node_id("origin"),
+                        "target_node_id": store.node_id("goal"),
+                        "content": "Recover the flag",
+                    }
+                )
+                return self.result(
+                    config.name,
+                    work_dir,
+                    "BLACKBOARD_INTENT: {invalid audit output}",
+                    protocol_output=intent_output,
+                )
+            intent_id = next(
+                edge["id"]
+                for edge in store.snapshot()["edges"]
+                if edge["type"] == "intent"
+            )
+            goal_id = store.node_id("goal")
+            result_output = "BLACKBOARD_RESULT: " + json.dumps(
+                {
+                    "protocol_version": 2,
+                    "intent_id": intent_id,
+                    "facts": [
+                        {
+                            "ref": "fact-correct-password",
+                            "content": "The correct password=nss826312",
+                        },
+                        {
+                            "ref": "fact-flag-result",
+                            "content": "NSSCTF{test-flag}",
+                        },
+                    ],
+                    "edges": [
+                        {
+                            "type": "addresses",
+                            "from": "fact-flag-result",
+                            "to": goal_id,
+                        },
+                        {
+                            "type": "supports",
+                            "from": "fact-correct-password",
+                            "to": "fact-flag-result",
+                        },
+                    ],
+                    "goal_achieved": True,
+                    "goal_result_ref": "fact-flag-result",
+                }
+            )
+            return self.result(
+                config.name,
+                work_dir,
+                'BLACKBOARD_RESULT: {"ref":"fact-correct-password=[redacted]"}',
+                protocol_output=result_output,
+            )
+
+        supervisor = ProjectSupervisor(
+            store=store,
+            providers=(provider("codex"),),
+            challenge_dir=None,
+            project_dir=root,
+            execute=execute,
+            max_iterations=1,
+        )
+
+        status = await supervisor.run_agent_once("codex")
+        snapshot = store.snapshot()
+
+        self.assertEqual(status, "completed")
+        self.assertEqual(snapshot["project"]["status"], "achieved")
+        self.assertEqual(snapshot["project"]["final_answer"], "NSSCTF{test-flag}")
+        self.assertTrue(
+            any(
+                node["type"] == "fact" and node["content"] == "NSSCTF{test-flag}"
+                for node in snapshot["nodes"]
+            )
         )
 
     async def test_protocol_correction_stops_after_second_error(self) -> None:

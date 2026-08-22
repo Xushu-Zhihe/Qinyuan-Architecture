@@ -1,4 +1,6 @@
 import asyncio
+import dataclasses
+import json
 import shutil
 import sys
 import tempfile
@@ -143,6 +145,59 @@ class ExecutorTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(b"sk-super-secret", persisted)
         self.assertNotIn("sk-super-secret", streamed)
         self.assertIn("[redacted]", result.output)
+
+    async def test_keeps_protocol_output_separate_from_redacted_audit_logs(self) -> None:
+        payload = {
+            "protocol_version": 2,
+            "intent_id": "intent-1",
+            "facts": [
+                {
+                    "ref": "fact-correct-password",
+                    "content": "The correct password=nss826312",
+                },
+                {
+                    "ref": "fact-token-analysis",
+                    "content": "Token label was inspected",
+                },
+                {
+                    "ref": "fact-secret-discovery",
+                    "content": "Secret label was inspected",
+                },
+            ],
+            "edges": [],
+            "goal_achieved": False,
+            "goal_result_ref": None,
+        }
+        protocol = "BLACKBOARD_RESULT: " + json.dumps(payload)
+        provider = ProviderConfig(
+            name="protocol",
+            enabled=True,
+            priority=10,
+            command=(sys.executable, "-c", "import sys; sys.stdout.write(sys.stdin.read())"),
+            timeout_seconds=5,
+        )
+        chunks: list[LogChunk] = []
+
+        with tempfile.TemporaryDirectory() as directory:
+            result = await execute_provider(
+                provider,
+                protocol,
+                None,
+                Path(directory) / "protocol",
+                on_chunk=chunks.append,
+            )
+            persisted = Path(result.stdout_path).read_text(encoding="utf-8")
+
+        self.assertEqual(result.protocol_text, protocol)
+        self.assertIn("fact-correct-password", result.output)
+        self.assertIn("fact-token-analysis", result.output)
+        self.assertIn("fact-secret-discovery", result.output)
+        self.assertNotIn("nss826312", result.output)
+        self.assertNotIn("nss826312", persisted)
+        self.assertNotIn("nss826312", "".join(chunk.text for chunk in chunks))
+        self.assertNotIn("protocol_output", result.to_dict())
+        self.assertNotIn("nss826312", repr(result))
+        self.assertIn("nss826312", dataclasses.asdict(result)["protocol_output"])
 
 
 if __name__ == "__main__":

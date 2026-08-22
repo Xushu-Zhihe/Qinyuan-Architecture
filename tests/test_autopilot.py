@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from autopilot.controller import AutoController
 from autopilot.manager import AutoManager
 from autopilot.models import AutoSession, AutoStartConfig, AutoTask
 from autopilot.protocol import parse_controller_result
@@ -36,6 +37,49 @@ class ProtocolTests(unittest.TestCase):
         missing = parse_controller_result("plain output")
         self.assertEqual(extra.status, "protocol_error")
         self.assertEqual(missing.status, "protocol_error")
+
+
+class ControllerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_reads_controller_result_from_protocol_channel(self) -> None:
+        provider = ProviderConfig("fake", True, 10, ("unused",), 10, max_running=1)
+        protocol_output = 'AUTOPILOT_RESULT: {"action":"wait","message":"empty"}'
+
+        async def execute(config, request, challenge_dir, work_dir, **kwargs):
+            stdout = work_dir / "stdout.txt"
+            stderr = work_dir / "stderr.txt"
+            stdout.write_text("AUTOPILOT_RESULT: {invalid audit output}", encoding="utf-8")
+            stderr.write_text("", encoding="utf-8")
+            return WorkerResult(
+                provider=config.name,
+                priority=config.priority,
+                status="success",
+                exit_code=0,
+                duration_seconds=0.01,
+                output="AUTOPILOT_RESULT: {invalid audit output}",
+                stdout_path=str(stdout),
+                stderr_path=str(stderr),
+                work_dir=str(work_dir),
+                protocol_output=protocol_output,
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            controller = AutoController(
+                providers={"fake": provider},
+                execute=execute,
+                coordinator=ExecutionCoordinator(),
+                runtime_root=Path(directory),
+            )
+            call = await controller.call(
+                session_id="session-1",
+                platform_prompt="Fetch a task",
+                provider_name="fake",
+                action="next",
+                timeout_seconds=5,
+                cancel_event=asyncio.Event(),
+            )
+
+        self.assertEqual(call.result.action, "wait")
+        self.assertEqual(call.result.message, "empty")
 
 
 class _FakeStore:

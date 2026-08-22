@@ -104,6 +104,21 @@ class LogChunk:
     text: str
 
 
+class StreamOutput(str):
+    """Rendered stream text with a redacted view and a protocol view.
+
+    Subclassing ``str`` keeps the historical ``_read_stream`` return contract
+    for callers that only need the audit text while exposing the semantic
+    protocol text to execution backends.
+    """
+
+    def __new__(cls, audit: str, protocol: str) -> "StreamOutput":
+        value = super().__new__(cls, audit)
+        value.audit = audit
+        value.protocol = protocol
+        return value
+
+
 @dataclass(frozen=True, slots=True)
 class WorkerResult:
     provider: str
@@ -128,6 +143,13 @@ class WorkerResult:
     cleanup_status: str = "not_applicable"
     cleanup_detail: str | None = None
     backend_metadata: dict[str, object] = field(default_factory=dict)
+    protocol_output: str | None = field(default=None, repr=False)
+
+    @property
+    def protocol_text(self) -> str:
+        return self.protocol_output or self.output
 
     def to_dict(self) -> dict[str, object]:
-        return asdict(self)
+        serialized = asdict(self)
+        serialized.pop("protocol_output", None)
+        return serialized

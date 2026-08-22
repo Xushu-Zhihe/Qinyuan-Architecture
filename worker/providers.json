@@ -139,7 +139,7 @@
         "2"
       ],
       "planning_timeout_seconds": 300,
-      "timeout_seconds": 3600,
+      "timeout_seconds": 3900,
       "streaming_supported": false,
       "capabilities": {
         "request_protocol_versions": [1],

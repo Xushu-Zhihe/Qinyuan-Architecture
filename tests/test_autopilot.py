@@ -96,6 +96,62 @@ class _FakeService:
 
 
 class ManagerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_tool_bootstrap_extends_solver_deadline_once(self) -> None:
+        root = Path("tests") / "nonexistent-bootstrap-root"
+
+        class DelayedService(_FakeService):
+            async def start_project(self, project_id: str):
+                self.handles[project_id].store.project = {
+                    "status": "idle",
+                    "final_answer": None,
+                }
+                await asyncio.sleep(0.005)
+                self.handles[project_id].store.project = {
+                    "status": "achieved",
+                    "final_answer": "flag{ok}",
+                }
+
+        class RecordingManager(AutoManager):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.persisted: list[tuple[str | None, str | None]] = []
+
+            def _persist_session(self, session):
+                self.persisted.append(
+                    (session.current_task_deadline_at, session.last_message)
+                )
+                super()._persist_session(session)
+
+        service = DelayedService(root)
+        provider = ProviderConfig("fake", True, 10, ("unused",), 10, max_running=1)
+        manager = RecordingManager(
+            service=service,
+            provider_configs=(provider,),
+            execute=None,
+        )
+        manager._tool_bootstrap_requested = lambda _project_id: True
+        config = AutoStartConfig(
+            platform_prompt="platform",
+            controller_provider="fake",
+            solver_providers=("fake",),
+            agent_limit=1,
+            max_tasks=1,
+            poll_interval_seconds=0.001,
+        )
+        session = AutoSession("auto-bootstrap", config, root / "runtime")
+        await manager._solve_task(
+            session,
+            AutoTask("task-bootstrap", "Task", "Goal", "Origin"),
+            asyncio.Event(),
+        )
+
+        compensation_events = [
+            item for item in manager.persisted
+            if item[1] and "tool bootstrap time compensated" in item[1]
+        ]
+        self.assertEqual(len(compensation_events), 1)
+        self.assertEqual(manager._tool_bootstrap_budget_seconds, 300)
+
     async def test_solver_stops_before_cleaning_task_artifacts(self) -> None:
         root = Path("tests") / "nonexistent-lifecycle-root"
         events: list[str] = []

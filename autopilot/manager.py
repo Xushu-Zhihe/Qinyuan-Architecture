@@ -5,10 +5,12 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import os
 import re
 import shutil
 from dataclasses import replace
 from datetime import datetime, timezone
+from pathlib import Path
 from uuid import uuid4
 
 from autopilot.controller import AutoController, AutoControllerError
@@ -106,6 +108,21 @@ def _timestamp() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _tool_bootstrap_budget_seconds() -> int:
+    raw = os.environ.get("QINYUAN_TOOL_BOOTSTRAP_BUDGET_SECONDS", "300")
+    try:
+        value = int(raw.strip())
+    except ValueError as exc:
+        raise ValueError(
+            "QINYUAN_TOOL_BOOTSTRAP_BUDGET_SECONDS must be an integer"
+        ) from exc
+    if not 1 <= value <= 300:
+        raise ValueError(
+            "QINYUAN_TOOL_BOOTSTRAP_BUDGET_SECONDS must be between 1 and 300"
+        )
+    return value
+
+
 class AutoManager:
     def __init__(
         self,
@@ -135,6 +152,7 @@ class AutoManager:
         self._platform_secret: RuntimePlatformSecret | None = None
         self._cleanup_failures = 0
         self._task_deadline_monotonic: float | None = None
+        self._tool_bootstrap_budget_seconds = _tool_bootstrap_budget_seconds()
         self._skip_requested: asyncio.Event | None = None
         self._skip_reason: str | None = None
         self._manual_submission_event: asyncio.Event | None = None
@@ -474,6 +492,40 @@ class AutoManager:
         except (OSError, TypeError, ValueError):
             # Session persistence must not change the automation outcome.
             return
+
+    def _tool_bootstrap_requested(self, project_id: str) -> bool:
+        """Return whether a trusted download MCP marker exists for this task."""
+        try:
+            handle = self.service.get_handle(project_id)
+            project_path = getattr(getattr(handle, "record", None), "path", None)
+            if project_path is None:
+                return False
+            workspace_root = Path(project_path) / "agent-workspaces"
+        except (KeyError, OSError, TypeError, ValueError):
+            return False
+
+        try:
+            if not workspace_root.is_dir():
+                return False
+            markers = workspace_root.glob("*/.qinyuan-tool-bootstrap.json")
+            for marker in markers:
+                if not marker.is_file():
+                    continue
+                try:
+                    payload = json.loads(marker.read_text(encoding="utf-8"))
+                except (OSError, UnicodeError, json.JSONDecodeError):
+                    continue
+                if not isinstance(payload, dict):
+                    continue
+                if (
+                    payload.get("version") == 1
+                    and payload.get("qualified_tool") == "download.install_tool"
+                    and payload.get("compensate_seconds") == 300
+                ):
+                    return True
+        except OSError:
+            return False
+        return False
 
     def _recover_session_snapshot(self) -> dict[str, object] | None:
         try:
@@ -1523,6 +1575,7 @@ class AutoManager:
         session.current_external_id = task.external_id
         session.current_task_name = task.name
         project_id: str | None = None
+        bootstrap_compensated = False
         try:
             project = self.service.create_project(
                 name=f"Auto {session.completed_tasks + 1}: {task.name}",
@@ -1551,6 +1604,27 @@ class AutoManager:
                     raise asyncio.CancelledError
                 if self._skip_requested is not None and self._skip_requested.is_set():
                     raise _SkipTaskRequested
+                if (
+                    not bootstrap_compensated
+                    and self._tool_bootstrap_requested(project_id)
+                ):
+                    self._task_deadline_monotonic = (
+                        self._task_deadline_monotonic or deadline
+                    ) + self._tool_bootstrap_budget_seconds
+                    session.current_task_deadline_at = datetime.fromtimestamp(
+                        datetime.now(timezone.utc).timestamp()
+                        + max(
+                            0.0,
+                            self._task_deadline_monotonic - loop.time(),
+                        ),
+                        timezone.utc,
+                    ).isoformat()
+                    session.last_message = (
+                        "tool bootstrap time compensated by "
+                        f"{self._tool_bootstrap_budget_seconds} seconds"
+                    )
+                    self._persist_session(session)
+                    bootstrap_compensated = True
                 snapshot = project.store.snapshot()["project"]
                 status = str(snapshot["status"])
                 if status == "achieved":

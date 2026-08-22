@@ -415,7 +415,7 @@ class ProviderConfigTests(unittest.TestCase):
         self.assertEqual(qinyuan.agent_lifecycle.release_timeout_seconds, 30)
         self.assertEqual(qinyuan.max_running, 2)
         self.assertEqual(qinyuan.planning_timeout_seconds, 300)
-        self.assertEqual(qinyuan.timeout_seconds, 3600)
+        self.assertEqual(qinyuan.timeout_seconds, 3900)
         self.assertFalse(qinyuan.streaming_supported)
         self.assertIsNotNone(qinyuan.health_check)
         self.assertTrue(all(provider.health_check for provider in providers.values()))

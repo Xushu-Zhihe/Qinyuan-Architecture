@@ -15,6 +15,7 @@
 
 ## [Unreleased]
 
+- q-subagent 默认健康检查改用 `doctor --json`，仅在模型配置、MCP 和本地工具链全部可用时参与调度。
 - 默认 qinyuan-agent 的执行、释放、能力探测和健康检查统一通过 provider 配置目录
   定位相邻的 `Qinyuan_Agent` uv 项目，避免系统 `PATH` 中多个同名 CLI 导致随机失效。
 - qinyuan-agent provider 的 sandbox 生命周期改由 solver project 持有：同一

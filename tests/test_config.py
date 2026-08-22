@@ -447,6 +447,12 @@ class ProviderConfigTests(unittest.TestCase):
         self.assertEqual(q_subagent.planning_timeout_seconds, 120)
         self.assertFalse(q_subagent.streaming_supported)
         self.assertIsNotNone(q_subagent.health_check)
+        assert q_subagent.health_check is not None
+        self.assertEqual(
+            q_subagent.health_check.command,
+            ("q-subagent", "doctor", "--json"),
+        )
+        self.assertEqual(q_subagent.health_check.timeout_seconds, 30)
         self.assertNotIn("--execution-backend", q_subagent.command)
         self.assertNotIn("approval", q_subagent.command)
 

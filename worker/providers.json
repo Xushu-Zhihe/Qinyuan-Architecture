@@ -225,9 +225,10 @@
       "health_check": {
         "command": [
           "q-subagent",
-          "--version"
+          "doctor",
+          "--json"
         ],
-        "timeout_seconds": 10,
+        "timeout_seconds": 30,
         "cooldown_seconds": 15,
         "max_cooldown_seconds": 300,
         "failure_threshold": 3

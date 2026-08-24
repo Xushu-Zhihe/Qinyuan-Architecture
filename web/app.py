@@ -344,6 +344,7 @@ def create_app(
                 solver_failure_action=payload.solver_failure_action,
                 stop_active_task_action=payload.stop_active_task_action,
                 max_replans_after_rejection=payload.max_replans_after_rejection,
+                max_agent_corrections=payload.max_agent_corrections,
                 max_transport_retries=payload.max_transport_retries,
             )
             secret = RuntimeControllerSecret(

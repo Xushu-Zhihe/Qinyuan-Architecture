@@ -120,6 +120,7 @@ class FieldMappingPayload(BaseModel):
     origin_path: str = "origin"
     origin_endpoint_path: str | None = None
     goal_format: Literal["plain", "flag_objective"] = "plain"
+    flag_header: str | None = Field(default=None, max_length=200)
     hints_path: str | None = "hints"
     hints_item_path: str | None = None
     attachments_path: str | None = None
@@ -195,10 +196,11 @@ class AutoCommon(BaseModel):
     max_tasks: int = Field(default=10, ge=1, le=1000)
     task_timeout_minutes: float = Field(default=60, gt=0, le=1440)
     poll_interval_seconds: float = Field(default=1, gt=0, le=3600)
-    rejected_action: Literal["pause", "replan", "skip", "fail"] = "pause"
+    rejected_action: Literal["pause", "replan", "agent_correct", "skip", "fail"] = "agent_correct"
     solver_failure_action: Literal["skip", "fail"] = "fail"
     stop_active_task_action: Literal["leave", "skip"] = "leave"
     max_replans_after_rejection: int = Field(default=1, ge=0, le=10)
+    max_agent_corrections: int = Field(default=2, ge=0, le=10)
     max_transport_retries: int = Field(default=2, ge=0, le=10)
 
     @model_validator(mode="after")

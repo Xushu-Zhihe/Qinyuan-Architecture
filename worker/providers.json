@@ -42,7 +42,7 @@
         "--skip-git-repo-check",
         "--ephemeral",
         "-C",
-        "{work_dir}",
+        "{agent_work_dir}",
         "-"
       ],
       "health_check": {
@@ -57,7 +57,18 @@
       },
       "planning_timeout_seconds": 120,
       "timeout_seconds": 900,
-      "streaming_supported": true
+      "streaming_supported": true,
+      "project_workspace": true,
+      "capabilities": {
+        "request_protocol_versions": [1],
+        "result_protocol_versions": [1, 2],
+        "skill_mode": "inline",
+        "available_skills": [],
+        "validates_result_locally": false,
+        "supports_result_fact": true,
+        "schema_version": "2",
+        "fixture_digest": "sha256:916cb6308fe2ce645a632a452bc309c330407f126165d09b0bef65bb80a5dcc6"
+      }
     },
     {
       "name": "claude",
@@ -86,7 +97,18 @@
         "failure_threshold": 3
       },
       "planning_timeout_seconds": 120,
-      "timeout_seconds": 900
+      "timeout_seconds": 900,
+      "project_workspace": true,
+      "capabilities": {
+        "request_protocol_versions": [1],
+        "result_protocol_versions": [1, 2],
+        "skill_mode": "inline",
+        "available_skills": [],
+        "validates_result_locally": false,
+        "supports_result_fact": true,
+        "schema_version": "2",
+        "fixture_digest": "sha256:916cb6308fe2ce645a632a452bc309c330407f126165d09b0bef65bb80a5dcc6"
+      }
     },
     {
       "name": "kimi",
@@ -108,7 +130,18 @@
         "failure_threshold": 3
       },
       "streaming_supported": false,
-      "timeout_seconds": 900
+      "timeout_seconds": 900,
+      "project_workspace": true,
+      "capabilities": {
+        "request_protocol_versions": [1],
+        "result_protocol_versions": [1, 2],
+        "skill_mode": "inline",
+        "available_skills": [],
+        "validates_result_locally": false,
+        "supports_result_fact": true,
+        "schema_version": "2",
+        "fixture_digest": "sha256:916cb6308fe2ce645a632a452bc309c330407f126165d09b0bef65bb80a5dcc6"
+      }
     },
     {
       "name": "qinyuan-agent",

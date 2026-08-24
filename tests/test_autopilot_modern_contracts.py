@@ -47,6 +47,28 @@ def _platform_config(**kwargs) -> StructuredPlatformConfig:
 
 
 class ModernContractTests(unittest.IsolatedAsyncioTestCase):
+    async def test_flag_header_is_included_in_structured_goal(self) -> None:
+        config = _platform_config(
+            mapping=FieldMapping(
+                goal_format="flag_objective",
+                flag_header="NSSCTF{} or FLAG{}",
+            )
+        )
+        adapter = StructuredPlatformAdapter(config)
+        try:
+            task = adapter._map_task(
+                {
+                    "id": "5046",
+                    "name": "Web",
+                    "goal": "Recover the flag",
+                    "origin": "target",
+                }
+            )
+        finally:
+            await adapter.close()
+
+        self.assertIn("Flag 头说明：NSSCTF{} or FLAG{}", task.goal)
+
     async def test_flag_submission_unwraps_json_plan_and_classifies_false_as_rejected(self) -> None:
         task = AutoTask("5046", "Web", "Recover the flag", "target")
         goal_result = type(

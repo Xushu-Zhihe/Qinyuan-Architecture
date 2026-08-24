@@ -1,4 +1,5 @@
 import json
+import shutil
 import sqlite3
 import threading
 from collections.abc import Awaitable, Callable
@@ -553,6 +554,11 @@ class ProjectService:
             or any(not task.done() for task in supervisor.manual_tasks.values())
         ):
             raise ValueError("stop the project before reopening it")
+        if supervisor is not None:
+            # Reopening after an achieved attempt must stop background loops,
+            # but preserve provider-owned resources for the same project.
+            await supervisor.stop(release_lifecycle=False)
+            self._supervisors.pop(project_id, None)
         sequence = int(handle.store.snapshot()["sequence"])
         goal_version = handle.store.reopen_project()
         handle.record = self.registry.update_status(project_id, "idle")
@@ -632,7 +638,17 @@ class ProjectService:
             await supervisor.stop()
         elif handle.store.snapshot()["project"]["status"] != "achieved":
             self._set_project_status(handle, "stopped")
+        self._cleanup_project_workspaces(handle)
         return self._sync_project_status(handle)
+
+    @staticmethod
+    def _cleanup_project_workspaces(handle: ProjectHandle) -> None:
+        project_root = handle.record.path.resolve()
+        workspace_root = (project_root / "agent-workspaces").resolve()
+        if workspace_root.parent != project_root:
+            raise ProjectPathError("agent workspace path escapes project directory")
+        if workspace_root.exists():
+            shutil.rmtree(workspace_root)
 
     def _restore_handle(
         self,

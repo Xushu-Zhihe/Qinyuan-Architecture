@@ -113,6 +113,7 @@ class FieldMapping:
     origin_path: str = "origin"
     origin_endpoint_path: str | None = None
     goal_format: str = "plain"
+    flag_header: str | None = None
     hints_path: str | None = "hints"
     hints_item_path: str | None = None
     attachments_path: str | None = None
@@ -122,6 +123,11 @@ class FieldMapping:
     def __post_init__(self) -> None:
         if self.goal_format not in {"plain", "flag_objective"}:
             raise ValueError("unsupported goal format")
+        if self.flag_header is not None:
+            flag_header = self.flag_header.strip()
+            if len(flag_header) > 200:
+                raise ValueError("flag_header must be at most 200 characters")
+            object.__setattr__(self, "flag_header", flag_header or None)
 
 
 @dataclass(frozen=True, slots=True)

@@ -172,10 +172,11 @@ class AutoStartConfig:
     mode: Literal["prompt", "structured"] = "prompt"
     controller: ControllerConfig | None = None
     platform: object | None = None
-    rejected_action: Literal["pause", "replan", "skip", "fail"] = "pause"
+    rejected_action: Literal["pause", "replan", "agent_correct", "skip", "fail"] = "agent_correct"
     solver_failure_action: Literal["skip", "fail"] = "fail"
     stop_active_task_action: Literal["leave", "skip"] = "leave"
     max_replans_after_rejection: int = 1
+    max_agent_corrections: int = 2
     max_transport_retries: int = 2
 
     def __post_init__(self) -> None:
@@ -226,7 +227,7 @@ class AutoStartConfig:
             )
         if not self.is_legacy and self.agent_limit > len(self.solver_providers):
             raise ValueError("agent_limit cannot exceed solver provider count")
-        if self.rejected_action not in {"pause", "replan", "skip", "fail"}:
+        if self.rejected_action not in {"pause", "replan", "agent_correct", "skip", "fail"}:
             raise ValueError("invalid rejected_action")
         if self.solver_failure_action not in {"skip", "fail"}:
             raise ValueError("invalid solver_failure_action")
@@ -235,6 +236,10 @@ class AutoStartConfig:
         if self.max_replans_after_rejection < 0 or self.max_replans_after_rejection > MAX_RETRY_COUNT:
             raise ValueError(
                 f"max_replans_after_rejection must be between 0 and {MAX_RETRY_COUNT}"
+            )
+        if self.max_agent_corrections < 0 or self.max_agent_corrections > MAX_RETRY_COUNT:
+            raise ValueError(
+                f"max_agent_corrections must be between 0 and {MAX_RETRY_COUNT}"
             )
         if self.max_transport_retries < 0 or self.max_transport_retries > MAX_RETRY_COUNT:
             raise ValueError(
@@ -386,6 +391,7 @@ class AutoSession:
     current_attempt_phase: str | None = None
     current_retry_count: int = 0
     current_replan_count: int = 0
+    current_correction_count: int = 0
     current_plan_fingerprint: str | None = None
     current_task: AutoTask | None = None
     consecutive_empty_fetches: int = 0
@@ -440,6 +446,7 @@ class AutoSession:
                 "phase": self.current_attempt_phase,
                 "retry_count": self.current_retry_count,
                 "replan_count": self.current_replan_count,
+                "correction_count": self.current_correction_count,
                 "plan_fingerprint": self.current_plan_fingerprint,
             },
             "history": [entry.to_dict() for entry in self.history],

@@ -454,7 +454,11 @@ class LocalExecutionBackend(ExecutionBackend):
                 command,
                 request,
                 challenge_dir,
-                work_dir,
+                (
+                    agent_work_dir
+                    if provider.project_workspace and agent_work_dir is not None
+                    else work_dir
+                ),
             )
             handle.metadata["stream_format"] = provider.stream_format
             stdin_task, stdout_task, stderr_task = await self.stream(

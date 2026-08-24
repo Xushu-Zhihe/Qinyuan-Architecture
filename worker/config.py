@@ -287,6 +287,9 @@ def _parse_provider(raw: object, index: int) -> ProviderConfig:
     streaming_supported = raw.get("streaming_supported", True)
     if not isinstance(streaming_supported, bool):
         raise ConfigError(f"provider {name!r}.streaming_supported must be a boolean")
+    project_workspace = raw.get("project_workspace", False)
+    if not isinstance(project_workspace, bool):
+        raise ConfigError(f"provider {name!r}.project_workspace must be a boolean")
     if (
         not isinstance(planning_timeout, (int, float))
         or isinstance(planning_timeout, bool)
@@ -354,6 +357,7 @@ def _parse_provider(raw: object, index: int) -> ProviderConfig:
             name,
             command,
         ),
+        project_workspace=project_workspace,
     )
 
 

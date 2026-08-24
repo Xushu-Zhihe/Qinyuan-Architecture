@@ -26,6 +26,7 @@ from autopilot.models import (
 )
 from autopilot.platform import PromptPlatformAdapter, StructuredPlatformAdapter
 from autopilot.platform_models import PlatformResult, StructuredPlatformConfig
+from autopilot.solver_result import SubmissionPlan
 from orchestrator.models import GoalResult
 from orchestrator.projects import ProjectService
 from worker.models import AuditConfig, ProviderConfig
@@ -52,7 +53,8 @@ TASK_TRANSITIONS = {
     "solving": {"solver_achieved", "skipped", "failed", "stopped"},
     "solver_achieved": {"submit_pending", "failed", "stopped"},
     "submit_pending": {"accepted", "rejected", "awaiting_manual_review", "retry_wait", "failed", "stopped"},
-    "rejected": {"replanning", "awaiting_manual_review", "skipped", "failed", "stopped"},
+    "rejected": {"replanning", "agent_correcting", "awaiting_manual_review", "skipped", "failed", "stopped"},
+    "agent_correcting": {"solver_achieved", "skipped", "failed", "stopped"},
     "replanning": {"submit_pending", "skipped", "failed", "stopped"},
     "retry_wait": {"queued", "submit_pending", "failed", "stopped"},
     "waiting": {"queued", "failed", "stopped"},
@@ -151,6 +153,7 @@ class AutoManager:
         self._controller_secret: RuntimeControllerSecret | None = None
         self._platform_secret: RuntimePlatformSecret | None = None
         self._cleanup_failures = 0
+        self._finalized_project_ids: set[str] = set()
         self._task_deadline_monotonic: float | None = None
         self._tool_bootstrap_budget_seconds = _tool_bootstrap_budget_seconds()
         self._skip_requested: asyncio.Event | None = None
@@ -253,6 +256,7 @@ class AutoManager:
                     self._clear_config_platform_secret(config)
                     raise AutoManagerError(str(exc)) from exc
             session_id = f"auto-{uuid4().hex}"
+            self._finalized_project_ids.clear()
             runtime_root = (
                 self.service.registry.data_root / "autopilot" / session_id
             ).resolve()
@@ -311,20 +315,11 @@ class AutoManager:
                 and not session.stop_release_attempted
             )
             session.stop_release_attempted = True
-            project_id = session.current_project_id
-
         if release_requested:
             await self._release_on_stop(session, release_task)
         if cancel_event is not None:
             cancel_event.set()
 
-        if project_id is not None:
-            try:
-                await self.service.stop_project(project_id)
-            except Exception:
-                # The runner will report a stable stopped state; do not leak
-                # provider or platform details from a cleanup failure.
-                pass
         if runner is not None and not runner.done():
             runner.cancel()
         if runner is not None and runner is not asyncio.current_task():
@@ -783,7 +778,12 @@ class AutoManager:
                 self._transition(session, "fetched")
                 self._transition(session, "solving")
                 try:
-                    await self._solve_task(session, task, cancel_event)
+                    await self._solve_task(
+                        session,
+                        task,
+                        cancel_event,
+                        retain_project=True,
+                    )
                 except _SkipTaskRequested:
                     await self._skip_modern(
                         session,
@@ -852,6 +852,69 @@ class AutoManager:
                 submission, attempt_records = await self._submit_modern(
                     session, task, goal_result, plan, cancel_event
                 )
+                correction_skipped = False
+                while (
+                    submission.status == "rejected"
+                    and session.config.rejected_action == "agent_correct"
+                    and session.current_correction_count
+                    < session.config.max_agent_corrections
+                ):
+                    self._transition(session, "rejected", "platform_rejected")
+                    rejection = (
+                        self._scrub_runtime_text(session, submission.message)
+                        or "platform rejected the submitted flag"
+                    )
+                    try:
+                        goal_result = await self._return_rejection_to_solver(
+                            session,
+                            task,
+                            plan,
+                            rejection,
+                            cancel_event,
+                        )
+                    except _SkipTaskRequested:
+                        await self._skip_modern(
+                            session,
+                            task,
+                            self._skip_reason or "user skipped",
+                            attempts=attempt_records,
+                        )
+                        self._skip_reason = None
+                        correction_skipped = True
+                        break
+                    except AutoManagerError as exc:
+                        if session.config.solver_failure_action != "skip":
+                            raise
+                        await self._skip_modern(
+                            session,
+                            task,
+                            self._scrub_runtime_text(session, str(exc))
+                            or "solver failed",
+                            attempts=attempt_records,
+                        )
+                        correction_skipped = True
+                        break
+                    plan = await self._controller.plan_submission(
+                        task,
+                        goal_result,
+                        rejection=rejection,
+                        cancel_event=cancel_event,
+                    )
+                    session.current_plan_fingerprint = plan.fingerprint
+                    self._transition(session, "submit_pending")
+                    submission, added = await self._submit_modern(
+                        session,
+                        task,
+                        goal_result,
+                        plan,
+                        cancel_event,
+                    )
+                    offset = len(attempt_records)
+                    for index, record in enumerate(added, start=1):
+                        record["attempt"] = offset + index
+                    attempt_records.extend(added)
+                if correction_skipped:
+                    continue
                 replans = 0
                 while submission.status == "rejected" and session.config.rejected_action == "replan" and replans < session.config.max_replans_after_rejection:
                     self._transition(session, "rejected", "platform_rejected")
@@ -881,7 +944,7 @@ class AutoManager:
                 finish_after_accept = session.finish_after_current_task_requested
                 if submission.status == "rejected":
                     self._transition(session, "rejected", "platform_rejected")
-                    if session.config.rejected_action == "pause":
+                    if session.config.rejected_action in {"pause", "agent_correct"}:
                         self._pause_for_manual_review(session, submission)
                         manual = await self._manual_review_loop(
                             session,
@@ -917,7 +980,7 @@ class AutoManager:
                     )
                     if reason_code not in TASK_REASON_CODES:
                         reason_code = "platform_submission_failed"
-                    if session.config.rejected_action == "pause":
+                    if session.config.rejected_action in {"pause", "agent_correct"}:
                         self._pause_for_manual_review(session, submission, reason_code)
                         manual = await self._manual_review_loop(
                             session,
@@ -943,6 +1006,7 @@ class AutoManager:
                             )
                         )
                 self._transition(session, "accepted")
+                await self._finalize_task_resources(session, task)
                 finished_at = _timestamp()
                 session.history.append(AutoHistoryEntry(
                     external_id=task.external_id,
@@ -987,6 +1051,11 @@ class AutoManager:
             self._set_session_terminal(session, "failed", "platform_submission_failed")
             session.last_error = f"automatic session failed: {type(exc).__name__}"
         finally:
+            if session.current_task is not None:
+                await self._finalize_task_resources(
+                    session,
+                    session.current_task,
+                )
             await self._dispose_modern_runtime()
             self._clear_runtime_platform_secret(session)
             self._persist_session(session)
@@ -1281,6 +1350,7 @@ class AutoManager:
             "solving",
             "rejected",
             "replanning",
+            "agent_correcting",
             "awaiting_manual_review",
         }:
             self._transition(
@@ -1288,6 +1358,7 @@ class AutoManager:
                 "skipped",
                 self._reason_code_for_error(reason, default="skipped"),
             )
+        await self._finalize_task_resources(session, task)
         self._append_terminal_history(
             session,
             task,
@@ -1477,6 +1548,7 @@ class AutoManager:
         session.current_attempt_phase = None
         session.current_retry_count = 0
         session.current_replan_count = 0
+        session.current_correction_count = 0
         session.current_plan_fingerprint = None
 
     @staticmethod
@@ -1571,11 +1643,12 @@ class AutoManager:
         session: AutoSession,
         task: AutoTask,
         cancel_event: asyncio.Event,
+        *,
+        retain_project: bool = False,
     ) -> None:
         session.current_external_id = task.external_id
         session.current_task_name = task.name
         project_id: str | None = None
-        bootstrap_compensated = False
         try:
             project = self.service.create_project(
                 name=f"Auto {session.completed_tasks + 1}: {task.name}",
@@ -1589,16 +1662,44 @@ class AutoManager:
             )
             project_id = project.id
             session.current_project_id = project.id
-            loop = asyncio.get_running_loop()
-            deadline = loop.time() + session.config.task_timeout_seconds
-            self._task_deadline_monotonic = deadline
-            session.current_task_started_at = _timestamp()
-            session.current_task_deadline_at = datetime.fromtimestamp(
-                datetime.now(timezone.utc).timestamp() + session.config.task_timeout_seconds,
-                timezone.utc,
-            ).isoformat()
             self._persist_session(session)
             await self.service.start_project(project.id)
+            await self._wait_for_solver_project(
+                session,
+                project.id,
+                cancel_event,
+            )
+        finally:
+            try:
+                if project_id is not None and not retain_project:
+                    await self.service.stop_project(project_id)
+            finally:
+                self._task_deadline_monotonic = None
+                session.current_task_started_at = None
+                session.current_task_deadline_at = None
+                cleanup = getattr(self._adapter, "cleanup_task_artifacts", None)
+                if callable(cleanup) and not retain_project:
+                    cleanup(task.external_id)
+
+    async def _wait_for_solver_project(
+        self,
+        session: AutoSession,
+        project_id: str,
+        cancel_event: asyncio.Event,
+    ) -> None:
+        project = self.service.get_handle(project_id)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + session.config.task_timeout_seconds
+        self._task_deadline_monotonic = deadline
+        session.current_task_started_at = _timestamp()
+        session.current_task_deadline_at = datetime.fromtimestamp(
+            datetime.now(timezone.utc).timestamp()
+            + session.config.task_timeout_seconds,
+            timezone.utc,
+        ).isoformat()
+        self._persist_session(session)
+        bootstrap_compensated = False
+        try:
             while True:
                 if cancel_event.is_set():
                     raise asyncio.CancelledError
@@ -1625,28 +1726,123 @@ class AutoManager:
                     )
                     self._persist_session(session)
                     bootstrap_compensated = True
-                snapshot = project.store.snapshot()["project"]
-                status = str(snapshot["status"])
+                status = str(project.store.snapshot()["project"]["status"])
                 if status == "achieved":
                     return
                 if status in {"degraded", "stopped"}:
-                    raise AutoManagerError(f"solver_degraded: solver project ended with {status}")
+                    raise AutoManagerError(
+                        f"solver_degraded: solver project ended with {status}"
+                    )
                 if loop.time() >= (self._task_deadline_monotonic or deadline):
                     raise AutoManagerError("solver_timeout: solver project timed out")
                 await self._sleep_or_cancel(
-                    session.config.poll_interval_seconds, cancel_event
+                    session.config.poll_interval_seconds,
+                    cancel_event,
                 )
         finally:
+            self._task_deadline_monotonic = None
+            session.current_task_started_at = None
+            session.current_task_deadline_at = None
+
+    @staticmethod
+    def _submitted_value_for_feedback(plan: SubmissionPlan) -> str:
+        value: object
+        if plan.content_type == "text":
+            value = plan.text or ""
+        elif plan.content_type == "json":
+            value = plan.json_value
+            if isinstance(value, dict):
+                value = next(
+                    (
+                        value[key]
+                        for key in ("flag", "answer", "value")
+                        if isinstance(value.get(key), str) and value.get(key)
+                    ),
+                    value,
+                )
+        else:
+            value = dict(plan.form_fields)
+        rendered = (
+            value
+            if isinstance(value, str)
+            else json.dumps(value, ensure_ascii=False, sort_keys=True)
+        )
+        return rendered[:1000]
+
+    async def _return_rejection_to_solver(
+        self,
+        session: AutoSession,
+        task: AutoTask,
+        plan: SubmissionPlan,
+        rejection: str,
+        cancel_event: asyncio.Event,
+    ) -> GoalResult:
+        project_id = session.current_project_id
+        if not project_id:
+            raise AutoManagerError("solver project is missing for flag correction")
+        self._transition(session, "agent_correcting", "platform_rejected")
+        session.current_correction_count += 1
+        submitted = self._submitted_value_for_feedback(plan)
+        feedback = (
+            "The platform explicitly rejected the previous flag submission.\n"
+            f"Rejected submission: {submitted}\n"
+            f"Platform feedback: {rejection[:1000]}\n"
+            "Treat this as negative evidence. Re-check the exploit or extraction, "
+            "produce a different verified flag, and do not resubmit the same value."
+        )
+        await self.service.reopen_project(project_id)
+        project = self.service.get_handle(project_id)
+        project.store.add_human_node("hint", feedback)
+        session.current_result_ref = None
+        session.current_result_fact_id = None
+        session.current_result_preview = None
+        session.current_attempt_phase = "solve"
+        session.last_message = (
+            f"rejected flag returned to solver "
+            f"({session.current_correction_count}/{session.config.max_agent_corrections})"
+        )
+        self._persist_session(session)
+        await self.service.start_project(project_id)
+        await self._wait_for_solver_project(
+            session,
+            project_id,
+            cancel_event,
+        )
+        goal_result = self.service.get_goal_result(project_id)
+        if goal_result is None:
+            raise AutoManagerError(
+                "solver project corrected without a Goal result Fact"
+            )
+        self._transition(session, "solver_achieved")
+        session.current_result_ref = goal_result.result_ref
+        session.current_result_fact_id = goal_result.fact.id
+        session.current_result_preview = self._scrub_runtime_text(
+            session,
+            goal_result.fact.content[:500],
+        )
+        return goal_result
+
+    async def _finalize_task_resources(
+        self,
+        session: AutoSession,
+        task: AutoTask,
+    ) -> None:
+        project_id = session.current_project_id
+        if project_id and project_id in self._finalized_project_ids:
+            return
+        if project_id:
             try:
-                if project_id is not None:
-                    await self.service.stop_project(project_id)
-            finally:
-                self._task_deadline_monotonic = None
-                session.current_task_started_at = None
-                session.current_task_deadline_at = None
-                cleanup = getattr(self._adapter, "cleanup_task_artifacts", None)
-                if callable(cleanup):
-                    cleanup(task.external_id)
+                await self.service.stop_project(project_id)
+            except Exception:
+                self._cleanup_failures += 1
+            else:
+                self._finalized_project_ids.add(project_id)
+        cleanup = getattr(self._adapter, "cleanup_task_artifacts", None)
+        if callable(cleanup):
+            try:
+                cleanup(task.external_id)
+            except (OSError, ValueError):
+                self._cleanup_failures += 1
 
     def _project_answer(self, session: AutoSession) -> str:
         if session.current_project_id is None:

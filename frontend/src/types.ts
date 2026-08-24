@@ -400,6 +400,7 @@ export interface StructuredPlatformInput {
     origin_path: string
     origin_endpoint_path: string | null
     goal_format: 'plain' | 'flag_objective'
+    flag_header: string | null
     hints_path: string | null
     hints_item_path: string | null
     attachments_path: string | null
@@ -433,10 +434,11 @@ interface AutopilotStartCommon {
   max_tasks: number
   task_timeout_minutes: number
   poll_interval_seconds: number
-  rejected_action: 'pause' | 'replan' | 'skip' | 'fail'
+  rejected_action: 'pause' | 'replan' | 'agent_correct' | 'skip' | 'fail'
   solver_failure_action: 'skip' | 'fail'
   stop_active_task_action: 'leave' | 'skip'
   max_replans_after_rejection: number
+  max_agent_corrections: number
   max_transport_retries: number
 }
 

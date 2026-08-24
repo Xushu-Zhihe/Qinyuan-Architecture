@@ -1,6 +1,7 @@
 import asyncio
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -17,9 +18,16 @@ from worker.models import ProviderCapabilities, ProviderConfig
 class _FakeStore:
     def __init__(self) -> None:
         self.status = "idle"
+        self.hints: list[str] = []
 
     def snapshot(self) -> dict[str, object]:
         return {"project": {"status": self.status}}
+
+    def add_human_node(self, node_type: str, content: str) -> str:
+        if node_type != "hint":
+            raise ValueError("fake store only accepts hints")
+        self.hints.append(content)
+        return f"hint-{len(self.hints)}"
 
 
 class _FakeService:
@@ -29,30 +37,52 @@ class _FakeService:
         self.handles: dict[str, object] = {}
         self.events: list[str] = []
         self.manual_facts: dict[str, str] = {}
+        self.solve_counts: dict[str, int] = {}
+        self.stop_calls: list[str] = []
+        self.attachment_observations: list[tuple[str, bool]] = []
 
-    def create_project(self, **_kwargs):
+    def create_project(self, **kwargs):
         project_id = f"project-{len(self.handles) + 1}"
-        handle = SimpleNamespace(id=project_id, store=_FakeStore())
+        handle = SimpleNamespace(
+            id=project_id,
+            store=_FakeStore(),
+            challenge_path=kwargs.get("challenge_path"),
+        )
         self.handles[project_id] = handle
         return handle
 
     async def start_project(self, project_id: str):
+        self.solve_counts[project_id] = self.solve_counts.get(project_id, 0) + 1
         self.events.append(f"solve:{project_id}")
+        challenge_path = self.handles[project_id].challenge_path
+        if challenge_path is not None:
+            self.attachment_observations.append(
+                (project_id, (Path(challenge_path) / "evidence.txt").is_file())
+            )
         self.handles[project_id].store.status = "achieved"
 
-    async def stop_project(self, _project_id: str):
+    async def stop_project(self, project_id: str):
+        self.stop_calls.append(project_id)
         return None
+
+    async def reopen_project(self, project_id: str):
+        self.events.append(f"reopen:{project_id}")
+        self.handles[project_id].store.status = "idle"
+        return {"id": project_id}
 
     def get_handle(self, project_id: str):
         return self.handles[project_id]
 
     def get_goal_result(self, project_id: str) -> GoalResult:
-        fact = GoalResultFact(f"{project_id}-fact", f"result for {project_id}")
+        solve_count = self.solve_counts.get(project_id, 1)
+        suffix = "" if solve_count == 1 else f"-{solve_count}"
+        content = "NSSCTF{wrong}" if solve_count == 1 else "NSSCTF{corrected}"
+        fact = GoalResultFact(f"{project_id}-fact{suffix}", content)
         return GoalResult(
             project_id=project_id,
-            goal_version=1,
+            goal_version=solve_count,
             goal_node_id=f"{project_id}-goal",
-            result_ref=f"{project_id}:1:{fact.id}",
+            result_ref=f"{project_id}:{solve_count}:{fact.id}",
             fact=fact,
         )
 
@@ -94,13 +124,21 @@ class _FakeController:
 
 
 class _FakePlatform(StructuredPlatformAdapter):
-    def __init__(self, events: list[str], outcomes: tuple[str, ...] = ()) -> None:
+    def __init__(
+        self,
+        events: list[str],
+        outcomes: tuple[str, ...] = (),
+        *,
+        stage_attachment: bool = False,
+    ) -> None:
         self.events = events
         self.index = 0
         self.submitted: list[str] = []
         self.submitted_facts: list[str] = []
         self.outcomes = list(outcomes)
         self.skip_calls = 0
+        self.stage_attachment = stage_attachment
+        self.cleanup_calls: list[str] = []
 
     async def fetch_task(self):
         tasks = (
@@ -115,14 +153,22 @@ class _FakePlatform(StructuredPlatformAdapter):
         self.events.append(f"fetch:{external_id}")
         from autopilot.models import AutoTask
 
+        task = AutoTask(
+            external_id=external_id,
+            name=name,
+            goal=f"Solve {name}",
+            origin="fixture",
+        )
+        if self.stage_attachment and external_id == "one":
+            attachment = self._runtime_root / "staging" / "evidence.txt"
+            attachment.write_text("attachment survives correction", encoding="utf-8")
+            task = replace(
+                task,
+                raw_metadata={"attachment_paths": ("evidence.txt",)},
+            )
         return PlatformResult(
             "task",
-            task=AutoTask(
-                external_id=external_id,
-                name=name,
-                goal=f"Solve {name}",
-                origin="fixture",
-            ),
+            task=task,
         )
 
     async def submit_result(self, task, _plan, goal_result):
@@ -130,7 +176,10 @@ class _FakePlatform(StructuredPlatformAdapter):
         self.submitted.append(task.external_id)
         self.submitted_facts.append(goal_result.fact.id)
         status = self.outcomes.pop(0) if self.outcomes else "accepted"
-        return PlatformResult(status)
+        return PlatformResult(
+            status,
+            message="platform feedback: invalid flag" if status == "rejected" else None,
+        )
 
     async def skip_task(self, _task, _reason):
         self.skip_calls += 1
@@ -138,6 +187,10 @@ class _FakePlatform(StructuredPlatformAdapter):
 
     async def close(self):
         return None
+
+    def cleanup_task_artifacts(self, external_id: str) -> None:
+        self.cleanup_calls.append(external_id)
+        super().cleanup_task_artifacts(external_id)
 
 
 class AutopilotSection13Tests(unittest.IsolatedAsyncioTestCase):
@@ -290,6 +343,7 @@ class AutopilotSection13Tests(unittest.IsolatedAsyncioTestCase):
                 agent_limit=1,
                 max_tasks=2,
                 poll_interval_seconds=0.001,
+                rejected_action="pause",
             )
             with patch(
                 "autopilot.manager.probe_provider_capabilities",
@@ -352,6 +406,7 @@ class AutopilotSection13Tests(unittest.IsolatedAsyncioTestCase):
                 agent_limit=1,
                 max_tasks=2,
                 poll_interval_seconds=0.001,
+                rejected_action="pause",
             )
             with patch(
                 "autopilot.manager.probe_provider_capabilities",
@@ -380,6 +435,112 @@ class AutopilotSection13Tests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(platform.index, 1)
             self.assertEqual(platform.skip_calls, 0)
             self.assertIn("finished by user", snapshot["session"]["last_message"])
+            await manager.aclose()
+
+    async def test_rejected_flag_reopens_same_project_with_feedback_and_attachments(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            service = _FakeService(Path(directory))
+            controller = _FakeController()
+            platform = _FakePlatform(
+                service.events,
+                ("rejected", "accepted"),
+                stage_attachment=True,
+            )
+            manager = AutoManager(
+                service=service,
+                provider_configs=(self._provider(),),
+                controller_factory=lambda *_args, **_kwargs: controller,
+                platform_adapter_factory=lambda *_args, **_kwargs: platform,
+            )
+            config = AutoStartConfig(
+                mode="structured",
+                controller=ControllerConfig("https://controller.example/v1", "model"),
+                platform=self._platform_config(),
+                solver_providers=("fake",),
+                agent_limit=1,
+                max_tasks=1,
+                poll_interval_seconds=0.001,
+                rejected_action="agent_correct",
+                max_agent_corrections=2,
+            )
+            with patch(
+                "autopilot.manager.probe_provider_capabilities",
+                return_value={"auto_ready": True, "status": "ready"},
+            ):
+                await manager.start(
+                    config,
+                    controller_secret=RuntimeControllerSecret("controller-key"),
+                    platform_secret=RuntimePlatformSecret(token="platform-token"),
+                )
+                await manager._runner
+
+            snapshot = await manager.snapshot()
+            handle = service.handles["project-1"]
+            self.assertEqual(snapshot["session"]["status"], "finished", snapshot)
+            self.assertEqual(service.solve_counts, {"project-1": 2})
+            self.assertEqual(
+                service.events[:5],
+                [
+                    "fetch:one",
+                    "solve:project-1",
+                    "submit:one",
+                    "reopen:project-1",
+                    "solve:project-1",
+                ],
+            )
+            self.assertEqual(service.attachment_observations, [("project-1", True), ("project-1", True)])
+            self.assertEqual(service.stop_calls, ["project-1"])
+            self.assertEqual(platform.cleanup_calls, ["one"])
+            self.assertFalse(Path(handle.challenge_path).exists())
+            self.assertEqual(len(handle.store.hints), 1)
+            self.assertIn("NSSCTF{wrong}", handle.store.hints[0])
+            self.assertIn("platform feedback: invalid flag", handle.store.hints[0])
+            self.assertEqual(snapshot["session"]["history"][0]["attempt_count"], 2)
+            await manager.aclose()
+
+    async def test_agent_correction_limit_falls_back_to_manual_review(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            service = _FakeService(Path(directory))
+            controller = _FakeController()
+            platform = _FakePlatform(service.events, ("rejected", "rejected"))
+            manager = AutoManager(
+                service=service,
+                provider_configs=(self._provider(),),
+                controller_factory=lambda *_args, **_kwargs: controller,
+                platform_adapter_factory=lambda *_args, **_kwargs: platform,
+            )
+            config = AutoStartConfig(
+                mode="structured",
+                controller=ControllerConfig("https://controller.example/v1", "model"),
+                platform=self._platform_config(),
+                solver_providers=("fake",),
+                agent_limit=1,
+                max_tasks=1,
+                poll_interval_seconds=0.001,
+                rejected_action="agent_correct",
+                max_agent_corrections=1,
+            )
+            with patch(
+                "autopilot.manager.probe_provider_capabilities",
+                return_value={"auto_ready": True, "status": "ready"},
+            ):
+                await manager.start(
+                    config,
+                    controller_secret=RuntimeControllerSecret("controller-key"),
+                    platform_secret=RuntimePlatformSecret(token="platform-token"),
+                )
+                paused = await self._wait_for_status(manager, "awaiting_manual_review")
+                self.assertEqual(
+                    paused["session"]["current_attempt"]["correction_count"],
+                    1,
+                )
+                self.assertEqual(service.solve_counts, {"project-1": 2})
+                await manager.stop()
+                await manager._runner
+
+            snapshot = await manager.snapshot()
+            self.assertEqual(snapshot["session"]["status"], "stopped", snapshot)
+            self.assertEqual(service.stop_calls, ["project-1"])
             await manager.aclose()
 
 

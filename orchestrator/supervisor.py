@@ -608,6 +608,11 @@ class ProjectSupervisor:
     def _agent_work_dir(self, provider: ProviderConfig) -> Path:
         return self.project_dir / "agent-workspaces" / provider.name
 
+    def _provider_workspace(self, provider: ProviderConfig) -> Path | None:
+        if provider.project_workspace or provider.agent_lifecycle is not None:
+            return self._agent_work_dir(provider)
+        return None
+
     async def _release_agent_lifecycle(self, provider: ProviderConfig) -> None:
         if (
             provider.agent_lifecycle is None
@@ -706,6 +711,11 @@ class ProjectSupervisor:
                 kwargs["max_log_bytes"] = self.audit_config.max_log_bytes
             if self._execute_accepts_origin_host:
                 kwargs["origin_host"] = self._origin_host()
+            workspace = self._provider_workspace(provider)
+            if workspace is not None:
+                workspace.mkdir(parents=True, exist_ok=True)
+                if self._execute_accepts_agent_work_dir:
+                    kwargs["agent_work_dir"] = workspace
             if provider.agent_lifecycle is not None:
                 if not (
                     self._execute_accepts_agent_owner_id
@@ -714,10 +724,7 @@ class ProjectSupervisor:
                     raise RuntimeError(
                         "execution backend does not accept Agent lifecycle arguments"
                     )
-                agent_work_dir = self._agent_work_dir(provider)
-                agent_work_dir.mkdir(parents=True, exist_ok=True)
                 kwargs["agent_owner_id"] = self._agent_owner_id(provider)
-                kwargs["agent_work_dir"] = agent_work_dir
             return await self.execute(
                 provider,
                 request,
@@ -955,7 +962,11 @@ class ProjectSupervisor:
                     provider,
                     timeout_seconds=provider.planning_timeout_seconds,
                 ),
-                render_intent_request(snapshot, self.challenge_dir),
+                render_intent_request(
+                    snapshot,
+                    self.challenge_dir,
+                    self._provider_workspace(provider),
+                ),
                 planning_dir,
                 kind="planning",
                 on_chunk=planning_logs.add,
@@ -1343,6 +1354,7 @@ class ProjectSupervisor:
                     },
                     self.challenge_dir,
                     self._bounded_timeout_output(timed_out.output),
+                    artifact_dir=self._provider_workspace(provider),
                 ),
                 execution_dir / "timeout-summary",
                 kind="execution",
@@ -1433,6 +1445,7 @@ class ProjectSupervisor:
                     self.challenge_dir,
                     protocol_error=protocol_error,
                     rejected_result_line=rejected_result_line,
+                    artifact_dir=self._provider_workspace(provider),
                 ),
                 execution_dir,
                 kind="execution",
@@ -1625,7 +1638,6 @@ class ProjectSupervisor:
             self.fact_compactor.wake()
         project_status = str(self.store.snapshot()["project"]["status"])
         if self.cancel_event.is_set() and project_status in {
-            "achieved",
             "degraded",
             "stopped",
         }:
@@ -1871,7 +1883,7 @@ class ProjectSupervisor:
         if self.fact_compactor is not None:
             await self.fact_compactor.wait_until_idle(timeout=timeout)
 
-    async def stop(self) -> None:
+    async def stop(self, *, release_lifecycle: bool = True) -> None:
         self.cancel_event.set()
         self.wake_event.set()
         if self.tasks:
@@ -1885,7 +1897,8 @@ class ProjectSupervisor:
             await self.fact_compactor.stop()
         if self.store.snapshot()["project"]["status"] != "achieved":
             await self._set_project_status("stopped")
-        await self._release_agent_lifecycles()
-        cleanup_task = self._lifecycle_cleanup_task
-        if cleanup_task is not None and cleanup_task is not asyncio.current_task():
-            await asyncio.gather(cleanup_task, return_exceptions=True)
+        if release_lifecycle:
+            await self._release_agent_lifecycles()
+            cleanup_task = self._lifecycle_cleanup_task
+            if cleanup_task is not None and cleanup_task is not asyncio.current_task():
+                await asyncio.gather(cleanup_task, return_exceptions=True)

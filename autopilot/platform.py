@@ -856,10 +856,16 @@ class StructuredPlatformAdapter:
         if endpoint_origin is not None:
             origin = endpoint_origin
         if mapping.goal_format == "flag_objective":
+            flag_header = (
+                f"\nFlag 头说明：{mapping.flag_header}"
+                if mapping.flag_header
+                else ""
+            )
             goal = (
                 f"题目：{task_name}\n"
                 f"题面：{goal}\n"
                 "目标：获取该题目的 flag 并作为最终答案提交。"
+                + flag_header
             )
         return AutoTask(
             external_id=text(

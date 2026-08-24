@@ -12,6 +12,7 @@ from worker.config import (
     load_fact_compaction_config,
     load_provider_configs,
 )
+from worker.capabilities import static_capability_snapshot
 
 
 DEFAULT_PROVIDERS = Path(__file__).resolve().parents[1] / "worker" / "providers.json"
@@ -469,6 +470,14 @@ class ProviderConfigTests(unittest.TestCase):
         self.assertIn(
             "--dangerously-bypass-approvals-and-sandbox",
             codex.command,
+        )
+        self.assertIn("{agent_work_dir}", codex.command)
+        self.assertTrue(all(providers[name].project_workspace for name in ("codex", "claude", "kimi")))
+        self.assertTrue(
+            all(
+                static_capability_snapshot(providers[name])["auto_ready"]
+                for name in providers
+            )
         )
         self.assertNotIn("workspace-write", codex.command)
         self.assertFalse(

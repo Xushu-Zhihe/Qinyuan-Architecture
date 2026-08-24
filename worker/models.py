@@ -73,6 +73,7 @@ class ProviderConfig:
     capability_probe: CapabilityProbeConfig | None = None
     protocol_arguments: tuple[str, ...] = ()
     agent_lifecycle: AgentLifecycleConfig | None = None
+    project_workspace: bool = False
 
 
 _FACT_COMPACTION_MODEL_PATTERN = re.compile(

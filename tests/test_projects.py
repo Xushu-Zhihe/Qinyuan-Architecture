@@ -5,6 +5,8 @@ import time
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 from orchestrator.projects import (
     ProjectConflictError,
@@ -221,6 +223,35 @@ class ProjectServiceDeletionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(challenge_file.read_text(encoding="utf-8"), "keep")
         with self.assertRaises(KeyError):
             self.service.registry.get(project_id)
+
+    async def test_stop_cleans_project_provider_workspaces_after_project_ends(self) -> None:
+        handle = self.create_project()
+        workspace = handle.record.path / "agent-workspaces" / "claude"
+        workspace.mkdir(parents=True)
+        artifact = workspace / "download.bin"
+        artifact.write_bytes(b"artifact")
+        self.assertTrue(artifact.is_file())
+
+        await self.service.stop_project(handle.id)
+
+        self.assertFalse((handle.record.path / "agent-workspaces").exists())
+        self.assertEqual(self.service.registry.get(handle.id).status, "stopped")
+
+    async def test_reopen_stops_old_supervisor_without_releasing_lifecycle(self) -> None:
+        handle = self.create_project()
+        handle.store.set_project_status("achieved", "NSSCTF{wrong}")
+        supervisor = SimpleNamespace(
+            tasks={},
+            manual_tasks={},
+            stop=AsyncMock(),
+        )
+        self.service._supervisors[handle.id] = supervisor
+
+        reopened = await self.service.reopen_project(handle.id)
+
+        supervisor.stop.assert_awaited_once_with(release_lifecycle=False)
+        self.assertNotIn(handle.id, self.service._supervisors)
+        self.assertEqual(reopened["status"], "idle")
 
     async def test_registry_failure_rolls_directory_and_handle_back(self) -> None:
         handle = self.create_project()

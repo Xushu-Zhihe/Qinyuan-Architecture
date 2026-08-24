@@ -192,9 +192,11 @@ Vite 默认地址为 `http://127.0.0.1:5173`，并将 `/api` 和 `/ws` 代理到
 - Prompt：输入平台说明 prompt，由独立的 Direct LLM Controller 使用当前阶段允许的 HTTP 工具取题、提交和放弃。
 - 结构化 API：填写平台 URL/token、current/fetch/info/submit/skip/health endpoint、字段映射、游标、结果判断、超时与重试；取题和响应判定由 `StructuredPlatformAdapter` 确定性执行。可选的 current endpoint 由“查看当前题目”按钮只读调用，不领取下一题、不创建 solver 项目，也不修改平台 lease。配置完成后可以保存为具名模板并在后续会话直接套用；模板持久化 endpoint、字段映射和结果判断，但始终排除平台 token。
 
-两种模式都单独填写 controller LLM 的 API key、base URL、model 和高级选项；controller 不占用 solver provider。solver provider 仍由现有 `ProjectService`/`Supervisor` 创建独立黑板项目。solver 完成后必须产生协议 v2 的 Goal Result Fact，controller 根据完整 Fact 和有限支持 Fact 生成 `SubmissionPlan`，支持 text、JSON 和 form 结果；平台明确返回 `accepted` 后才进入下一题。业务 `rejected` 只会按 `replan`、`skip` 或 `fail` 处理，429/5xx/网络错误只重试同一个 plan。
+两种模式都单独填写 controller LLM 的 API key、base URL、model 和高级选项；controller 不占用 solver provider。solver provider 仍由现有 `ProjectService`/`Supervisor` 创建独立黑板项目。solver 完成后必须产生协议 v2 的 Goal Result Fact，controller 根据完整 Fact 和有限支持 Fact 生成 `SubmissionPlan`，支持 text、JSON 和 form 结果；平台明确返回 `accepted` 后才进入下一题。结构化字段映射可以配置 `Flag 头说明`，它会作为题目 Goal 的正式说明传给 solver，避免只给出模糊的“提交 flag”目标。
 
-协议 v2 使用 `goal_result_ref`、completion claim 和 `GoalResult`，不再把 `answer_key`/`final_answer` 当作新自动模式的结果入口。qinyuan-agent 与 q-subagent 通过 required Skill、stdout 前 validator gate 和 capability probe 提供 v2 provider 能力；未满足 v2 能力的 provider 不会被新自动模式选中。旧 provider-controller payload 保留为兼容入口，但新 UI 不使用它。
+平台返回业务 `rejected` 时，默认动作 `agent_correct` 会把被拒绝的 flag 和平台反馈写回同一个 solver project 的 Hint，重新打开并继续运行该项目；纠正期间项目、黑板和附件均保留。达到 `max_agent_corrections` 上限后才暂停等待人工处理，也可以选择兼容的 `pause`、`replan`、`skip` 或 `fail` 动作。429/5xx/网络错误只重试同一个 plan，不会把传输故障误判为 flag 错误。
+
+协议 v2 使用 `goal_result_ref`、completion claim 和 `GoalResult`，不再把 `answer_key`/`final_answer` 当作新自动模式的结果入口。五个 solver provider（`qinyuan-agent`、`q-subagent`、Codex、Claude、Kimi）都可以进入全自动模式：前两者通过 required Skill、stdout 前 validator gate 和 capability probe 提供 v2 能力；后三者通过内置 protocol-v2 capability 声明和 inline prompt 适配。未满足 v2 能力的 provider 不会被新自动模式选中。旧 provider-controller payload 保留为兼容入口，但新 UI 不使用它。
 
 controller key、平台 token 和完整 prompt 只存在于当前 React state/运行时 session；启动后输入立即清空，snapshot/history/SQLite 不包含凭据。服务重启不会恢复自动 session 或平台 lease。首版不支持 controller streaming、并行题目或结果 artifact/文件上传。
 
@@ -255,7 +257,7 @@ Codex 使用纯文本流式适配器，Kimi 默认仅在任务完成后输出。
         "exec",
         "--dangerously-bypass-approvals-and-sandbox",
         "-C",
-        "{work_dir}",
+        "{agent_work_dir}",
         "-"
       ],
       "health_check": {
@@ -331,6 +333,15 @@ terminal cleanup path. Release stdout/stderr and status are recorded under the
 project's `agent-lifecycle/` directory and in an
 `agent.lifecycle_release_finished` event.
 
+对于不使用 qinyuan-agent sandbox 的 provider（当前为 Codex、Claude、Kimi），将
+`project_workspace: true` 写入 provider 配置即可启用项目级附件目录。系统会为每个
+`project_id + provider` 创建稳定的 `agent-workspaces/<provider>/` 目录，并在每次短期
+execution 中把该目录作为 provider 的工作目录；provider 下载的题目文件和生成的证据、
+中间结果都必须放在该目录。单次 execution 的 stdout/stderr 仍保存在自己的日志目录，
+不会覆盖附件。纠正 flag 时同一目录会继续复用，只有项目进入终态并执行
+`ProjectService.stop_project()` 才清理整个 `agent-workspaces/`，项目被删除时也随项目
+目录一起移入回收区。
+
 字段说明：
 
 | 字段 | 说明 |
@@ -356,8 +367,9 @@ endpoint 释放租约并结束本题。默认
 `remaining_seconds` 或 `expire_at` 属于平台租约，本地超时配置不能延长平台租约。
 
 `{config_dir}` 会在加载 provider 配置时解析为该 JSON 文件所在目录，可用于声明不受
-进程工作目录影响的仓库相对命令路径。`{work_dir}`、`{challenge_dir}`、
-`{origin_host}`、`{agent_owner_id}` 和 `{agent_work_dir}` 保留到具体调用时再解析。
+进程工作目录影响的仓库相对命令路径。`{work_dir}` 表示单次 execution 日志目录，
+`{agent_work_dir}` 表示项目级稳定附件目录；`{challenge_dir}`、`{origin_host}` 和
+`{agent_owner_id}` 保留到具体调用时再解析。
 prompt 通过 stdin 发送，CLI 认证由各 provider 自己管理，平台不读取或保存 API Key。
 
 ### 执行配额与公平调度

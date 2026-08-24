@@ -395,10 +395,12 @@ def _result_contract(
 def render_intent_request(
     snapshot: dict[str, object],
     challenge_dir: str | Path | None,
+    artifact_dir: str | Path | None = None,
 ) -> str:
     return (
         "Choose the next useful action from the blackboard.\n"
         f"Challenge directory (read-only): {_challenge_text(challenge_dir)}\n"
+        f"Provider artifact directory (writable during execution): {_challenge_text(artifact_dir)}\n"
         "When the active Origin node is a URL or host:port, it is the "
         "authoritative target endpoint. Use that endpoint; do not infer or "
         "replace it.\n"
@@ -426,6 +428,7 @@ def render_execution_request(
     challenge_dir: str | Path | None,
     protocol_error: str | None = None,
     rejected_result_line: str | None = None,
+    artifact_dir: str | Path | None = None,
 ) -> str:
     correction = ""
     if protocol_error is not None:
@@ -451,6 +454,9 @@ def render_execution_request(
     return (
         "Execute the assigned blackboard intent.\n"
         f"Challenge directory (read-only): {_challenge_text(challenge_dir)}\n"
+        f"Provider artifact directory (writable): {_challenge_text(artifact_dir)}\n"
+        "Store every downloaded file and generated artifact in the provider "
+        "artifact directory. Do not write into the challenge directory.\n"
         "When the active Origin node is a URL or host:port, it is the "
         "authoritative target endpoint. Use that endpoint together with any "
         "files in the challenge directory.\n"
@@ -479,6 +485,8 @@ def render_timeout_summary_request(
     intent: dict[str, object],
     challenge_dir: str | Path | None,
     partial_output: str,
+    *,
+    artifact_dir: str | Path | None = None,
 ) -> str:
     """Ask a fresh provider process to preserve facts from a timed-out run.
 
@@ -497,6 +505,7 @@ def render_timeout_summary_request(
         "Finish promptly with exactly one valid BLACKBOARD_RESULT line for "
         "the assigned Intent.\n"
         f"Challenge directory (read-only): {_challenge_text(challenge_dir)}\n"
+        f"Provider artifact directory: {_challenge_text(artifact_dir)}\n"
         + _result_contract(intent, snapshot)
         + "\nAssigned intent:\n"
         + json.dumps(intent, ensure_ascii=False, indent=2)

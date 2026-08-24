@@ -63,6 +63,41 @@ class ExecutorTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(Path(result.stdout_path).is_file())
             self.assertTrue(Path(result.stderr_path).is_file())
 
+    async def test_project_workspace_provider_runs_from_stable_artifact_directory(self) -> None:
+        code = (
+            "from pathlib import Path;"
+            "print(Path.cwd());"
+            "Path('artifact.txt').write_text('generated', encoding='utf-8')"
+        )
+        provider = ProviderConfig(
+            name="codex",
+            enabled=True,
+            priority=10,
+            command=(sys.executable, "-c", code),
+            timeout_seconds=5,
+            project_workspace=True,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            work_dir = root / "execution"
+            artifact_dir = root / "agent-workspaces" / provider.name
+            artifact_dir.mkdir(parents=True)
+            result = await execute_provider(
+                provider,
+                "task",
+                None,
+                work_dir,
+                agent_work_dir=artifact_dir,
+            )
+
+            self.assertEqual(result.status, "success")
+            self.assertIn(str(artifact_dir.resolve()), result.output)
+            self.assertEqual(
+                (artifact_dir / "artifact.txt").read_text(encoding="utf-8"),
+                "generated",
+            )
+            self.assertFalse((work_dir / "artifact.txt").exists())
+
     async def test_records_non_zero_exit(self) -> None:
         provider = ProviderConfig(
             name="failed",

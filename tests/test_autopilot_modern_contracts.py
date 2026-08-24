@@ -198,6 +198,7 @@ class ModernContractTests(unittest.IsolatedAsyncioTestCase):
                     "题面：Analyze the supplied challenge service endpoint and "
                     "recover the requested result.",
                     "目标：获取该题目的 flag 并作为最终答案提交。",
+                    "Result Fact 必须只写一个最终答案，不要添加解释、Markdown 或多个候选值。",
                 ],
             )
             self.assertEqual(events, ["fetch", "sleep:15", "detail"])
@@ -653,6 +654,7 @@ class ModernContractTests(unittest.IsolatedAsyncioTestCase):
                     "\u9898\u9762\uff1a\u5bc6\u7801\u662f\u591a\u5c11\u5440",
                     "\u76ee\u6807\uff1a\u83b7\u53d6\u8be5\u9898\u76ee\u7684 flag "
                     "\u5e76\u4f5c\u4e3a\u6700\u7ec8\u7b54\u6848\u63d0\u4ea4\u3002",
+                    "Result Fact \u5fc5\u987b\u53ea\u5199\u4e00\u4e2a\u6700\u7ec8\u7b54\u6848\uff0c\u4e0d\u8981\u6dfb\u52a0\u89e3\u91ca\u3001Markdown \u6216\u591a\u4e2a\u5019\u9009\u503c\u3002",
                 ],
             )
             self.assertEqual(result.task.origin, "http://target.example:18080")

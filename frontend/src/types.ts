@@ -401,6 +401,8 @@ export interface StructuredPlatformInput {
     origin_endpoint_path: string | null
     goal_format: 'plain' | 'flag_objective'
     flag_header: string | null
+    flag_pattern: string | null
+    flag_pattern_id: string | null
     hints_path: string | null
     hints_item_path: string | null
     attachments_path: string | null

@@ -174,6 +174,7 @@ class GoalResult:
     supporting_facts: tuple[GoalResultFact, ...] = ()
     supporting_providers: tuple[str, ...] = ()
     completion_threshold: int = 1
+    result_value: str | None = None
 
     def __post_init__(self) -> None:
         if not self.project_id.strip() or not self.goal_node_id.strip():
@@ -192,3 +193,5 @@ class GoalResult:
             raise ValueError("supporting Fact content exceeds the domain limit")
         if self.completion_threshold < 1:
             raise ValueError("completion_threshold must be positive")
+        if self.result_value is not None and not self.result_value.strip():
+            raise ValueError("GoalResult result_value must be non-empty when provided")

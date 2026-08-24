@@ -19,6 +19,9 @@ class StoreTestCase(unittest.TestCase):
         goal: str = "Recover the flag",
         origin: str = "Challenge statement",
         hints: tuple[str, ...] = (),
+        goal_format: str = "plain",
+        flag_pattern: str | None = None,
+        flag_pattern_id: str | None = None,
     ) -> BlackboardStore:
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
@@ -28,6 +31,9 @@ class StoreTestCase(unittest.TestCase):
             goal=goal,
             origin=origin,
             hints=hints,
+            goal_format=goal_format,
+            flag_pattern=flag_pattern,
+            flag_pattern_id=flag_pattern_id,
         )
         self.addCleanup(store.close)
         return store
@@ -45,6 +51,23 @@ class StoreTestCase(unittest.TestCase):
                 fact_id,
                 store.node_id("goal"),
                 "Verify the key source",
+            ),
+        )
+        return store, intent
+
+    def make_flag_store_and_intent(self):
+        store = self.make_store(
+            goal_format="flag_objective",
+            flag_pattern=r"NSSCTF\{[^{}\r\n]{1,128}\}",
+            flag_pattern_id="nssctf-v1",
+        )
+        fact_id = store.add_human_node("fact", "Investigate the challenge")
+        intent = store.create_or_merge_intent(
+            "codex",
+            IntentProposal(
+                fact_id,
+                store.node_id("goal"),
+                "Verify the recovered flag",
             ),
         )
         return store, intent
@@ -751,6 +774,67 @@ class BlackboardExecutionTests(StoreTestCase):
         self.assertEqual(result.fact.id, fact_id)
         self.assertEqual(result.supporting_providers, ("claude", "codex"))
         self.assertFalse(store.goal_result_conflict(available_providers=2))
+
+    def test_flag_consensus_uses_value_fingerprint_across_different_facts(self) -> None:
+        store, intent = self.make_flag_store_and_intent()
+
+        first_id = self.finish_v2_result(
+            store,
+            intent,
+            "codex",
+            "Verified from the service: NSSCTF{same-value}",
+        )
+        self.assertIsNone(store.goal_result(available_providers=2))
+        second_id = self.finish_v2_result(
+            store,
+            intent,
+            "claude",
+            "The final answer is NSSCTF{same-value}",
+        )
+
+        result = store.goal_result(available_providers=2)
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result.result_value, "NSSCTF{same-value}")
+        self.assertEqual(result.supporting_providers, ("claude", "codex"))
+        self.assertIn(second_id, {result.fact.id, *(fact.id for fact in result.supporting_facts)})
+        self.assertIn(first_id, {result.fact.id, *(fact.id for fact in result.supporting_facts)})
+
+    def test_flag_result_rejects_multiple_candidates(self) -> None:
+        store, intent = self.make_flag_store_and_intent()
+
+        with self.assertRaisesRegex(ValueError, "multiple values"):
+            self.finish_v2_result(
+                store,
+                intent,
+                "codex",
+                "NSSCTF{first} and NSSCTF{second}",
+            )
+
+    def test_flag_result_without_pattern_requires_one_line_scalar(self) -> None:
+        store = self.make_store(goal_format="flag_objective")
+        fact_id = store.add_human_node("fact", "Investigate the challenge")
+        intent = store.create_or_merge_intent(
+            "codex",
+            IntentProposal(fact_id, store.node_id("goal"), "Return the answer"),
+        )
+
+        self.finish_v2_result(store, intent, "codex", "token-value")
+        result = store.goal_result(available_providers=1)
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result.result_value, "token-value")
+
+    def test_flag_result_without_pattern_rejects_multiline_fact(self) -> None:
+        store = self.make_store(goal_format="flag_objective")
+        fact_id = store.add_human_node("fact", "Investigate the challenge")
+        intent = store.create_or_merge_intent(
+            "codex",
+            IntentProposal(fact_id, store.node_id("goal"), "Return the answer"),
+        )
+
+        with self.assertRaisesRegex(ValueError, "one line"):
+            self.finish_v2_result(store, intent, "codex", "token-value\nwith explanation")
 
     def test_submission_result_projects_only_an_active_selected_fact(self) -> None:
         store, fact_id = self.make_store_with_fact()

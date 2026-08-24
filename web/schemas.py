@@ -121,6 +121,8 @@ class FieldMappingPayload(BaseModel):
     origin_endpoint_path: str | None = None
     goal_format: Literal["plain", "flag_objective"] = "plain"
     flag_header: str | None = Field(default=None, max_length=200)
+    flag_pattern: str | None = Field(default=None, max_length=500)
+    flag_pattern_id: str | None = Field(default=None, max_length=100)
     hints_path: str | None = "hints"
     hints_item_path: str | None = None
     attachments_path: str | None = None

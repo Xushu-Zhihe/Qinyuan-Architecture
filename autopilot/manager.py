@@ -66,6 +66,7 @@ TASK_REASON_CODES = frozenset(
         "platform_wait",
         "platform_transport",
         "platform_rejected",
+        "duplicate_rejected_flag",
         "platform_retry_exhausted",
         "platform_submission_failed",
         "solver_timeout",
@@ -1199,6 +1200,36 @@ class AutoManager:
         cancel_event,
     ) -> tuple[PlatformResult, list[dict[str, object]]]:
         attempts: list[dict[str, object]] = []
+        result_value = getattr(goal_result, "result_value", None)
+        if (
+            isinstance(result_value, str)
+            and result_value
+            and result_value in getattr(session, "current_rejected_result_values", ())
+        ):
+            return (
+                PlatformResult(
+                    "rejected",
+                    message="the same deterministic flag value was already rejected",
+                    metadata={"reason_code": "duplicate_rejected_flag"},
+                ),
+                [
+                    {
+                        "attempt": 1,
+                        "phase": "deduplication",
+                        "status": "rejected",
+                        "external_id": task.external_id,
+                        "project_id": session.current_project_id,
+                        "goal_version": goal_result.goal_version,
+                        "fact_id": goal_result.fact.id,
+                        "result_value": result_value,
+                        "plan_fingerprint": plan.fingerprint,
+                        "result_ref": goal_result.result_ref,
+                        "source_fact_ids": list(plan.source_fact_ids),
+                        "content_type": plan.content_type,
+                        "reason_code": "duplicate_rejected_flag",
+                    }
+                ],
+            )
         result: PlatformResult | None = None
         while len(attempts) <= session.config.max_transport_retries:
             attempt_number = len(attempts) + 1
@@ -1216,6 +1247,7 @@ class AutoManager:
                     "project_id": session.current_project_id,
                     "goal_version": goal_result.goal_version,
                     "fact_id": goal_result.fact.id,
+                    "result_value": result_value,
                     "plan_fingerprint": plan.fingerprint,
                     "result_ref": goal_result.result_ref,
                     "source_fact_ids": list(plan.source_fact_ids),
@@ -1230,6 +1262,11 @@ class AutoManager:
                 }
             )
             if result.status != "retryable_error":
+                if result.status == "rejected" and isinstance(result_value, str) and result_value:
+                    session.current_rejected_result_value = result_value
+                    rejected_values = getattr(session, "current_rejected_result_values", None)
+                    if rejected_values is not None and result_value not in rejected_values:
+                        rejected_values.append(result_value)
                 return result, attempts
             if len(attempts) > session.config.max_transport_retries:
                 break
@@ -1550,6 +1587,8 @@ class AutoManager:
         session.current_replan_count = 0
         session.current_correction_count = 0
         session.current_plan_fingerprint = None
+        session.current_rejected_result_value = None
+        session.current_rejected_result_values.clear()
 
     @staticmethod
     def _clear_runtime_platform_secret(session: AutoSession) -> None:
@@ -1650,6 +1689,11 @@ class AutoManager:
         session.current_task_name = task.name
         project_id: str | None = None
         try:
+            mapping = (
+                session.config.platform.mapping
+                if isinstance(session.config.platform, StructuredPlatformConfig)
+                else None
+            )
             project = self.service.create_project(
                 name=f"Auto {session.completed_tasks + 1}: {task.name}",
                 goal=task.goal,
@@ -1659,6 +1703,9 @@ class AutoManager:
                 provider_names=session.config.solver_providers,
                 agent_limit=session.config.agent_limit,
                 challenge_path=task.challenge_path,
+                goal_format=mapping.goal_format if mapping is not None else "plain",
+                flag_pattern=mapping.flag_pattern if mapping is not None else None,
+                flag_pattern_id=mapping.flag_pattern_id if mapping is not None else None,
             )
             project_id = project.id
             session.current_project_id = project.id

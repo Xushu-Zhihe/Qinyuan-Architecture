@@ -253,6 +253,7 @@ class DirectLLMController:
             "task": {"external_id": task.external_id, "name": task.name},
             "goal_result": {
                 "result_ref": goal_result.result_ref,
+                "result_value": getattr(goal_result, "result_value", None),
                 "fact": {"id": goal_result.fact.id, "content": goal_result.fact.content},
                 "supporting_facts": [{"id": fact.id, "content": fact.content} for fact in goal_result.supporting_facts],
             },

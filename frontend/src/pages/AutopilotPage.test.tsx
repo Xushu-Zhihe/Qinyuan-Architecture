@@ -38,7 +38,7 @@ const defaultTemplatePlatform: StructuredPlatformInput = {
   task_info: null,
   submit_result: templateEndpoint('POST', '/attempt/{{external_id}}/submit', { flag: '{{submission.value}}' }),
   skip_task: null,
-  mapping: { task_list_path: null, external_id_path: 'id', name_path: 'name', goal_path: 'goal', origin_path: 'origin', origin_endpoint_path: null, goal_format: 'plain', flag_header: null, hints_path: 'hints', hints_item_path: null, attachments_path: null, cursor_path: null, lease_id_path: null },
+  mapping: { task_list_path: null, external_id_path: 'id', name_path: 'name', goal_path: 'goal', origin_path: 'origin', origin_endpoint_path: null, goal_format: 'plain', flag_header: null, flag_pattern: null, flag_pattern_id: null, hints_path: 'hints', hints_item_path: null, attachments_path: null, cursor_path: null, lease_id_path: null },
   outcomes: { fetch: { finished: null, empty: null }, submit: { accepted: null, rejected: null, retryable: { status_codes: [429, 500, 502, 503, 504] } }, skip: { succeeded: null } },
   health_check: null,
   task_info_mode: 'always',

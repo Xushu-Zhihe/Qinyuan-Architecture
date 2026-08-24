@@ -861,11 +861,17 @@ class StructuredPlatformAdapter:
                 if mapping.flag_header
                 else ""
             )
+            result_instruction = (
+                "\nResult Fact 必须只写一个最终答案，不要添加解释、Markdown 或多个候选值。"
+                if not mapping.flag_pattern
+                else "\nResult Fact 中必须包含一个可验证的最终 Flag。"
+            )
             goal = (
                 f"题目：{task_name}\n"
                 f"题面：{goal}\n"
                 "目标：获取该题目的 flag 并作为最终答案提交。"
                 + flag_header
+                + result_instruction
             )
         return AutoTask(
             external_id=text(
@@ -925,9 +931,11 @@ class StructuredPlatformAdapter:
                 message=f"task is already terminal: {terminal}",
             )
         try:
-            value = self._submission_value(
-                plan,
-                scalar_answer=self.config.mapping.goal_format == "flag_objective",
+            scalar_answer = self.config.mapping.goal_format == "flag_objective"
+            value = (
+                goal_result.result_value
+                if scalar_answer and getattr(goal_result, "result_value", None)
+                else self._submission_value(plan, scalar_answer=scalar_answer)
             )
         except ValueError as exc:
             return PlatformResult("fatal_error", message=str(exc))

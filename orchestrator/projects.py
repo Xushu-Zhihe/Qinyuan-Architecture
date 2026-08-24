@@ -403,6 +403,9 @@ class ProjectService:
         provider_names: tuple[str, ...],
         agent_limit: int,
         challenge_path: Path | None,
+        goal_format: str = "plain",
+        flag_pattern: str | None = None,
+        flag_pattern_id: str | None = None,
     ) -> ProjectHandle:
         with self._lock:
             unknown = set(provider_names) - set(self.provider_configs)
@@ -421,6 +424,9 @@ class ProjectService:
                 goal,
                 origin,
                 hints,
+                goal_format=goal_format,
+                flag_pattern=flag_pattern,
+                flag_pattern_id=flag_pattern_id,
             )
             handle = ProjectHandle(
                 record,

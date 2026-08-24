@@ -393,6 +393,8 @@ class AutoSession:
     current_replan_count: int = 0
     current_correction_count: int = 0
     current_plan_fingerprint: str | None = None
+    current_rejected_result_value: str | None = None
+    current_rejected_result_values: list[str] = field(default_factory=list)
     current_task: AutoTask | None = None
     consecutive_empty_fetches: int = 0
     consecutive_fetch_errors: int = 0
@@ -448,6 +450,8 @@ class AutoSession:
                 "replan_count": self.current_replan_count,
                 "correction_count": self.current_correction_count,
                 "plan_fingerprint": self.current_plan_fingerprint,
+                "rejected_result_value": self.current_rejected_result_value,
+                "rejected_result_values": list(self.current_rejected_result_values),
             },
             "history": [entry.to_dict() for entry in self.history],
         }

@@ -76,7 +76,13 @@ class _FakeService:
     def get_goal_result(self, project_id: str) -> GoalResult:
         solve_count = self.solve_counts.get(project_id, 1)
         suffix = "" if solve_count == 1 else f"-{solve_count}"
-        content = "NSSCTF{wrong}" if solve_count == 1 else "NSSCTF{corrected}"
+        content = (
+            "NSSCTF{wrong}"
+            if solve_count == 1
+            else "NSSCTF{corrected}"
+            if solve_count == 2
+            else "NSSCTF{wrong}"
+        )
         fact = GoalResultFact(f"{project_id}-fact{suffix}", content)
         return GoalResult(
             project_id=project_id,
@@ -84,6 +90,7 @@ class _FakeService:
             goal_node_id=f"{project_id}-goal",
             result_ref=f"{project_id}:{solve_count}:{fact.id}",
             fact=fact,
+            result_value=content,
         )
 
     def get_submission_result(self, project_id: str, fact_id: str) -> GoalResult:
@@ -496,6 +503,47 @@ class AutopilotSection13Tests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("NSSCTF{wrong}", handle.store.hints[0])
             self.assertIn("platform feedback: invalid flag", handle.store.hints[0])
             self.assertEqual(snapshot["session"]["history"][0]["attempt_count"], 2)
+            await manager.aclose()
+
+    async def test_rejected_flag_value_is_not_resubmitted_after_agent_cycles_back(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            service = _FakeService(Path(directory))
+            controller = _FakeController()
+            platform = _FakePlatform(service.events, ("rejected", "rejected"))
+            manager = AutoManager(
+                service=service,
+                provider_configs=(self._provider(),),
+                controller_factory=lambda *_args, **_kwargs: controller,
+                platform_adapter_factory=lambda *_args, **_kwargs: platform,
+            )
+            config = AutoStartConfig(
+                mode="structured",
+                controller=ControllerConfig("https://controller.example/v1", "model"),
+                platform=self._platform_config(),
+                solver_providers=("fake",),
+                agent_limit=1,
+                max_tasks=1,
+                poll_interval_seconds=0.001,
+                rejected_action="agent_correct",
+                max_agent_corrections=2,
+            )
+            with patch(
+                "autopilot.manager.probe_provider_capabilities",
+                return_value={"auto_ready": True, "status": "ready"},
+            ):
+                await manager.start(
+                    config,
+                    controller_secret=RuntimeControllerSecret("controller-key"),
+                    platform_secret=RuntimePlatformSecret(token="platform-token"),
+                )
+                paused = await self._wait_for_status(manager, "awaiting_manual_review")
+
+            self.assertEqual(platform.submitted, ["one", "one"])
+            self.assertEqual(
+                paused["session"]["current_attempt"]["rejected_result_values"],
+                ["NSSCTF{wrong}", "NSSCTF{corrected}"],
+            )
+            await manager.stop()
             await manager.aclose()
 
     async def test_agent_correction_limit_falls_back_to_manual_review(self) -> None:

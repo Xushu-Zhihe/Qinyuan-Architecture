@@ -114,6 +114,8 @@ class FieldMapping:
     origin_endpoint_path: str | None = None
     goal_format: str = "plain"
     flag_header: str | None = None
+    flag_pattern: str | None = None
+    flag_pattern_id: str | None = None
     hints_path: str | None = "hints"
     hints_item_path: str | None = None
     attachments_path: str | None = None
@@ -128,6 +130,25 @@ class FieldMapping:
             if len(flag_header) > 200:
                 raise ValueError("flag_header must be at most 200 characters")
             object.__setattr__(self, "flag_header", flag_header or None)
+        if self.flag_pattern is not None:
+            flag_pattern = self.flag_pattern.strip()
+            if len(flag_pattern) > 500:
+                raise ValueError("flag_pattern must be at most 500 characters")
+            if not flag_pattern:
+                flag_pattern = None
+            else:
+                try:
+                    re.compile(flag_pattern)
+                except re.error as exc:
+                    raise ValueError(f"invalid flag_pattern: {exc}") from exc
+            object.__setattr__(self, "flag_pattern", flag_pattern)
+        if self.flag_pattern_id is not None:
+            flag_pattern_id = self.flag_pattern_id.strip()
+            if len(flag_pattern_id) > 100:
+                raise ValueError("flag_pattern_id must be at most 100 characters")
+            object.__setattr__(self, "flag_pattern_id", flag_pattern_id or None)
+        if self.goal_format == "flag_objective" and self.flag_pattern and not self.flag_pattern_id:
+            object.__setattr__(self, "flag_pattern_id", "configured-v1")
 
 
 @dataclass(frozen=True, slots=True)

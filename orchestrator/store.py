@@ -20,10 +20,13 @@ from orchestrator.models import (
     RELATION_EDGE_TYPES,
 )
 from orchestrator.persistence_utils import (
+    FLAG_EXTRACTOR_VERSION,
     content_fingerprint,
+    extract_flag_value,
     new_id,
     normalize_text,
     raw_fingerprint,
+    result_fingerprint,
     utc_now,
 )
 
@@ -95,6 +98,9 @@ CREATE TABLE projects (
     goal_version INTEGER NOT NULL DEFAULT 1,
     goal_result_fact_id TEXT REFERENCES nodes(id),
     final_answer TEXT,
+    goal_format TEXT NOT NULL DEFAULT 'plain',
+    flag_pattern TEXT,
+    flag_pattern_id TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -222,6 +228,8 @@ CREATE TABLE goal_completion_claims (
     provider TEXT NOT NULL,
     execution_id TEXT NOT NULL REFERENCES intent_executions(id),
     fact_node_id TEXT NOT NULL REFERENCES nodes(id),
+    result_fingerprint TEXT,
+    extractor_version TEXT,
     created_at TEXT NOT NULL
 );
 
@@ -274,7 +282,7 @@ def _timestamp_after(value: str, seconds: float) -> str:
     ).isoformat()
 
 
-BLACKBOARD_SCHEMA_VERSION = 6
+BLACKBOARD_SCHEMA_VERSION = 7
 
 
 def _add_columns(
@@ -394,6 +402,30 @@ def _migrate_blackboard_v5(connection: sqlite3.Connection) -> None:
     )
 
 
+def _migrate_blackboard_v7(connection: sqlite3.Connection) -> None:
+    _add_columns(
+        connection,
+        "projects",
+        {
+            "goal_format": "TEXT NOT NULL DEFAULT 'plain'",
+            "flag_pattern": "TEXT",
+            "flag_pattern_id": "TEXT",
+        },
+    )
+    _add_columns(
+        connection,
+        "goal_completion_claims",
+        {
+            "result_fingerprint": "TEXT",
+            "extractor_version": "TEXT",
+        },
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS goal_completion_claims_fingerprint "
+        "ON goal_completion_claims(goal_version, result_fingerprint, provider)"
+    )
+
+
 BLACKBOARD_MIGRATIONS = {
     1: ("provider health state", _migrate_blackboard_v1),
     2: ("planning and execution audit", _migrate_blackboard_v2),
@@ -401,6 +433,7 @@ BLACKBOARD_MIGRATIONS = {
     4: ("canonical final answer consensus", _migrate_blackboard_v4),
     5: ("goal result completion claims", _migrate_blackboard_v5),
     6: ("asynchronous fact compaction", migrate_fact_compaction_v6),
+    7: ("deterministic flag result fingerprints", _migrate_blackboard_v7),
 }
 
 
@@ -419,7 +452,10 @@ def _ensure_runtime_schema(
 
 
 BLACKBOARD_REQUIRED_SCHEMA = {
-    "projects": {"id", "status", "goal_version", "goal_result_fact_id"},
+    "projects": {
+        "id", "status", "goal_version", "goal_result_fact_id",
+        "goal_format", "flag_pattern", "flag_pattern_id",
+    },
     "provider_health": {"provider", "status", "cli_version"},
     "planning_attempts": {
         "id",
@@ -442,7 +478,8 @@ BLACKBOARD_REQUIRED_SCHEMA = {
     },
     "final_answers": {"answer_key", "answer_fingerprint"},
     "goal_completion_claims": {
-        "id", "goal_version", "provider", "execution_id", "fact_node_id"
+        "id", "goal_version", "provider", "execution_id", "fact_node_id",
+        "result_fingerprint", "extractor_version",
     },
     "fact_compactions": FACT_COMPACTION_REQUIRED_SCHEMA,
 }
@@ -500,6 +537,15 @@ def _fingerprint(content: str) -> str:
     return content_fingerprint(content)
 
 
+def _result_extractor_version(project: sqlite3.Row) -> str:
+    pattern_id = str(project["flag_pattern_id"] or "").strip()
+    if pattern_id:
+        return pattern_id
+    if project["flag_pattern"]:
+        return "configured-v1"
+    return FLAG_EXTRACTOR_VERSION
+
+
 def _intent_fingerprint(proposal: IntentProposal) -> str:
     material = "\0".join(
         (
@@ -550,9 +596,20 @@ class BlackboardStore:
         goal: str,
         origin: str,
         hints: tuple[str, ...],
+        goal_format: str = "plain",
+        flag_pattern: str | None = None,
+        flag_pattern_id: str | None = None,
     ) -> "BlackboardStore":
         if not goal.strip() or not origin.strip():
             raise ValueError("goal and origin must be non-empty")
+        if goal_format not in {"plain", "flag_objective"}:
+            raise ValueError("unsupported goal format")
+        if flag_pattern is not None and not flag_pattern.strip():
+            flag_pattern = None
+        if flag_pattern_id is not None and not flag_pattern_id.strip():
+            flag_pattern_id = None
+        if goal_format == "flag_objective" and flag_pattern and not flag_pattern_id:
+            flag_pattern_id = "configured-v1"
         path.parent.mkdir(parents=True, exist_ok=True)
         connection = sqlite3.connect(path, check_same_thread=False)
         connection.row_factory = sqlite3.Row
@@ -568,10 +625,18 @@ class BlackboardStore:
             connection.execute(
                 """
                 INSERT INTO projects(
-                    id, status, goal_version, created_at, updated_at
-                ) VALUES (?, 'idle', 1, ?, ?)
+                    id, status, goal_version, goal_format, flag_pattern,
+                    flag_pattern_id, created_at, updated_at
+                ) VALUES (?, 'idle', 1, ?, ?, ?, ?, ?)
                 """,
-                (project_id, now, now),
+                (
+                    project_id,
+                    goal_format,
+                    flag_pattern,
+                    flag_pattern_id,
+                    now,
+                    now,
+                ),
             )
             goal_id = store._insert_node(
                 "goal", goal, "human", generation=0
@@ -596,6 +661,52 @@ class BlackboardStore:
 
     def close(self) -> None:
         self.connection.close()
+
+    def _flag_result_metadata(
+        self,
+        fact_id: str,
+        *,
+        source: str | None = None,
+        content_override: str | None = None,
+    ) -> tuple[str, str, str] | None:
+        project = self.connection.execute(
+            """
+            SELECT goal_format, flag_pattern, flag_pattern_id
+            FROM projects WHERE id = ?
+            """,
+            (self.project_id,),
+        ).fetchone()
+        if project is None or str(project["goal_format"]) != "flag_objective":
+            return None
+        fact = self.connection.execute(
+            """
+            SELECT content FROM nodes
+            WHERE id = ? AND project_id = ? AND type = 'fact'
+            """,
+            (fact_id, self.project_id),
+        ).fetchone()
+        if fact is None:
+            raise ValueError("goal result Fact is missing")
+        result_content = content_override
+        if result_content is None and source:
+            provenance = self.connection.execute(
+                """
+                SELECT original_content FROM node_provenance
+                WHERE node_id = ? AND source = ?
+                ORDER BY created_at DESC, id DESC LIMIT 1
+                """,
+                (fact_id, source),
+            ).fetchone()
+            if provenance is not None:
+                result_content = str(provenance["original_content"])
+        if result_content is None:
+            result_content = str(fact["content"])
+        extractor_version = _result_extractor_version(project)
+        value = extract_flag_value(
+            result_content,
+            pattern=(str(project["flag_pattern"]) if project["flag_pattern"] else None),
+        )
+        return value, result_fingerprint(value, extractor_version), extractor_version
 
     def _event(
         self,
@@ -1645,6 +1756,22 @@ class BlackboardStore:
                     ).fetchone()
                     if address is None:
                         raise ValueError("goal result must address the current Goal")
+                    result_content = next(
+                        (
+                            str(fact.content)
+                            for fact in update.facts
+                            if fact.ref == result_ref
+                        ),
+                        None,
+                    )
+                    result_metadata = self._flag_result_metadata(
+                        result_node_id,
+                        source=str(execution["provider"]),
+                        content_override=result_content,
+                    )
+                    result_value = result_metadata[0] if result_metadata else None
+                    result_fingerprint_value = result_metadata[1] if result_metadata else None
+                    extractor_version = result_metadata[2] if result_metadata else None
                     goal_version = int(
                         self.connection.execute(
                             "SELECT goal_version FROM projects WHERE id = ?",
@@ -1661,12 +1788,14 @@ class BlackboardStore:
                         """
                         INSERT INTO goal_completion_claims(
                             id, goal_version, provider, execution_id,
-                            fact_node_id, created_at
-                        ) VALUES (?, ?, ?, ?, ?, ?)
+                            fact_node_id, result_fingerprint, extractor_version,
+                            created_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             _id("claim"), goal_version, str(execution["provider"]),
-                            execution_id, result_node_id, _now(),
+                            execution_id, result_node_id, result_fingerprint_value,
+                            extractor_version, _now(),
                         ),
                     )
                     self._event(
@@ -1676,6 +1805,8 @@ class BlackboardStore:
                             "execution_id": execution_id,
                             "fact_node_id": result_node_id,
                             "goal_version": goal_version,
+                            "result_fingerprint": result_fingerprint_value,
+                            "result_value": result_value,
                         },
                     )
                 else:
@@ -2049,12 +2180,14 @@ class BlackboardStore:
             produced_by_intent_id=(str(produced["intent_edge_id"]) if produced else None),
             produced_by_execution_id=(str(produced["execution_id"]) if produced else None),
         )
+        result_metadata = self._flag_result_metadata(fact_id)
         return GoalResult(
             project_id=self.project_id,
             goal_version=goal_version,
             goal_node_id=str(goal["id"]),
             result_ref=f"{self.project_id}:{goal_version}:{fact_id}",
             fact=result_fact,
+            result_value=result_metadata[0] if result_metadata else None,
         )
 
     def goal_result(
@@ -2109,6 +2242,7 @@ class BlackboardStore:
             produced_by_intent_id=(str(produced["intent_edge_id"]) if produced else None),
             produced_by_execution_id=(str(produced["execution_id"]) if produced else None),
         )
+        result_metadata = self._flag_result_metadata(fact_id)
         supporting_rows = self.connection.execute(
             """
             SELECT DISTINCT n.id, n.content
@@ -2156,6 +2290,7 @@ class BlackboardStore:
             supporting_facts=tuple(list(supporting_by_id.values())[:20]),
             supporting_providers=tuple(sorted(winner["supporters"])),
             completion_threshold=threshold,
+            result_value=result_metadata[0] if result_metadata else None,
         )
 
     def goal_result_conflict(
@@ -2169,7 +2304,11 @@ class BlackboardStore:
         available_providers: int | None,
     ) -> dict[str, object]:
         project = self.connection.execute(
-            "SELECT goal_version, goal_result_fact_id FROM projects WHERE id = ?",
+            """
+            SELECT goal_version, goal_result_fact_id, goal_format,
+                   flag_pattern, flag_pattern_id
+            FROM projects WHERE id = ?
+            """,
             (self.project_id,),
         ).fetchone()
         if project is None:
@@ -2208,51 +2347,88 @@ class BlackboardStore:
                 first, second = sorted((left_root, right_root))
                 parents[second] = first
 
-        equivalent_rows = self.connection.execute(
-            """
-            SELECT e.from_node, e.to_node
-            FROM edges e
-            JOIN nodes source ON source.id = e.from_node
-            JOIN nodes target ON target.id = e.to_node
-            WHERE e.project_id = ? AND e.type = 'equivalent_to'
-              AND source.type = 'fact' AND source.state = 'active'
-              AND target.type = 'fact' AND target.state = 'active'
-            """,
-            (self.project_id,),
-        ).fetchall()
-        for row in equivalent_rows:
-            left = str(row["from_node"])
-            right = str(row["to_node"])
-            if left in parents and right in parents:
-                union(left, right)
-
-        claim_rows = self.connection.execute(
-            """
-            SELECT fact_node_id, provider FROM goal_completion_claims
-            WHERE goal_version = ? ORDER BY fact_node_id, provider
-            """,
-            (goal_version,),
-        ).fetchall()
         components: dict[str, dict[str, object]] = {}
         providers: set[str] = set()
-        for row in claim_rows:
-            fact_id = str(row["fact_node_id"])
-            if fact_id not in parents:
-                continue
-            provider = str(row["provider"])
-            providers.add(provider)
-            root = find(fact_id)
-            component = components.setdefault(
-                root,
-                {"fact_ids": set(), "supporters": set(), "claims_by_fact": {}},
-            )
-            component["fact_ids"].add(fact_id)
-            component["supporters"].add(provider)
-            component["claims_by_fact"].setdefault(fact_id, set()).add(provider)
-        for fact_id in active_facts:
-            root = find(fact_id)
-            if root in components:
-                components[root]["fact_ids"].add(fact_id)
+        is_flag_goal = str(project["goal_format"]) == "flag_objective"
+        if is_flag_goal:
+            claim_rows = self.connection.execute(
+                """
+                SELECT fact_node_id, provider, result_fingerprint,
+                       extractor_version
+                FROM goal_completion_claims
+                WHERE goal_version = ? ORDER BY fact_node_id, provider
+                """,
+                (goal_version,),
+            ).fetchall()
+            for row in claim_rows:
+                fact_id = str(row["fact_node_id"])
+                if fact_id not in active_facts:
+                    continue
+                fingerprint = str(row["result_fingerprint"] or "").strip()
+                if not fingerprint:
+                    try:
+                        metadata = self._flag_result_metadata(fact_id)
+                    except ValueError:
+                        continue
+                    fingerprint = metadata[1]
+                provider = str(row["provider"])
+                providers.add(provider)
+                component = components.setdefault(
+                    fingerprint,
+                    {
+                        "fingerprint": fingerprint,
+                        "fact_ids": set(),
+                        "supporters": set(),
+                        "claims_by_fact": {},
+                    },
+                )
+                component["fact_ids"].add(fact_id)
+                component["supporters"].add(provider)
+                component["claims_by_fact"].setdefault(fact_id, set()).add(provider)
+        else:
+            equivalent_rows = self.connection.execute(
+                """
+                SELECT e.from_node, e.to_node
+                FROM edges e
+                JOIN nodes source ON source.id = e.from_node
+                JOIN nodes target ON target.id = e.to_node
+                WHERE e.project_id = ? AND e.type = 'equivalent_to'
+                  AND source.type = 'fact' AND source.state = 'active'
+                  AND target.type = 'fact' AND target.state = 'active'
+                """,
+                (self.project_id,),
+            ).fetchall()
+            for row in equivalent_rows:
+                left = str(row["from_node"])
+                right = str(row["to_node"])
+                if left in parents and right in parents:
+                    union(left, right)
+
+            claim_rows = self.connection.execute(
+                """
+                SELECT fact_node_id, provider FROM goal_completion_claims
+                WHERE goal_version = ? ORDER BY fact_node_id, provider
+                """,
+                (goal_version,),
+            ).fetchall()
+            for row in claim_rows:
+                fact_id = str(row["fact_node_id"])
+                if fact_id not in parents:
+                    continue
+                provider = str(row["provider"])
+                providers.add(provider)
+                root = find(fact_id)
+                component = components.setdefault(
+                    root,
+                    {"fact_ids": set(), "supporters": set(), "claims_by_fact": {}},
+                )
+                component["fact_ids"].add(fact_id)
+                component["supporters"].add(provider)
+                component["claims_by_fact"].setdefault(fact_id, set()).add(provider)
+            for fact_id in active_facts:
+                root = find(fact_id)
+                if root in components:
+                    components[root]["fact_ids"].add(fact_id)
         provider_count = available_providers if available_providers is not None else max(1, len(providers))
         threshold = 1 if provider_count == 1 else 2
         winners = [

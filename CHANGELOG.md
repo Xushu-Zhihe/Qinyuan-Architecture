@@ -22,10 +22,6 @@
   `project_id + provider` 的短进程通过稳定 owner ID 和 workspace 接管同一容器，
   并在项目 achieved/stop/delete 收尾后执行可审计的显式释放。
 - 新增 `BLACKBOARD_RESULT` v2、`goal_result_ref`、Goal Result Fact、completion claim、SQLite schema v5 和 `ProjectService.get_goal_result()`；多 provider 通过同一 Fact 或显式 `equivalent_to` 达成结果共识，不等价结果进入 `result_conflict`。
-- 全自动模式新增独立 OpenAI-compatible Direct LLM Controller，并支持 Prompt/结构化 API 两种平台接入；新 UI 不再选择 provider 作为 controller，旧 provider-controller payload 仅作为兼容入口保留。
-- 新增 text/JSON/form `SubmissionPlan`、冻结 plan fingerprint、rejected/replan 与传输重试分流、题目级状态/history、显式平台 health endpoint 测试和运行时 controller/platform secret 清理。
-- provider 配置新增 result protocol capability、runtime probe、required Skill 和协议参数；qinyuan-agent/q-subagent 可被确定性识别为 v2 auto-ready。
-- 首版明确不支持结果 artifact/文件上传、controller streaming、并行题目和自动 session/lease 恢复。
 - 项目支持可恢复删除：运行项目会先停止并清理，项目目录移动到
   `web-data/.trash/`，注册表删除失败会自动回滚。
 - 编辑模式支持 Fact/Hint 归档、恢复、无执行历史边删除；浏览模式锁定语义修改，

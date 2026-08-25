@@ -4,7 +4,6 @@ import { api } from './api/client'
 import { NewProjectDialog, type NewProjectPayload } from './components/NewProjectDialog'
 import { ProjectDashboard } from './pages/ProjectDashboard'
 import { BlackboardWorkspace } from './pages/BlackboardWorkspace'
-import { AutopilotPage } from './pages/AutopilotPage'
 import type { ProjectSummary, RuntimeSnapshot } from './types'
 
 export default function App() {
@@ -63,11 +62,6 @@ export default function App() {
     window.dispatchEvent(new PopStateEvent('popstate'))
   }
 
-  function openAutopilot() {
-    window.history.pushState({}, '', '/auto')
-    window.dispatchEvent(new PopStateEvent('popstate'))
-  }
-
   function goDashboard() {
     window.history.pushState({}, '', '/')
     window.dispatchEvent(new PopStateEvent('popstate'))
@@ -78,14 +72,10 @@ export default function App() {
     return <BlackboardWorkspace projectId={projectMatch[1]} onBack={goDashboard} />
   }
 
-  if (path === '/auto') {
-    return <AutopilotPage onBack={goDashboard} onOpenProject={openProject} />
-  }
-
   return (
     <>
       {error && <div className="error-banner">{error}</div>}
-      <ProjectDashboard projects={projects} runtime={runtime} onOpen={openProject} onCreate={() => setDialogOpen(true)} onDelete={deleteProject} onOpenAutopilot={openAutopilot} />
+      <ProjectDashboard projects={projects} runtime={runtime} onOpen={openProject} onCreate={() => setDialogOpen(true)} onDelete={deleteProject} />
       <NewProjectDialog
         open={dialogOpen}
         providers={['codex', 'claude', 'kimi', 'qinyuan-agent', 'q-subagent']}

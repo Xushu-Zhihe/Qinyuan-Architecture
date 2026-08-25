@@ -50,7 +50,7 @@ Executor = Callable[..., Awaitable[WorkerResult]]
 ProjectStatusWriter = Callable[[str, str | None], None]
 PermitCallback = Callable[[PermitLease], Awaitable[None] | None]
 
-TIMEOUT_SUMMARY_SECONDS = 30.0
+TIMEOUT_SUMMARY_SECONDS = 300.0
 TIMEOUT_SUMMARY_MAX_CHARS = 12 * 1024
 
 
@@ -1336,13 +1336,9 @@ class ProjectSupervisor:
                 "execution_id": execution.id,
             },
         )
-        summary_timeout = max(
-            0.1,
-            min(TIMEOUT_SUMMARY_SECONDS, provider.planning_timeout_seconds),
-        )
         try:
             summary = await self._run_provider(
-                replace(provider, timeout_seconds=summary_timeout),
+                replace(provider, timeout_seconds=TIMEOUT_SUMMARY_SECONDS),
                 render_timeout_summary_request(
                     self.store.snapshot(),
                     {
@@ -1598,7 +1594,10 @@ class ProjectSupervisor:
                         "threshold": goal_result.completion_threshold,
                     },
                 )
-                self._write_project_status("achieved", goal_result.fact.content)
+                self._write_project_status(
+                    "achieved",
+                    goal_result.result_value or goal_result.fact.content,
+                )
                 self.cancel_event.set()
             elif (
                 parsed_result.update.protocol_version == 2

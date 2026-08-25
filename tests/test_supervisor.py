@@ -46,7 +46,12 @@ def health_provider(
 
 
 class SupervisorTests(unittest.IsolatedAsyncioTestCase):
-    def make_store(self) -> tuple[BlackboardStore, Path]:
+    def make_store(
+        self,
+        *,
+        goal_format: str = "plain",
+        flag_pattern: str | None = None,
+    ) -> tuple[BlackboardStore, Path]:
         temporary = tempfile.TemporaryDirectory()
         self.addAsyncCleanup(__import__("asyncio").to_thread, temporary.cleanup)
         root = Path(temporary.name)
@@ -56,6 +61,8 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             "Recover the flag",
             "Challenge statement",
             (),
+            goal_format=goal_format,
+            flag_pattern=flag_pattern,
         )
         self.addAsyncCleanup(__import__("asyncio").to_thread, store.close)
         return store, root
@@ -223,13 +230,22 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status, "completed")
         self.assertEqual(observed_timeouts, [30, 900])
 
-    async def test_timeout_recovers_verified_facts_with_summary_pass(self) -> None:
+    async def test_timeout_recovers_facts_then_starts_next_round(self) -> None:
         store, root = self.make_store()
         calls: list[str] = []
 
         async def execute(config, request, challenge_dir, work_dir, **kwargs):
             if "BLACKBOARD_INTENT:" in request:
                 calls.append("planning")
+                if calls.count("planning") == 2:
+                    return self.result(
+                        config.name,
+                        work_dir,
+                        "BLACKBOARD_INTENT: "
+                        + json.dumps(
+                            {"action": "idle", "reason": "Use recovered fact"}
+                        ),
+                    )
                 return self.result(
                     config.name,
                     work_dir,
@@ -245,6 +261,7 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
                 )
             if "immediate timeout-recovery pass" in request:
                 calls.append("timeout-summary")
+                self.assertEqual(config.timeout_seconds, 300)
                 intent_id = next(
                     edge["id"]
                     for edge in store.snapshot()["edges"]
@@ -284,13 +301,16 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             challenge_dir=None,
             project_dir=root,
             execute=execute,
-            max_iterations=1,
+            max_iterations=2,
         )
 
-        status = await supervisor.run_agent_once("codex")
+        await supervisor.start()
+        await supervisor.wait_until_idle(timeout=1)
 
-        self.assertEqual(status, "completed")
-        self.assertEqual(calls, ["planning", "execution", "timeout-summary"])
+        self.assertEqual(
+            calls,
+            ["planning", "execution", "timeout-summary", "planning"],
+        )
         facts = [
             node["content"]
             for node in store.snapshot()["nodes"]
@@ -1228,6 +1248,75 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
                 node["type"] == "fact" and node["content"] == "NSSCTF{test-flag}"
                 for node in snapshot["nodes"]
             )
+        )
+
+    async def test_flag_goal_uses_extracted_value_as_final_answer(self) -> None:
+        store, root = self.make_store(
+            goal_format="flag_objective",
+            flag_pattern=r"NSSCTF\{[^{}\r\n]{1,128}\}",
+        )
+
+        async def execute(config, request, challenge_dir, work_dir, **kwargs):
+            if "BLACKBOARD_INTENT:" in request:
+                return self.result(
+                    config.name,
+                    work_dir,
+                    "BLACKBOARD_INTENT: "
+                    + json.dumps(
+                        {
+                            "action": "plan",
+                            "source_node_id": store.node_id("origin"),
+                            "target_node_id": store.node_id("goal"),
+                            "content": "Recover the flag",
+                        }
+                    ),
+                )
+            intent_id = next(
+                edge["id"]
+                for edge in store.snapshot()["edges"]
+                if edge["type"] == "intent"
+            )
+            return self.result(
+                config.name,
+                work_dir,
+                "BLACKBOARD_RESULT: "
+                + json.dumps(
+                    {
+                        "protocol_version": 2,
+                        "intent_id": intent_id,
+                        "facts": [
+                            {
+                                "ref": "flag-result",
+                                "content": "The exact answer is NSSCTF{correct}.",
+                            }
+                        ],
+                        "edges": [
+                            {
+                                "type": "addresses",
+                                "from": "flag-result",
+                                "to": store.node_id("goal"),
+                            }
+                        ],
+                        "goal_achieved": True,
+                        "goal_result_ref": "flag-result",
+                    }
+                ),
+            )
+
+        supervisor = ProjectSupervisor(
+            store=store,
+            providers=(provider("codex"),),
+            challenge_dir=None,
+            project_dir=root,
+            execute=execute,
+            max_iterations=1,
+        )
+
+        await supervisor.run_agent_once("codex")
+
+        self.assertEqual(
+            store.snapshot()["project"]["final_answer"],
+            "NSSCTF{correct}",
         )
 
     async def test_protocol_correction_stops_after_second_error(self) -> None:

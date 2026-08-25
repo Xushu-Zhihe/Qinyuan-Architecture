@@ -8,14 +8,6 @@ import type {
   ProjectSummary,
   RuntimeSnapshot,
   SyncedExecutionLogs,
-  AutopilotSnapshot,
-  AutopilotStartPayload,
-  ControllerInput,
-  CurrentTaskResult,
-  PlatformValidationPayload,
-  StructuredPlatformInput,
-  StructuredPlatformTemplate,
-  ValidationResult,
 } from '../types'
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -103,64 +95,4 @@ export const api = {
   planningAttempts: (projectId: string) =>
     request<PlanningAttempt[]>(`/api/projects/${projectId}/planning-attempts`),
   auditExportUrl: (projectId: string) => `/api/projects/${projectId}/audit/export`,
-  getAutopilot: () => request<AutopilotSnapshot>('/api/autopilot'),
-  listAutopilotTemplates: () => request<StructuredPlatformTemplate[]>('/api/autopilot/templates'),
-  saveAutopilotTemplate: (payload: { name: string; platform: StructuredPlatformInput }) =>
-    request<StructuredPlatformTemplate>('/api/autopilot/templates', {
-      method: 'POST',
-      body: JSON.stringify(payload),
-    }),
-  deleteAutopilotTemplate: (templateId: string) =>
-    request<void>(`/api/autopilot/templates/${templateId}`, { method: 'DELETE' }),
-  startAutopilot: (payload: AutopilotStartPayload) =>
-    request<AutopilotSnapshot>('/api/autopilot/start', {
-      method: 'POST',
-      body: JSON.stringify(payload),
-    }),
-  stopAutopilot: () => request<AutopilotSnapshot>('/api/autopilot/stop', { method: 'POST' }),
-  extendAutopilotTime: (seconds: number) =>
-    request<AutopilotSnapshot>('/api/autopilot/extend-time', {
-      method: 'POST',
-      body: JSON.stringify({ seconds }),
-    }),
-  skipAutopilotTask: (reason = 'user skipped') =>
-    request<AutopilotSnapshot>('/api/autopilot/skip-current-task', {
-      method: 'POST',
-      body: JSON.stringify({ reason }),
-    }),
-  finishAfterCurrentAutopilotTask: () =>
-    request<AutopilotSnapshot>('/api/autopilot/finish-after-current-task', {
-      method: 'POST',
-      body: JSON.stringify({}),
-    }),
-  submitAutopilotTask: (factId: string, finishAfterAccept = false) =>
-    request<AutopilotSnapshot>('/api/autopilot/submit-current-task', {
-      method: 'POST',
-      body: JSON.stringify({ fact_id: factId, finish_after_accept: finishAfterAccept }),
-    }),
-  testAutopilotController: (payload: ControllerInput) =>
-    request<ValidationResult>('/api/autopilot/test-controller', {
-      method: 'POST',
-      body: JSON.stringify(payload),
-    }),
-  validateAutopilotPlatform: (payload: PlatformValidationPayload) =>
-    request<ValidationResult>('/api/autopilot/validate-platform', {
-      method: 'POST',
-      body: JSON.stringify(payload),
-    }),
-  validateAutopilotPrompt: (controller: ControllerInput, prompt: string) =>
-    request<ValidationResult>('/api/autopilot/validate-prompt', {
-      method: 'POST',
-      body: JSON.stringify({ controller, prompt }),
-    }),
-  testAutopilotPlatformHealth: (platform: StructuredPlatformInput) =>
-    request<ValidationResult>('/api/autopilot/test-platform-health', {
-      method: 'POST',
-      body: JSON.stringify({ mode: 'structured', platform }),
-    }),
-  getAutopilotCurrentTask: (platform: StructuredPlatformInput) =>
-    request<CurrentTaskResult>('/api/autopilot/current-task', {
-      method: 'POST',
-      body: JSON.stringify({ mode: 'structured', platform }),
-    }),
 }

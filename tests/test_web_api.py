@@ -58,6 +58,29 @@ class WebApiTests(unittest.TestCase):
         )
         self.assertEqual(graph.json()["layout"]["revision"], 0)
 
+    def test_create_project_forwards_flag_goal_settings(self) -> None:
+        response = self.client.post(
+            "/api/projects",
+            json={
+                "name": "Flag goal",
+                "goal": "Recover the flag",
+                "origin": "Challenge statement",
+                "mode": "manual",
+                "providers": [],
+                "agent_limit": 1,
+                "goal_format": "flag_objective",
+                "flag_pattern": r"NSSCTF\{[^{}\r\n]{1,128}\}",
+                "flag_pattern_id": "nssctf-v1",
+            },
+        )
+
+        self.assertEqual(response.status_code, 201, response.text)
+        project = self.client.app.state.projects.get_handle(response.json()["id"])
+        stored = project.store.snapshot()["project"]
+        self.assertEqual(stored["goal_format"], "flag_objective")
+        self.assertEqual(stored["flag_pattern"], r"NSSCTF\{[^{}\r\n]{1,128}\}")
+        self.assertEqual(stored["flag_pattern_id"], "nssctf-v1")
+
     def test_deletes_project_to_recoverable_trash(self) -> None:
         challenge = self.data_root / "challenge"
         challenge.mkdir()
